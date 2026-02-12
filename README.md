@@ -71,6 +71,7 @@ npm run dev
 
 - `get_ticket`
 - `get_tickets`
+- `search_tickets`
 - `get_ticket_comments`
 - `create_ticket_comment`
 - `create_ticket`

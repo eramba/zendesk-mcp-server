@@ -34,6 +34,19 @@ export type TicketListResult = {
   previous_page: number | null;
 };
 
+export type TicketSearchResult = {
+  query: string;
+  tickets: ZendeskTicket[];
+  page: number;
+  per_page: number;
+  count: number;
+  sort_by: string;
+  sort_order: "asc" | "desc";
+  has_more: boolean;
+  next_page: number | null;
+  previous_page: number | null;
+};
+
 export type ZendeskSectionArticles = {
   section_id: number;
   description: string | null;

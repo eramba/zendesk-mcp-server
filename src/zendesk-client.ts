@@ -1,5 +1,6 @@
 import type {
   TicketListResult,
+  TicketSearchResult,
   ZendeskComment,
   ZendeskKnowledgeBase,
   ZendeskTicket,
@@ -18,6 +19,7 @@ type TicketPayload = {
   assignee_id?: number;
   organization_id?: number;
   tags?: string[];
+  result_type?: string;
 };
 
 type ZendeskApiError = {
@@ -143,6 +145,45 @@ export class ZendeskClient {
     const tickets = data.tickets.map(normalizeTicket);
 
     return {
+      tickets,
+      page: options.page,
+      per_page: Math.min(options.perPage, 100),
+      count: tickets.length,
+      sort_by: options.sortBy,
+      sort_order: options.sortOrder,
+      has_more: data.next_page !== null,
+      next_page: data.next_page ? options.page + 1 : null,
+      previous_page: data.previous_page && options.page > 1 ? options.page - 1 : null,
+    };
+  }
+
+  async searchTickets(options: {
+    query: string;
+    page: number;
+    perPage: number;
+    sortBy: string;
+    sortOrder: "asc" | "desc";
+  }): Promise<TicketSearchResult> {
+    const query = new URLSearchParams({
+      query: options.query,
+      page: String(options.page),
+      per_page: String(Math.min(options.perPage, 100)),
+      sort_by: options.sortBy,
+      sort_order: options.sortOrder,
+    });
+
+    const data = await this.request<{
+      results: TicketPayload[];
+      next_page: string | null;
+      previous_page: string | null;
+    }>(`/search.json?${query.toString()}`);
+
+    const tickets = data.results
+      .filter((result) => result.result_type === "ticket")
+      .map(normalizeTicket);
+
+    return {
+      query: options.query,
       tickets,
       page: options.page,
       per_page: Math.min(options.perPage, 100),

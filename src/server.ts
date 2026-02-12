@@ -165,6 +165,37 @@ export function buildZendeskServer(client: ZendeskClient): McpServer {
   );
 
   server.registerTool(
+    "search_tickets",
+    {
+      description: "Search Zendesk tickets by query using Zendesk Search API",
+      inputSchema: {
+        query: z.string().min(1),
+        page: z.number().int().min(1).default(1),
+        per_page: z.number().int().min(1).max(100).default(25),
+        sort_by: z
+          .enum(["created_at", "updated_at", "priority", "status"])
+          .default("created_at"),
+        sort_order: z.enum(["asc", "desc"]).default("desc"),
+      },
+    },
+    async ({ query, page, per_page, sort_by, sort_order }) => {
+      try {
+        return jsonText(
+          await client.searchTickets({
+            query,
+            page,
+            perPage: per_page,
+            sortBy: sort_by,
+            sortOrder: sort_order,
+          }),
+        );
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
     "get_ticket_comments",
     {
       description: "Retrieve all comments for a Zendesk ticket by its ID",
