@@ -1,9 +1,17 @@
 import type {
+  TicketAuditListResult,
+  TicketFieldListResult,
   TicketListResult,
   TicketSearchResult,
   ZendeskComment,
   ZendeskKnowledgeBase,
+  ZendeskOrganization,
+  ZendeskSearchResult,
   ZendeskTicket,
+  ZendeskTicketAudit,
+  ZendeskTicketAuditEvent,
+  ZendeskTicketField,
+  ZendeskUser,
 } from "./types.js";
 
 type TicketPayload = {
@@ -20,6 +28,64 @@ type TicketPayload = {
   organization_id?: number;
   tags?: string[];
   result_type?: string;
+};
+
+type UserPayload = {
+  id?: number;
+  name?: string;
+  email?: string;
+  role?: string;
+  created_at?: string;
+  updated_at?: string;
+  organization_id?: number;
+  suspended?: boolean;
+  active?: boolean;
+  result_type?: string;
+};
+
+type OrganizationPayload = {
+  id?: number;
+  name?: string;
+  details?: string;
+  notes?: string;
+  created_at?: string;
+  updated_at?: string;
+  shared_tickets?: boolean;
+  result_type?: string;
+};
+
+type SearchResultPayload = TicketPayload | UserPayload | OrganizationPayload;
+
+type TicketFieldPayload = {
+  id?: number;
+  title?: string;
+  type?: string;
+  description?: string;
+  required?: boolean;
+  visible_in_portal?: boolean;
+  active?: boolean;
+  position?: number;
+  custom_field_options?: Array<{
+    id?: number;
+    name?: string;
+    value?: string;
+  }>;
+};
+
+type TicketAuditEventPayload = {
+  id?: number;
+  type?: string;
+  field_name?: string;
+  value?: unknown;
+  previous_value?: unknown;
+  body?: string;
+};
+
+type TicketAuditPayload = {
+  id?: number;
+  author_id?: number;
+  created_at?: string;
+  events?: TicketAuditEventPayload[];
 };
 
 type ZendeskApiError = {
@@ -43,6 +109,72 @@ function normalizeTicket(ticket: TicketPayload): ZendeskTicket {
     assignee_id: ticket.assignee_id ?? null,
     organization_id: ticket.organization_id ?? null,
     tags: Array.isArray(ticket.tags) ? ticket.tags : [],
+  };
+}
+
+function normalizeUser(user: UserPayload): ZendeskUser {
+  return {
+    id: Number(user.id),
+    name: user.name ?? null,
+    email: user.email ?? null,
+    role: user.role ?? null,
+    created_at: user.created_at ?? null,
+    updated_at: user.updated_at ?? null,
+    organization_id: user.organization_id ?? null,
+    suspended: Boolean(user.suspended),
+    active: Boolean(user.active),
+  };
+}
+
+function normalizeOrganization(organization: OrganizationPayload): ZendeskOrganization {
+  return {
+    id: Number(organization.id),
+    name: organization.name ?? null,
+    details: organization.details ?? null,
+    notes: organization.notes ?? null,
+    created_at: organization.created_at ?? null,
+    updated_at: organization.updated_at ?? null,
+    shared_tickets: Boolean(organization.shared_tickets),
+  };
+}
+
+function normalizeTicketField(field: TicketFieldPayload): ZendeskTicketField {
+  return {
+    id: Number(field.id),
+    title: field.title ?? null,
+    type: field.type ?? null,
+    description: field.description ?? null,
+    required: Boolean(field.required),
+    visible_in_portal: Boolean(field.visible_in_portal),
+    active: Boolean(field.active),
+    position: field.position ?? null,
+    custom_field_options: Array.isArray(field.custom_field_options)
+      ? field.custom_field_options.map((option) => ({
+          id: Number(option.id),
+          name: option.name ?? "",
+          value: option.value ?? "",
+        }))
+      : [],
+  };
+}
+
+function normalizeTicketAuditEvent(event: TicketAuditEventPayload): ZendeskTicketAuditEvent {
+  return {
+    id: Number(event.id),
+    type: event.type ?? null,
+    field_name: event.field_name ?? null,
+    value: event.value ?? null,
+    previous_value: event.previous_value ?? null,
+    body: event.body ?? null,
+  };
+}
+
+function normalizeTicketAudit(audit: TicketAuditPayload): ZendeskTicketAudit {
+  return {
+    id: Number(audit.id),
+    author_id: audit.author_id ?? null,
+    created_at: audit.created_at ?? null,
+    events: Array.isArray(audit.events) ? audit.events.map(normalizeTicketAuditEvent) : [],
   };
 }
 
@@ -190,6 +322,132 @@ export class ZendeskClient {
       count: tickets.length,
       sort_by: options.sortBy,
       sort_order: options.sortOrder,
+      has_more: data.next_page !== null,
+      next_page: data.next_page ? options.page + 1 : null,
+      previous_page: data.previous_page && options.page > 1 ? options.page - 1 : null,
+    };
+  }
+
+  async search(options: {
+    query: string;
+    type?: "ticket" | "user" | "organization";
+    page: number;
+    perPage: number;
+    sortBy: string;
+    sortOrder: "asc" | "desc";
+  }): Promise<ZendeskSearchResult> {
+    const searchQuery = options.type ? `type:${options.type} ${options.query}` : options.query;
+    const query = new URLSearchParams({
+      query: searchQuery,
+      page: String(options.page),
+      per_page: String(Math.min(options.perPage, 100)),
+      sort_by: options.sortBy,
+      sort_order: options.sortOrder,
+    });
+
+    const data = await this.request<{
+      results: SearchResultPayload[];
+      next_page: string | null;
+      previous_page: string | null;
+    }>(`/search.json?${query.toString()}`);
+
+    const tickets = data.results
+      .filter((result) => result.result_type === "ticket")
+      .map((result) => normalizeTicket(result as TicketPayload));
+    const users = data.results
+      .filter((result) => result.result_type === "user")
+      .map((result) => normalizeUser(result as UserPayload));
+    const organizations = data.results
+      .filter((result) => result.result_type === "organization")
+      .map((result) => normalizeOrganization(result as OrganizationPayload));
+
+    return {
+      query: options.query,
+      type: options.type ?? "any",
+      tickets,
+      users,
+      organizations,
+      page: options.page,
+      per_page: Math.min(options.perPage, 100),
+      count: data.results.length,
+      sort_by: options.sortBy,
+      sort_order: options.sortOrder,
+      has_more: data.next_page !== null,
+      next_page: data.next_page ? options.page + 1 : null,
+      previous_page: data.previous_page && options.page > 1 ? options.page - 1 : null,
+    };
+  }
+
+  async searchUsers(options: {
+    query: string;
+    page: number;
+    perPage: number;
+    sortBy: string;
+    sortOrder: "asc" | "desc";
+  }): Promise<ZendeskSearchResult> {
+    return this.search({
+      ...options,
+      type: "user",
+    });
+  }
+
+  async searchOrganizations(options: {
+    query: string;
+    page: number;
+    perPage: number;
+    sortBy: string;
+    sortOrder: "asc" | "desc";
+  }): Promise<ZendeskSearchResult> {
+    return this.search({
+      ...options,
+      type: "organization",
+    });
+  }
+
+  async listTicketFields(): Promise<TicketFieldListResult> {
+    const fields: ZendeskTicketField[] = [];
+    let nextPagePath: string | null = "/ticket_fields.json?per_page=100";
+
+    while (nextPagePath) {
+      const data = await this.request<{
+        ticket_fields: TicketFieldPayload[];
+        next_page: string | null;
+      }>(nextPagePath);
+
+      fields.push(...data.ticket_fields.map(normalizeTicketField));
+      nextPagePath = this.nextPath(data.next_page);
+    }
+
+    return {
+      fields,
+      count: fields.length,
+    };
+  }
+
+  async getTicketAudits(options: {
+    ticketId: number;
+    page: number;
+    perPage: number;
+  }): Promise<TicketAuditListResult> {
+    const query = new URLSearchParams({
+      page: String(options.page),
+      per_page: String(Math.min(options.perPage, 100)),
+    });
+
+    const data = await this.request<{
+      audits: TicketAuditPayload[];
+      next_page: string | null;
+      previous_page: string | null;
+    }>(`/tickets/${options.ticketId}/audits.json?${query.toString()}`);
+
+    const audits = data.audits.map(normalizeTicketAudit);
+
+    return {
+      ticket_id: options.ticketId,
+      audits,
+      page: options.page,
+      per_page: Math.min(options.perPage, 100),
+      count: audits.length,
       has_more: data.next_page !== null,
       next_page: data.next_page ? options.page + 1 : null,
       previous_page: data.previous_page && options.page > 1 ? options.page - 1 : null,

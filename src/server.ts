@@ -196,6 +196,141 @@ export function buildZendeskServer(client: ZendeskClient): McpServer {
   );
 
   server.registerTool(
+    "search",
+    {
+      description: "Search Zendesk across tickets, users, and organizations",
+      inputSchema: {
+        query: z.string().min(1),
+        type: z.enum(["ticket", "user", "organization"]).optional(),
+        page: z.number().int().min(1).default(1),
+        per_page: z.number().int().min(1).max(100).default(25),
+        sort_by: z
+          .enum(["created_at", "updated_at", "priority", "status"])
+          .default("created_at"),
+        sort_order: z.enum(["asc", "desc"]).default("desc"),
+      },
+    },
+    async ({ query, type, page, per_page, sort_by, sort_order }) => {
+      try {
+        return jsonText(
+          await client.search({
+            query,
+            type,
+            page,
+            perPage: per_page,
+            sortBy: sort_by,
+            sortOrder: sort_order,
+          }),
+        );
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "search_users",
+    {
+      description: "Search Zendesk users by query",
+      inputSchema: {
+        query: z.string().min(1),
+        page: z.number().int().min(1).default(1),
+        per_page: z.number().int().min(1).max(100).default(25),
+        sort_by: z
+          .enum(["created_at", "updated_at", "priority", "status"])
+          .default("created_at"),
+        sort_order: z.enum(["asc", "desc"]).default("desc"),
+      },
+    },
+    async ({ query, page, per_page, sort_by, sort_order }) => {
+      try {
+        return jsonText(
+          await client.searchUsers({
+            query,
+            page,
+            perPage: per_page,
+            sortBy: sort_by,
+            sortOrder: sort_order,
+          }),
+        );
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "search_organizations",
+    {
+      description: "Search Zendesk organizations by query",
+      inputSchema: {
+        query: z.string().min(1),
+        page: z.number().int().min(1).default(1),
+        per_page: z.number().int().min(1).max(100).default(25),
+        sort_by: z
+          .enum(["created_at", "updated_at", "priority", "status"])
+          .default("created_at"),
+        sort_order: z.enum(["asc", "desc"]).default("desc"),
+      },
+    },
+    async ({ query, page, per_page, sort_by, sort_order }) => {
+      try {
+        return jsonText(
+          await client.searchOrganizations({
+            query,
+            page,
+            perPage: per_page,
+            sortBy: sort_by,
+            sortOrder: sort_order,
+          }),
+        );
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_ticket_fields",
+    {
+      description: "List Zendesk ticket fields (including custom fields)",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        return jsonText(await client.listTicketFields());
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_ticket_audits",
+    {
+      description: "Retrieve ticket audits/history for a Zendesk ticket",
+      inputSchema: {
+        ticket_id: z.number().int().positive(),
+        page: z.number().int().min(1).default(1),
+        per_page: z.number().int().min(1).max(100).default(25),
+      },
+    },
+    async ({ ticket_id, page, per_page }) => {
+      try {
+        return jsonText(
+          await client.getTicketAudits({
+            ticketId: ticket_id,
+            page,
+            perPage: per_page,
+          }),
+        );
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
     "get_ticket_comments",
     {
       description: "Retrieve all comments for a Zendesk ticket by its ID",
