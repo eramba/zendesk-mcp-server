@@ -88,3 +88,16 @@ npm run dev
 ## Resources
 
 - `zendesk://knowledge-base`
+
+## Contributing
+
+Issues and pull requests are welcome at [github.com/eramba/zendesk-mcp-server](https://github.com/eramba/zendesk-mcp-server).
+
+When submitting changes:
+- Keep changes focused and small
+- Include clear reproduction/validation steps
+- Update documentation for any tool or behavior changes
+
+## Support
+
+For bug reports and feature requests, please use [GitHub Issues](https://github.com/eramba/zendesk-mcp-server/issues).

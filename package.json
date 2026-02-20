@@ -19,7 +19,16 @@
     "zendesk",
     "typescript"
   ],
+  "author": "Eramba",
   "license": "Apache-2.0",
+  "homepage": "https://github.com/eramba/zendesk-mcp-server#readme",
+  "bugs": {
+    "url": "https://github.com/eramba/zendesk-mcp-server/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eramba/zendesk-mcp-server.git"
+  },
   "engines": {
     "node": ">=20"
   },
