@@ -1,3 +1,6 @@
+> **Important note:** All credits go to [reminia](https://github.com/reminia).  
+> This project is a TypeScript port of [`reminia/zendesk-mcp-server`](https://github.com/reminia/zendesk-mcp-server), with some upgrades and new tools.
+
 # Zendesk MCP Server (TypeScript)
 
 A Model Context Protocol server for Zendesk, rewritten in TypeScript from [`reminia/zendesk-mcp-server`](https://github.com/reminia/zendesk-mcp-server).
