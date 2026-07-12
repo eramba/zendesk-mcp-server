@@ -26,6 +26,12 @@ Please fetch the ticket info, comments and knowledge base to draft a professiona
 The response should be formatted well and ready to be posted as a comment.
 `;
 
+const SERVER_INSTRUCTIONS = [
+  "Zendesk ticket and comment body or html_body fields may contain inline image URLs.",
+  "When an image is relevant, retrieve it with a normal HTTP GET that follows redirects; do not use HEAD to decide whether the image is available because Zendesk content may reject HEAD while allowing GET.",
+  "Save the downloaded image locally and inspect the local image before drawing conclusions from it.",
+].join(" ");
+
 const ticketStatusEnum = z.enum(["new", "open", "pending", "hold", "solved", "closed"]);
 const ticketPriorityEnum = z.enum(["low", "normal", "high", "urgent"]);
 const ticketTypeEnum = z.enum(["problem", "incident", "question", "task"]);
@@ -57,6 +63,7 @@ export function buildZendeskServer(client: ZendeskClient): McpServer {
       capabilities: {
         logging: {},
       },
+      instructions: SERVER_INSTRUCTIONS,
     },
   );
 
