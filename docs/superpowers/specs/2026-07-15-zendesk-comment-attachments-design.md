@@ -1,7 +1,7 @@
 # Zendesk Comment Attachments Design
 
 **Date:** 2026-07-15
-**Status:** Design approved; awaiting written spec review
+**Status:** Approved for implementation
 
 ## Problem
 
