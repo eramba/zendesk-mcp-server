@@ -13,6 +13,17 @@ export type ZendeskTicket = {
   tags?: string[];
 };
 
+export type ZendeskAttachment = {
+  id: number;
+  file_name: string | null;
+  content_type: string | null;
+  size: number | null;
+  content_url: string | null;
+  inline: boolean;
+  deleted: boolean;
+  malware_scan_result: string | null;
+};
+
 export type ZendeskComment = {
   id: number;
   author_id: number | null;
@@ -20,6 +31,7 @@ export type ZendeskComment = {
   html_body: string | null;
   public: boolean;
   created_at: string | null;
+  attachments: ZendeskAttachment[];
 };
 
 export type ZendeskUser = {

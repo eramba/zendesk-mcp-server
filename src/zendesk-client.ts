@@ -3,6 +3,7 @@ import type {
   TicketFieldListResult,
   TicketListResult,
   TicketSearchResult,
+  ZendeskAttachment,
   ZendeskComment,
   ZendeskKnowledgeBase,
   ZendeskOrganization,
@@ -28,6 +29,27 @@ type TicketPayload = {
   organization_id?: number;
   tags?: string[];
   result_type?: string;
+};
+
+type AttachmentPayload = {
+  id?: number;
+  file_name?: string;
+  content_type?: string;
+  size?: number;
+  content_url?: string;
+  inline?: boolean;
+  deleted?: boolean;
+  malware_scan_result?: string;
+};
+
+type CommentPayload = {
+  id?: number;
+  author_id?: number;
+  body?: string;
+  html_body?: string;
+  public?: boolean;
+  created_at?: string;
+  attachments?: AttachmentPayload[];
 };
 
 type UserPayload = {
@@ -109,6 +131,33 @@ function normalizeTicket(ticket: TicketPayload): ZendeskTicket {
     assignee_id: ticket.assignee_id ?? null,
     organization_id: ticket.organization_id ?? null,
     tags: Array.isArray(ticket.tags) ? ticket.tags : [],
+  };
+}
+
+function normalizeAttachment(attachment: AttachmentPayload): ZendeskAttachment {
+  return {
+    id: Number(attachment.id),
+    file_name: attachment.file_name ?? null,
+    content_type: attachment.content_type ?? null,
+    size: attachment.size ?? null,
+    content_url: attachment.content_url ?? null,
+    inline: Boolean(attachment.inline),
+    deleted: Boolean(attachment.deleted),
+    malware_scan_result: attachment.malware_scan_result ?? null,
+  };
+}
+
+function normalizeComment(comment: CommentPayload): ZendeskComment {
+  return {
+    id: Number(comment.id),
+    author_id: comment.author_id ?? null,
+    body: comment.body ?? null,
+    html_body: comment.html_body ?? null,
+    public: Boolean(comment.public),
+    created_at: comment.created_at ?? null,
+    attachments: Array.isArray(comment.attachments)
+      ? comment.attachments.map(normalizeAttachment)
+      : [],
   };
 }
 
@@ -234,25 +283,22 @@ export class ZendeskClient {
   }
 
   async getTicketComments(ticketId: number): Promise<ZendeskComment[]> {
-    const data = await this.request<{
-      comments: Array<{
-        id: number;
-        author_id?: number;
-        body?: string;
-        html_body?: string;
-        public?: boolean;
-        created_at?: string;
-      }>;
-    }>(`/tickets/${ticketId}/comments.json`);
+    const comments: ZendeskComment[] = [];
+    let nextCommentsPath: string | null =
+      `/tickets/${ticketId}/comments.json?include_inline_images=true&page[size]=100`;
 
-    return data.comments.map((comment) => ({
-      id: Number(comment.id),
-      author_id: comment.author_id ?? null,
-      body: comment.body ?? null,
-      html_body: comment.html_body ?? null,
-      public: Boolean(comment.public),
-      created_at: comment.created_at ?? null,
-    }));
+    while (nextCommentsPath) {
+      const data = await this.request<{
+        comments: CommentPayload[];
+        links?: { next?: string | null };
+        next_page?: string | null;
+      }>(nextCommentsPath);
+
+      comments.push(...data.comments.map(normalizeComment));
+      nextCommentsPath = this.nextPath(data.links?.next ?? data.next_page ?? null);
+    }
+
+    return comments;
   }
 
   async getTickets(options: {
