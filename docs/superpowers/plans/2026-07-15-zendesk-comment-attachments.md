@@ -17,6 +17,7 @@
 - Return metadata only; never return attachment bytes or base64 through MCP.
 - Include regular attachments and inline images.
 - Follow every Zendesk comments page and preserve API order.
+- Treat cursor `meta.has_more` as authoritative and normalize full next URLs without duplicating `/api/v2`.
 - Never send Zendesk API credentials to attachment URLs or redirected third-party hosts.
 - Never write downloaded files from the MCP server process.
 - Treat customer files and archives as untrusted input.
@@ -117,6 +118,7 @@ test('getTicketComments includes inline images, follows pagination, and normaliz
         links: {
           next: 'https://example.zendesk.com/api/v2/tickets/36870/comments.json?include_inline_images=true&page%5Bsize%5D=100&page%5Bafter%5D=cursor',
         },
+        meta: { has_more: true },
       })
     }
 
@@ -128,6 +130,7 @@ test('getTicketComments includes inline images, follows pagination, and normaliz
         },
       ],
       links: { next: null },
+      meta: { has_more: false },
     })
   })
 
@@ -140,6 +143,7 @@ test('getTicketComments includes inline images, follows pagination, and normaliz
   assert.equal(firstUrl.searchParams.get('include_inline_images'), 'true')
   assert.equal(firstUrl.searchParams.get('page[size]'), '100')
   assert.match(calls[0].headers.get('authorization') ?? '', /^Basic /)
+  assert.equal(new URL(calls[1].url).pathname, '/api/v2/tickets/36870/comments.json')
   assert.match(calls[1].headers.get('authorization') ?? '', /^Basic /)
 
   assert.deepEqual(comments, [
@@ -175,6 +179,36 @@ test('getTicketComments includes inline images, follows pagination, and normaliz
   ])
 })
 
+test('getTicketComments stops when cursor metadata reports no more pages', async (t) => {
+  let calls = 0
+
+  installFetch(t, async () => {
+    calls += 1
+
+    if (calls === 1) {
+      return jsonResponse({
+        comments: [{ id: 104, attachments: [] }],
+        links: {
+          next: 'https://example.zendesk.com/api/v2/tickets/36870/comments.json?include_inline_images=true&page%5Bsize%5D=100&page%5Bafter%5D=terminal-cursor',
+        },
+        meta: { has_more: false },
+      })
+    }
+
+    return jsonResponse({
+      comments: [],
+      links: { next: null },
+      meta: { has_more: false },
+    })
+  })
+
+  const client = new ZendeskClient('example', 'agent@example.test', 'test-token')
+  const comments = await client.getTicketComments(36870)
+
+  assert.equal(calls, 1)
+  assert.equal(comments.length, 1)
+})
+
 test('get_ticket_comments exposes attachment defaults through MCP', async (t) => {
   installFetch(t, async () =>
     jsonResponse({
@@ -185,6 +219,7 @@ test('get_ticket_comments exposes attachment defaults through MCP', async (t) =>
         },
       ],
       links: { next: null },
+      meta: { has_more: false },
     }),
   )
 
@@ -355,18 +390,47 @@ async getTicketComments(ticketId: number): Promise<ZendeskComment[]> {
     const data = await this.request<{
       comments: CommentPayload[];
       links?: { next?: string | null };
+      meta?: { has_more: boolean };
       next_page?: string | null;
     }>(nextCommentsPath);
 
     comments.push(...data.comments.map(normalizeComment));
-    nextCommentsPath = this.nextPath(data.links?.next ?? data.next_page ?? null);
+    const nextUrl = data.meta
+      ? data.meta.has_more
+        ? (data.links?.next ?? null)
+        : null
+      : (data.next_page ?? data.links?.next ?? null);
+    nextCommentsPath = this.nextPath(nextUrl);
   }
 
   return comments;
 }
 ```
 
-- [ ] **Step 7: Re-run the same focused tests and confirm GREEN**
+- [ ] **Step 7: Normalize full Zendesk cursor URLs against the API base path**
+
+Replace `nextPath()` with:
+
+```ts
+private nextPath(nextUrl: string | null): string | null {
+  if (!nextUrl) {
+    return null;
+  }
+
+  if (nextUrl.startsWith("http://") || nextUrl.startsWith("https://")) {
+    const parsed = new URL(nextUrl);
+    const apiPrefix = "/api/v2";
+    const pathname = parsed.pathname.startsWith(`${apiPrefix}/`)
+      ? parsed.pathname.slice(apiPrefix.length)
+      : parsed.pathname;
+    return `${pathname}${parsed.search}`;
+  }
+
+  return nextUrl;
+}
+```
+
+- [ ] **Step 8: Re-run the same focused tests and confirm GREEN**
 
 Run:
 
@@ -374,9 +438,9 @@ Run:
 npm run build && node --test test/zendesk-comments-attachments.test.mjs
 ```
 
-Expected: PASS with `2` tests passed and `0` failed.
+Expected: PASS with `3` tests passed and `0` failed.
 
-- [ ] **Step 8: Run the existing suite and type checker**
+- [ ] **Step 9: Run the existing suite and type checker**
 
 Run:
 
@@ -386,9 +450,9 @@ npm test
 git diff --check
 ```
 
-Expected: all commands exit `0`; the complete suite reports `3` tests passed and `0` failed.
+Expected: all commands exit `0`; the complete suite reports `4` tests passed and `0` failed.
 
-- [ ] **Step 9: Commit the comment contract**
+- [ ] **Step 10: Commit the comment contract**
 
 ```bash
 git add src/types.ts src/zendesk-client.ts test/zendesk-comments-attachments.test.mjs
@@ -496,7 +560,7 @@ npm test
 git diff --check
 ```
 
-Expected: all commands exit `0`; the complete suite reports `3` tests passed and `0` failed.
+Expected: all commands exit `0`; the complete suite reports `4` tests passed and `0` failed.
 
 - [ ] **Step 7: Commit the server instructions**
 
@@ -532,7 +596,7 @@ npm test
 git diff --check
 ```
 
-Expected: all commands exit `0`; the complete suite reports `3` tests passed and `0` failed.
+Expected: all commands exit `0`; the complete suite reports `4` tests passed and `0` failed.
 
 - [ ] **Step 3: Run the sanitized read-only smoke test against ticket 36870**
 
@@ -601,7 +665,7 @@ try {
 NODE
 ```
 
-Expected: exit `0`, attachment names include `logs_2026-07-14 (2).zip` and `~WRD0000.jpg`, `zip_bytes` is greater than `0`, and `zip_magic` is `PK`.
+Expected: exit `0`, attachment names include `logs_2026-07-14 (2).zip`, inline `image001.png`, and `~WRD0000.jpg`; `zip_bytes` is greater than `0`, and `zip_magic` is `PK`.
 
 - [ ] **Step 4: Review the final diff and scope**
 
@@ -613,12 +677,12 @@ git status --short
 git diff -- README.md
 ```
 
-Expected: no whitespace errors; only the intended README documentation remains uncommitted because Tasks 1 and 2 were already committed.
+Expected: no whitespace errors; only the intended README and approved design/plan documentation updates remain uncommitted because the production changes were already committed.
 
 - [ ] **Step 5: Commit the documentation**
 
 ```bash
-git add README.md
+git add README.md docs/superpowers/specs/2026-07-15-zendesk-comment-attachments-design.md docs/superpowers/plans/2026-07-15-zendesk-comment-attachments.md
 git commit -m "docs: document Zendesk comment attachments"
 ```
 
@@ -628,7 +692,7 @@ Run:
 
 ```bash
 git status --short --branch
-git log -3 --oneline
+git log -4 --oneline
 ```
 
-Expected: the working tree is clean and the latest three commits are the attachment contract, attachment instructions, and README documentation commits.
+Expected: the working tree is clean and the latest four commits are the attachment contract, attachment instructions, cursor pagination correction, and documentation commits.

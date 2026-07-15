@@ -65,10 +65,11 @@ The contract intentionally excludes attachment bytes, API-record URLs, mapped UR
 `ZendeskClient.getTicketComments()` will:
 
 1. Request ticket comments with `include_inline_images=true` and a page size of 100.
-2. Follow Zendesk's returned `links.next` or `next_page` value using the existing `nextPath()` boundary.
-3. Accumulate normalized comments in API order.
-4. Normalize each comment's attachment array into the typed contract.
-5. Fail the whole request if any page fails, avoiding a silently incomplete result.
+2. Treat cursor `meta.has_more` as authoritative; follow `links.next` only when it is true, with `next_page` retained as the offset-pagination fallback.
+3. Normalize full Zendesk next URLs through `nextPath()` without duplicating the `/api/v2` base path.
+4. Accumulate normalized comments in API order.
+5. Normalize each comment's attachment array into the typed contract.
+6. Fail the whole request if any page fails, avoiding a silently incomplete result.
 
 The client continues to authenticate only calls to the configured Zendesk API base URL. It does not fetch attachment `content_url` values.
 
@@ -114,6 +115,7 @@ Focused automated coverage:
 
 - A client test stubs Zendesk comment responses and proves the request includes `include_inline_images=true`.
 - A multi-page fixture proves all pages are followed in order.
+- A cursor fixture proves a non-null `links.next` is ignored when `meta.has_more` is false and that `/api/v2` is not duplicated for a real next page.
 - Attachment fixtures prove the selected fields are normalized without binary data.
 - Comments without attachments produce `attachments: []`.
 - Missing optional values produce the specified null or false defaults.
@@ -128,7 +130,7 @@ After a valid focused RED, apply the stated production change and re-run the sam
 
 Manual read-only verification uses ticket `36870` only as a smoke test:
 
-- MCP output includes the ZIP and JPG attachment metadata.
+- MCP output includes the ZIP, inline image, and JPG attachment metadata.
 - The ZIP `content_url` downloads with GET.
 - The downloaded bytes begin with the ZIP `PK` signature.
 
