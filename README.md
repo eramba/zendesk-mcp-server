@@ -85,6 +85,8 @@ npm run dev
 - `create_ticket`
 - `update_ticket`
 
+`get_ticket_comments` returns an `attachments` array on each comment. Each attachment includes its ID, filename, content type, size, download URL, inline/deleted flags, and malware scan result. File bytes are not embedded in MCP responses; consumers download relevant `content_url` values with a normal GET and inspect them locally.
+
 ## Resources
 
 - `zendesk://knowledge-base`

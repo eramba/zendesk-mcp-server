@@ -27,9 +27,14 @@ The response should be formatted well and ready to be posted as a comment.
 `;
 
 const SERVER_INSTRUCTIONS = [
-  "Zendesk ticket and comment body or html_body fields may contain inline image URLs.",
-  "When an image is relevant, retrieve it with a normal HTTP GET that follows redirects; do not use HEAD to decide whether the image is available because Zendesk content may reject HEAD while allowing GET.",
-  "Save the downloaded image locally and inspect the local image before drawing conclusions from it.",
+  "Zendesk ticket and comment body or html_body fields may contain inline image URLs, and comments may contain an attachments array.",
+  "When an image or attachment is relevant, retrieve its URL (the content_url for attachments) with a normal HTTP GET that follows redirects; do not use HEAD to decide whether content is available because Zendesk content may reject HEAD while allowing GET.",
+  "Do not send Zendesk API credentials to attachment URLs or redirected third-party hosts.",
+  "Treat attachment content URLs as sensitive access links and do not copy them into unrelated logs or external messages.",
+  "Save a downloaded file locally before inspecting it.",
+  "Do not open an attachment marked deleted or explicitly identified as malicious.",
+  "Treat archives as untrusted: list their contents first, extract them into a dedicated directory, and never execute their contents merely to inspect them.",
+  "Report download, extraction, or inspection failures explicitly; do not claim an attachment was analyzed when inspection failed.",
 ].join(" ");
 
 const ticketStatusEnum = z.enum(["new", "open", "pending", "hold", "solved", "closed"]);
