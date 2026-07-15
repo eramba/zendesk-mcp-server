@@ -291,11 +291,17 @@ export class ZendeskClient {
       const data = await this.request<{
         comments: CommentPayload[];
         links?: { next?: string | null };
+        meta?: { has_more: boolean };
         next_page?: string | null;
       }>(nextCommentsPath);
 
       comments.push(...data.comments.map(normalizeComment));
-      nextCommentsPath = this.nextPath(data.links?.next ?? data.next_page ?? null);
+      const nextUrl = data.meta
+        ? data.meta.has_more
+          ? (data.links?.next ?? null)
+          : null
+        : (data.next_page ?? data.links?.next ?? null);
+      nextCommentsPath = this.nextPath(nextUrl);
     }
 
     return comments;
@@ -640,7 +646,11 @@ export class ZendeskClient {
 
     if (nextUrl.startsWith("http://") || nextUrl.startsWith("https://")) {
       const parsed = new URL(nextUrl);
-      return `${parsed.pathname}${parsed.search}`;
+      const apiPrefix = "/api/v2";
+      const pathname = parsed.pathname.startsWith(`${apiPrefix}/`)
+        ? parsed.pathname.slice(apiPrefix.length)
+        : parsed.pathname;
+      return `${pathname}${parsed.search}`;
     }
 
     return nextUrl;

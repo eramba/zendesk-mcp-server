@@ -57,6 +57,7 @@ test('getTicketComments includes inline images, follows pagination, and normaliz
         links: {
           next: 'https://example.zendesk.com/api/v2/tickets/36870/comments.json?include_inline_images=true&page%5Bsize%5D=100&page%5Bafter%5D=cursor',
         },
+        meta: { has_more: true },
       })
     }
 
@@ -68,6 +69,7 @@ test('getTicketComments includes inline images, follows pagination, and normaliz
         },
       ],
       links: { next: null },
+      meta: { has_more: false },
     })
   })
 
@@ -80,6 +82,7 @@ test('getTicketComments includes inline images, follows pagination, and normaliz
   assert.equal(firstUrl.searchParams.get('include_inline_images'), 'true')
   assert.equal(firstUrl.searchParams.get('page[size]'), '100')
   assert.match(calls[0].headers.get('authorization') ?? '', /^Basic /)
+  assert.equal(new URL(calls[1].url).pathname, '/api/v2/tickets/36870/comments.json')
   assert.match(calls[1].headers.get('authorization') ?? '', /^Basic /)
 
   assert.deepEqual(comments, [
@@ -115,6 +118,36 @@ test('getTicketComments includes inline images, follows pagination, and normaliz
   ])
 })
 
+test('getTicketComments stops when cursor metadata reports no more pages', async (t) => {
+  let calls = 0
+
+  installFetch(t, async () => {
+    calls += 1
+
+    if (calls === 1) {
+      return jsonResponse({
+        comments: [{ id: 104, attachments: [] }],
+        links: {
+          next: 'https://example.zendesk.com/api/v2/tickets/36870/comments.json?include_inline_images=true&page%5Bsize%5D=100&page%5Bafter%5D=terminal-cursor',
+        },
+        meta: { has_more: false },
+      })
+    }
+
+    return jsonResponse({
+      comments: [],
+      links: { next: null },
+      meta: { has_more: false },
+    })
+  })
+
+  const client = new ZendeskClient('example', 'agent@example.test', 'test-token')
+  const comments = await client.getTicketComments(36870)
+
+  assert.equal(calls, 1)
+  assert.equal(comments.length, 1)
+})
+
 test('get_ticket_comments exposes attachment defaults through MCP', async (t) => {
   installFetch(t, async () =>
     jsonResponse({
@@ -125,6 +158,7 @@ test('get_ticket_comments exposes attachment defaults through MCP', async (t) =>
         },
       ],
       links: { next: null },
+      meta: { has_more: false },
     }),
   )
 
