@@ -12,6 +12,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
     "dev:http": "tsx src/http.ts",
+    "smoke:http": "node scripts/smoke-http.mjs",
     "start": "node dist/index.js",
     "start:http": "node dist/http.js",
     "test": "npm run build && node --test test/*.test.mjs",

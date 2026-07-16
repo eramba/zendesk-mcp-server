@@ -39,6 +39,75 @@ For local development:
 npm run dev
 ```
 
+### Streamable HTTP
+
+Build and start the HTTP transport locally:
+
+```bash
+npm run build
+MCP_BEARER_TOKEN="$(openssl rand -hex 32)" \
+MCP_ALLOWED_HOSTS="localhost,127.0.0.1" \
+npm run start:http
+```
+
+The endpoints are `POST /mcp` and `GET /healthz`. `GET /mcp` and `DELETE /mcp` return `405` because the server is stateless.
+
+### Docker Compose deployment
+
+The default deployment publishes the container only on the `dev-server` Tailscale address, `100.83.206.45:38184`:
+
+```text
+http://dev-server:38184/mcp
+```
+
+Create `.env` from `.env.example`, keep it mode `0600`, set the three `ZENDESK_*` values, and generate the server token with `openssl rand -hex 32`. Then run:
+
+```bash
+docker compose config
+docker compose up -d --build --wait
+docker compose ps
+docker compose logs --tail=50 zendesk-mcp
+```
+
+Update an existing checkout with:
+
+```bash
+git pull --ff-only origin master
+docker compose up -d --build --wait
+```
+
+Do not bind the plain-HTTP service to a public interface. Tailscale supplies the encrypted network path; public exposure requires HTTPS and a separate access-control review.
+
+### Codex URL configuration
+
+```toml
+[mcp_servers.zendesk]
+url = "http://dev-server:38184/mcp"
+bearer_token_env_var = "ZENDESK_MCP_BEARER_TOKEN"
+```
+
+Set `ZENDESK_MCP_BEARER_TOKEN` to the shared MCP token on each trusted client. Do not copy `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`, or `ZENDESK_API_KEY` to clients.
+
+For a shell-launched Codex process on macOS or Linux:
+
+```bash
+export ZENDESK_MCP_BEARER_TOKEN='the-shared-mcp-token'
+```
+
+For the macOS Codex app in the current login session:
+
+```bash
+launchctl setenv ZENDESK_MCP_BEARER_TOKEN 'the-shared-mcp-token'
+```
+
+Fully quit and reopen the Codex app after changing its environment. Linux services must receive the same variable through their service manager and be restarted.
+
+Verify a configured endpoint without returning ticket data:
+
+```bash
+MCP_URL=http://dev-server:38184/mcp npm run smoke:http
+```
+
 ## Environment variables
 
 - `ZENDESK_SUBDOMAIN`
