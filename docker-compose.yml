@@ -1,0 +1,30 @@
+services:
+  zendesk-mcp:
+    build:
+      context: .
+      target: runtime
+    init: true
+    restart: unless-stopped
+    env_file:
+      - ${MCP_ENV_FILE:-.env}
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+    ports:
+      - "${MCP_BIND_ADDRESS:-100.83.206.45}:${MCP_HOST_PORT:-38184}:3000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/healthz').then((response) => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
