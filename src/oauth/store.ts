@@ -59,6 +59,28 @@ export type ZendeskGrant = {
   scopes: string[];
 };
 
+export type CredentialSnapshot = {
+  principalId: string;
+  zendeskUserId: string;
+  principalEpoch: number;
+  credentialVersion: number;
+  status: "active" | "disconnected" | "reauthorization_required";
+  grant: ZendeskGrant;
+};
+
+export type StageRefreshInput = {
+  principalId: string;
+  expectedPrincipalEpoch: number;
+  expectedCredentialVersion: number;
+  grant: ZendeskGrant;
+  now: number;
+};
+
+export type InstallRefreshResult =
+  | { kind: "installed"; snapshot: CredentialSnapshot }
+  | { kind: "winner"; snapshot: CredentialSnapshot }
+  | { kind: "disconnected" };
+
 export type DisconnectResult =
   | {
       kind: "disconnected";
@@ -170,6 +192,15 @@ export interface OAuthStore extends OAuthRegisteredClientsStore {
   ): ZendeskCallbackContext | undefined;
   stageLoginGrant(input: StageLoginGrantInput): { stageId: string };
   commitLogin(input: CommitLoginInput): LoginCommitResult;
+  loadCredential(principalId: string): CredentialSnapshot | undefined;
+  stageRefreshGrant(input: StageRefreshInput): { stageId: string };
+  installStagedRefresh(stageId: string, now: number): InstallRefreshResult;
+  markReauthorizationRequiredIfCurrent(input: {
+    principalId: string;
+    expectedPrincipalEpoch: number;
+    expectedCredentialVersion: number;
+    now: number;
+  }): boolean;
   challengeForAuthorizationCode(
     clientId: string,
     code: string,

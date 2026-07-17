@@ -30,7 +30,9 @@ import type {
   CommitLoginInput,
   ConsentDecisionInput,
   ConsentDecisionResult,
+  CredentialSnapshot,
   DisconnectResult,
+  InstallRefreshResult,
   LoginCommitResult,
   LoginStart,
   OAuthRedirectContext,
@@ -41,6 +43,7 @@ import type {
   RecoverySummary,
   IssuedTokens,
   StageLoginGrantInput,
+  StageRefreshInput,
   StoredAuthInfo,
   StoreInspection,
   ZendeskGrant,
@@ -258,6 +261,10 @@ type LifecycleStore = Pick<
   | "claimZendeskCallback"
   | "stageLoginGrant"
   | "commitLogin"
+  | "loadCredential"
+  | "stageRefreshGrant"
+  | "installStagedRefresh"
+  | "markReauthorizationRequiredIfCurrent"
   | "challengeForAuthorizationCode"
   | "consumeCodeAndIssueFamily"
   | "rotateRefreshToken"
@@ -528,6 +535,27 @@ function decryptCredentialGrant(
     throw new Error("invalid encrypted Zendesk credential");
   }
   return { ...(grant as ZendeskGrant), scopes: [...ZENDESK_SCOPES] };
+}
+
+function credentialSnapshot(
+  cipher: TokenCipher,
+  principal: PrincipalRow,
+  credential: CredentialRow,
+): CredentialSnapshot | undefined {
+  if (
+    principal.status !== "active" ||
+    principal.lifecycle_epoch !== credential.principal_epoch
+  ) {
+    return undefined;
+  }
+  return {
+    principalId: principal.id,
+    zendeskUserId: principal.zendesk_user_id,
+    principalEpoch: principal.lifecycle_epoch,
+    credentialVersion: credential.credential_version,
+    status: principal.status,
+    grant: decryptCredentialGrant(cipher, principal, credential),
+  };
 }
 
 function decryptRevocationGrant(
@@ -1368,6 +1396,264 @@ class SqliteOAuthStore implements LifecycleStore {
         principalEpoch,
         authorizationCode,
       };
+    }).immediate();
+  }
+
+  loadCredential(principalId: string): CredentialSnapshot | undefined {
+    this.assertReady();
+    if (typeof principalId !== "string" || principalId.length === 0) return undefined;
+    return this.#db.transaction(() => {
+      const principal = this.#db
+        .prepare<[string], PrincipalRow>("SELECT * FROM principals WHERE id = ?")
+        .get(principalId);
+      if (!principal || principal.status !== "active") return undefined;
+      const credential = this.#db
+        .prepare<[string], CredentialRow>(
+          "SELECT * FROM zendesk_credentials WHERE principal_id = ?",
+        )
+        .get(principalId);
+      if (!credential) return undefined;
+      return credentialSnapshot(this.#cipher, principal, credential);
+    })();
+  }
+
+  stageRefreshGrant(input: StageRefreshInput): { stageId: string } {
+    this.assertReady();
+    const grant = normalizeZendeskGrant(input.grant, input.now);
+    if (
+      !validStoreTime(input.now) ||
+      typeof input.principalId !== "string" ||
+      input.principalId.length === 0 ||
+      !Number.isSafeInteger(input.expectedPrincipalEpoch) ||
+      input.expectedPrincipalEpoch < 1 ||
+      !Number.isSafeInteger(input.expectedCredentialVersion) ||
+      input.expectedCredentialVersion < 1 ||
+      !grant
+    ) {
+      throw new Error("invalid refresh stage");
+    }
+
+    return this.#db.transaction(() => {
+      const principal = this.#db
+        .prepare<[string], PrincipalRow>("SELECT * FROM principals WHERE id = ?")
+        .get(input.principalId);
+      if (!principal) throw new Error("invalid refresh stage");
+      const stageId = this.#randomId();
+      if (!isOpaque(stageId)) throw new Error("OAuth store random source is invalid");
+      const stage: StagedGrantRow = {
+        id: stageId,
+        login_transaction_id: null,
+        purpose: "refresh",
+        subdomain: principal.subdomain,
+        expected_principal_id: input.principalId,
+        expected_principal_epoch: input.expectedPrincipalEpoch,
+        expected_credential_version: input.expectedCredentialVersion,
+        encrypted_grant_json: "",
+        status: "staged",
+        created_at: input.now,
+        expires_at: grant.accessExpiresAt,
+      };
+      const encrypted = this.#cipher.encrypt(
+        JSON.stringify(grant),
+        stagedGrantCipherContext(stage),
+      );
+      this.#db
+        .prepare(
+          `INSERT INTO staged_grants (
+             id, login_transaction_id, purpose, subdomain,
+             expected_principal_id, expected_principal_epoch,
+             expected_credential_version, encrypted_grant_json,
+             status, created_at, expires_at
+           ) VALUES (?, NULL, 'refresh', ?, ?, ?, ?, ?, 'staged', ?, ?)`,
+        )
+        .run(
+          stage.id,
+          stage.subdomain,
+          stage.expected_principal_id,
+          stage.expected_principal_epoch,
+          stage.expected_credential_version,
+          JSON.stringify(encrypted),
+          stage.created_at,
+          stage.expires_at,
+        );
+      return { stageId };
+    })();
+  }
+
+  installStagedRefresh(stageId: string, now: number): InstallRefreshResult {
+    this.assertReady();
+    if (typeof stageId !== "string" || !validStoreTime(now)) {
+      throw new Error("invalid refresh stage");
+    }
+
+    return this.#db.transaction((): InstallRefreshResult => {
+      const stage = this.#db
+        .prepare<[string, number], StagedGrantRow>(
+          `SELECT * FROM staged_grants
+           WHERE id = ? AND purpose = 'refresh' AND status = 'staged' AND expires_at > ?`,
+        )
+        .get(stageId, now);
+      if (
+        !stage ||
+        stage.expected_principal_id === null ||
+        stage.expected_principal_epoch === null ||
+        stage.expected_credential_version === null
+      ) {
+        throw new Error("invalid refresh stage");
+      }
+      let grant: ZendeskGrant;
+      try {
+        grant = decryptStagedGrant(this.#cipher, stage, now);
+      } catch {
+        throw new Error("invalid refresh stage");
+      }
+
+      const principal = this.#db
+        .prepare<[string], PrincipalRow>("SELECT * FROM principals WHERE id = ?")
+        .get(stage.expected_principal_id);
+      const credential = principal
+        ? this.#db
+            .prepare<[string], CredentialRow>(
+              "SELECT * FROM zendesk_credentials WHERE principal_id = ?",
+            )
+            .get(principal.id)
+        : undefined;
+      const current = principal && credential
+        ? credentialSnapshot(this.#cipher, principal, credential)
+        : undefined;
+
+      if (
+        current &&
+        current.principalEpoch === stage.expected_principal_epoch &&
+        current.credentialVersion === stage.expected_credential_version
+      ) {
+        const credentialVersion = current.credentialVersion + 1;
+        if (!Number.isSafeInteger(credentialVersion)) {
+          throw new Error("OAuth credential version overflow");
+        }
+        const encrypted = this.#cipher.encrypt(JSON.stringify(grant), {
+          kind: "zendesk_credential",
+          rowId: current.principalId,
+          expiresAt: grant.refreshExpiresAt,
+          subdomain: stage.subdomain,
+          principalId: current.principalId,
+          credentialVersion,
+          principalEpoch: current.principalEpoch,
+        });
+        const installed = this.#db
+          .prepare(
+            `UPDATE zendesk_credentials
+             SET credential_version = ?, encrypted_grant_json = ?,
+                 access_expires_at = ?, refresh_expires_at = ?, scopes = ?, updated_at = ?
+             WHERE principal_id = ? AND principal_epoch = ? AND credential_version = ?`,
+          )
+          .run(
+            credentialVersion,
+            JSON.stringify(encrypted),
+            grant.accessExpiresAt,
+            grant.refreshExpiresAt,
+            grant.scopes.join(" "),
+            now,
+            current.principalId,
+            current.principalEpoch,
+            current.credentialVersion,
+          ).changes;
+        if (installed !== 1) throw new Error("OAuth credential changed concurrently");
+        const deleted = this.#db
+          .prepare("DELETE FROM staged_grants WHERE id = ? AND status = 'staged'")
+          .run(stage.id).changes;
+        if (deleted !== 1) throw new Error("OAuth refresh stage changed concurrently");
+        return {
+          kind: "installed",
+          snapshot: {
+            ...current,
+            credentialVersion,
+            grant,
+          },
+        };
+      }
+
+      const deleted = this.#db
+        .prepare("DELETE FROM staged_grants WHERE id = ? AND status = 'staged'")
+        .run(stage.id).changes;
+      if (deleted !== 1) throw new Error("OAuth refresh stage changed concurrently");
+      if (current) return { kind: "winner", snapshot: current };
+      return { kind: "disconnected" };
+    }).immediate();
+  }
+
+  markReauthorizationRequiredIfCurrent(input: {
+    principalId: string;
+    expectedPrincipalEpoch: number;
+    expectedCredentialVersion: number;
+    now: number;
+  }): boolean {
+    this.assertReady();
+    if (
+      typeof input.principalId !== "string" ||
+      input.principalId.length === 0 ||
+      !Number.isSafeInteger(input.expectedPrincipalEpoch) ||
+      input.expectedPrincipalEpoch < 1 ||
+      !Number.isSafeInteger(input.expectedCredentialVersion) ||
+      input.expectedCredentialVersion < 1 ||
+      !validStoreTime(input.now)
+    ) {
+      return false;
+    }
+
+    return this.#db.transaction(() => {
+      const principal = this.#db
+        .prepare<[string], PrincipalRow>("SELECT * FROM principals WHERE id = ?")
+        .get(input.principalId);
+      const credential = principal
+        ? this.#db
+            .prepare<[string], CredentialRow>(
+              "SELECT * FROM zendesk_credentials WHERE principal_id = ?",
+            )
+            .get(principal.id)
+        : undefined;
+      if (
+        !principal ||
+        !credential ||
+        principal.status !== "active" ||
+        principal.lifecycle_epoch !== input.expectedPrincipalEpoch ||
+        credential.principal_epoch !== input.expectedPrincipalEpoch ||
+        credential.credential_version !== input.expectedCredentialVersion
+      ) {
+        return false;
+      }
+      const nextEpoch = principal.lifecycle_epoch + 1;
+      if (!Number.isSafeInteger(nextEpoch)) {
+        throw new Error("OAuth principal lifecycle epoch overflow");
+      }
+      const changed = this.#db
+        .prepare(
+          `UPDATE principals
+           SET status = 'reauthorization_required', lifecycle_epoch = ?, updated_at = ?
+           WHERE id = ? AND status = 'active' AND lifecycle_epoch = ?`,
+        )
+        .run(nextEpoch, input.now, principal.id, principal.lifecycle_epoch).changes;
+      if (changed !== 1) return false;
+      this.#db
+        .prepare(
+          `UPDATE authorization_codes SET consumed_at = ?
+           WHERE principal_id = ? AND consumed_at IS NULL`,
+        )
+        .run(input.now, principal.id);
+      this.#db
+        .prepare(
+          `UPDATE token_families
+           SET revoked_at = ?, revoke_reason = 'principal_reauthorization_required'
+           WHERE principal_id = ? AND revoked_at IS NULL`,
+        )
+        .run(input.now, principal.id);
+      this.#db
+        .prepare(
+          `UPDATE staged_grants SET status = 'discard_only'
+           WHERE expected_principal_id = ? AND status = 'staged'`,
+        )
+        .run(principal.id);
+      return true;
     }).immediate();
   }
 
