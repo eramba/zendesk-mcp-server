@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -322,7 +322,7 @@ test('refresh stages before users/me, requires the exact user, and persists rota
   assert.deepEqual(reopened.loadCredential(principal.principalId).grant, rotated)
 })
 
-test('a refreshed grant with a different users/me ID is discarded and never installed', async (t) => {
+test('recovery securely deletes an identity-mismatched refresh stage across reopen', async (t) => {
   const f = await fixture(t)
   const initial = grant('identity-old', NOW + 1)
   const rotated = grant('identity-wrong')
@@ -342,9 +342,31 @@ test('a refreshed grant with a different users/me ID is discarded and never inst
 
   await assert.rejects(clientResolver.resolve(principal.principalId), /identity/i)
   assert.deepEqual(f.store.loadCredential(principal.principalId).grant, initial)
-  assert.deepEqual(rows(f.path, 'SELECT purpose, status FROM staged_grants'), [
-    { purpose: 'refresh', status: 'discard_only' },
-  ])
+  const discarded = rows(
+    f.path,
+    'SELECT purpose, status, encrypted_grant_json FROM staged_grants',
+  )
+  assert.equal(discarded.length, 1)
+  assert.equal(discarded[0].purpose, 'refresh')
+  assert.equal(discarded[0].status, 'discard_only')
+  const encryptedStage = discarded[0].encrypted_grant_json
+
+  f.store.recover(NOW)
+  assert.deepEqual(rows(f.path, 'SELECT * FROM staged_grants'), [])
+  const backup = join(f.directory, 'recovered.sqlite')
+  await f.store.backup(backup)
+  assert.equal((await readFile(backup)).includes(Buffer.from(encryptedStage, 'utf8')), false)
+
+  f.store.close()
+  const reopened = openSqliteOAuthStore({
+    path: f.path,
+    cipher: f.cipher,
+    mcpResourceUrl: new URL(RESOURCE),
+    now: () => NOW,
+  })
+  t.after(() => reopened.close())
+  assert.deepEqual(rows(f.path, 'SELECT * FROM staged_grants'), [])
+  assert.deepEqual(reopened.loadCredential(principal.principalId).grant, initial)
 })
 
 test('a concurrent login CAS winner is adopted and the losing stage is removed locally', async (t) => {

@@ -729,13 +729,16 @@ function recoverRows(db: Database.Database, now: number): RecoverySummary {
            AND status IN ('consent_pending', 'upstream_pending', 'callback_claimed')`,
       )
       .run(now, now).changes;
-    const discardedStages = db
+    db
       .prepare(
         `UPDATE staged_grants
          SET status = 'discard_only'
          WHERE status = 'staged' AND expires_at <= ?`,
       )
-      .run(now).changes;
+      .run(now);
+    const discardedStages = db
+      .prepare("DELETE FROM staged_grants WHERE status = 'discard_only'")
+      .run().changes;
     db.prepare(
       `UPDATE revocation_outbox
        SET status = 'claimed', encrypted_grant_json = '{}',
