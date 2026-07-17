@@ -12,6 +12,8 @@ services:
       PORT: 3000
     ports:
       - "${MCP_BIND_ADDRESS:-127.0.0.1}:${MCP_HOST_PORT:-38184}:3000"
+    volumes:
+      - oauth-data:/data
     healthcheck:
       test:
         - CMD
@@ -28,3 +30,6 @@ services:
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 15s
+
+volumes:
+  oauth-data:
