@@ -421,7 +421,7 @@ test('reschedule accepts only exact clock-based exponential backoff including th
   assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 900), true)
 })
 
-test('recovery deletes pending and stranded claimed tombstones at the retention boundary', async (t) => {
+test('recovery terminalizes pending and stranded claimed tombstones at the retention boundary', async (t) => {
   const { path, store, client } = await fixture(t)
   const pending = login(store, client.client_id, 'retention-pending', {
     subdomain: 'alpha',
@@ -439,10 +439,78 @@ test('recovery deletes pending and stranded claimed tombstones at the retention 
   assert.equal(query(path, 'SELECT COUNT(*) AS count FROM revocation_outbox')[0].count, 2)
 
   store.recover(retention)
-  assert.equal(query(path, 'SELECT * FROM revocation_outbox').length, 0)
+  assert.deepEqual(
+    query(
+      path,
+      `SELECT status, encrypted_grant_json, claim_owner, claim_expires_at, completed_at
+       FROM revocation_outbox ORDER BY principal_id`,
+    ),
+    [
+      {
+        status: 'claimed',
+        encrypted_grant_json: '{}',
+        claim_owner: null,
+        claim_expires_at: null,
+        completed_at: retention,
+      },
+      {
+        status: 'claimed',
+        encrypted_grant_json: '{}',
+        claim_owner: null,
+        claim_expires_at: null,
+        completed_at: retention,
+      },
+    ],
+  )
   assert.equal(store.claimDueRevocation('new-owner', retention, retention + 10), undefined)
   assert.equal(pendingDisconnect.kind, 'disconnected')
   assert.equal(claimedDisconnect.kind, 'disconnected')
+})
+
+test('retention preserves the credential-version high-water mark for later reactivation', async (t) => {
+  const { path, store, client } = await fixture(t)
+  const first = login(store, client.client_id, 'retention-version-one', { now: NOW })
+  const second = login(store, client.client_id, 'retention-version-two', { now: NOW + 1 })
+  assert.equal(first.committed.principalId, second.committed.principalId)
+  assert.equal(
+    query(path, 'SELECT credential_version FROM zendesk_credentials')[0].credential_version,
+    2,
+  )
+
+  const disconnected = store.disconnectUser(SUBDOMAIN, USER_ID, NOW + 10)
+  const retention = second.grant.refreshExpiresAt + 604_800
+  store.recover(retention)
+
+  assert.deepEqual(
+    query(
+      path,
+      `SELECT principal_id, captured_principal_epoch, credential_version,
+              encrypted_grant_json, status, claim_owner, claim_expires_at,
+              retention_expires_at, completed_at
+       FROM revocation_outbox`,
+    ),
+    [{
+      principal_id: disconnected.principalId,
+      captured_principal_epoch: 2,
+      credential_version: 2,
+      encrypted_grant_json: '{}',
+      status: 'claimed',
+      claim_owner: null,
+      claim_expires_at: null,
+      retention_expires_at: retention,
+      completed_at: retention,
+    }],
+  )
+  assert.equal(store.claimDueRevocation('late-worker', retention, retention + 30), undefined)
+
+  const reactivated = login(store, client.client_id, 'after-retention', { now: retention + 1 })
+  assert.equal(reactivated.committed.principalId, disconnected.principalId)
+  assert.equal(reactivated.committed.principalEpoch, 3)
+  assert.equal(
+    query(path, 'SELECT credential_version FROM zendesk_credentials')[0].credential_version,
+    3,
+  )
+  assert.equal(query(path, 'SELECT credential_version FROM revocation_outbox')[0].credential_version, 2)
 })
 
 test('an expired claim is reclaimed after reopen and only for the still-disconnected captured epoch', async (t) => {

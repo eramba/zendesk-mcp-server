@@ -709,9 +709,12 @@ function recoverRows(db: Database.Database, now: number): RecoverySummary {
       )
       .run(now).changes;
     db.prepare(
-      `DELETE FROM revocation_outbox
+      `UPDATE revocation_outbox
+       SET status = 'claimed', encrypted_grant_json = '{}',
+           claim_owner = NULL, claim_expires_at = NULL,
+           completed_at = COALESCE(completed_at, ?)
        WHERE retention_expires_at <= ?`,
-    ).run(now);
+    ).run(now, now);
     const reclaimedClaims = db
       .prepare(
         `UPDATE revocation_outbox
@@ -722,7 +725,7 @@ function recoverRows(db: Database.Database, now: number): RecoverySummary {
       )
       .run(now).changes;
     return { expiredLogins, discardedStages, reclaimedClaims };
-  })();
+  }).immediate();
 }
 
 class SqliteOAuthStore implements LifecycleStore {
