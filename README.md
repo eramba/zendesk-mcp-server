@@ -162,21 +162,21 @@ Keep the OAuth encryption key in separate custody from both the live volume and 
 
 Use this restore procedure:
 
-1. Copy the completed consistent backup to a protected restore-input directory. If recovery uses a separately captured SQLite snapshot instead, checkpoint that snapshot before copying it; never copy the live `oauth.sqlite`, `-wal`, and `-shm` files independently.
-2. Resolve the exact already-built application image ID, create a disposable volume, and seed only that volume without network access or the normal entrypoint:
+1. Place the completed consistent backup in a protected restore-input directory as a protected root-owned backup with mode `0600`. If recovery uses a separately captured SQLite snapshot instead, checkpoint that snapshot before copying it; never copy the live `oauth.sqlite`, `-wal`, and `-shm` files independently.
+2. Resolve the exact already-built application image ID, create a disposable volume, and seed only that volume without network access or the normal entrypoint. Override the image user to root for this copy step only so it can read the protected root-owned input; hand the restored database back to the runtime user before the helper exits:
 
    ```bash
    RESTORE_IMAGE="$(docker compose images --quiet zendesk-mcp)"
    test -n "$RESTORE_IMAGE"
    docker volume create zendesk-oauth-restore-drill
-   docker run --rm --network none \
+   docker run --rm --network none --user root \
      --mount type=bind,source="$PWD/restore-input",target=/restore-input,readonly \
      --mount type=volume,source=zendesk-oauth-restore-drill,target=/data \
      --entrypoint sh "$RESTORE_IMAGE" \
-     -c 'cp /restore-input/<new-name>.sqlite /data/oauth.sqlite && chmod 0600 /data/oauth.sqlite'
+     -c 'cp /restore-input/<new-name>.sqlite /data/oauth.sqlite && chown node:node /data/oauth.sqlite && chmod 0600 /data/oauth.sqlite'
    ```
 
-3. Load the exact `ZENDESK_SUBDOMAIN` and the matching separately held `OAUTH_ENCRYPTION_KEY` into the operator shell without printing them. Verify the disposable database with the same exact image in a one-off, network-isolated admin process:
+3. Load the exact `ZENDESK_SUBDOMAIN` and the matching separately held `OAUTH_ENCRYPTION_KEY` into the operator shell without printing them. Verify the disposable database with the same exact image in a one-off, network-isolated admin process. Do not set `--user`: the image's default `USER node` must read the restored `node:node` database.
 
    ```bash
    docker run --rm --network none \
@@ -198,7 +198,7 @@ Use this restore procedure:
 
 5. For disaster recovery, keep the original volume untouched until the disposable-volume drill passes, then switch the deployment to a restored replacement volume during a maintenance window.
 
-Acceptance criteria: the consistent-backup or checkpointed-snapshot restore opens only with the matching separately held key and subdomain, reports the expected non-secret sessions from the exact image, starts no HTTP process or worker, has no network, removes the disposable volume, and does not modify the source backup or live volume.
+Acceptance criteria: only the seed helper runs as root; it produces `/data/oauth.sqlite` owned by `node:node` with mode `0600`; the consistent-backup or checkpointed-snapshot restore then opens as the image's default non-root `node` user only with the matching separately held key and subdomain, reports the expected non-secret sessions from the exact image, starts no HTTP process or worker, has no network, removes the disposable volume, and does not modify the source backup or live volume.
 
 ## Maintenance-window cutover and rollback
 

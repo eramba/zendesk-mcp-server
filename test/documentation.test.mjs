@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 const README = new URL('../README.md', import.meta.url)
+const DOCKERFILE = new URL('../Dockerfile', import.meta.url)
 
 test('documents separate stdio API-token and HTTP OAuth setup', async () => {
   const readme = await readFile(README, 'utf8')
@@ -34,10 +35,20 @@ test('documents URL-only Codex login and exact local versus server revocation se
 })
 
 test('documents safe backup, restore, cutover, rollback, retirement, and orphan-grant recovery', async () => {
-  const readme = await readFile(README, 'utf8')
+  const [readme, dockerfile] = await Promise.all([
+    readFile(README, 'utf8'),
+    readFile(DOCKERFILE, 'utf8'),
+  ])
   const restore = readme.match(/## Backup and restore\n([\s\S]*?)(?=## Maintenance-window cutover)/)?.[1]
 
   assert.ok(restore, 'README must contain a bounded backup and restore section')
+  const shellBlocks = [...restore.matchAll(/```bash\n([\s\S]*?)```/g)]
+    .map((match) => match[1])
+  const seed = shellBlocks.find((block) => block.includes('cp /restore-input/'))
+  const verification = shellBlocks.find((block) =>
+    block.includes('scripts/oauth-admin.mjs sessions'))
+  assert.ok(seed, 'restore procedure must have a dedicated seed command')
+  assert.ok(verification, 'restore procedure must have a dedicated admin verification command')
   assert.match(
     restore,
     /npm run oauth:backup -- --destination \/data\/backups\/<new-name>\.sqlite/,
@@ -48,6 +59,14 @@ test('documents safe backup, restore, cutover, rollback, retirement, and orphan-
   assert.match(restore, /RESTORE_IMAGE="\$\(docker compose images --quiet zendesk-mcp\)"/)
   assert.match(restore, /--network none/)
   assert.match(restore, /--entrypoint node/)
+  assert.match(restore, /protected root-owned backup/i)
+  assert.match(seed, /--user root/)
+  assert.match(
+    seed,
+    /cp \/restore-input\/<new-name>\.sqlite \/data\/oauth\.sqlite && chown node:node \/data\/oauth\.sqlite && chmod 0600 \/data\/oauth\.sqlite/,
+  )
+  assert.match(dockerfile, /^USER node$/m)
+  assert.doesNotMatch(verification, /--user(?:=|\s+)root/)
   assert.match(restore, /--env ZENDESK_SUBDOMAIN/)
   assert.match(restore, /--env OAUTH_ENCRYPTION_KEY/)
   assert.match(restore, /--env OAUTH_DB_PATH=\/data\/oauth\.sqlite/)
