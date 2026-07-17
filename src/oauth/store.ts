@@ -224,6 +224,12 @@ export interface OAuthStore extends OAuthRegisteredClientsStore {
     owner: string,
     leaseExpiresAt: number,
   ): boolean;
+  replaceRevocationGrant(
+    outboxId: string,
+    owner: string,
+    grant: ZendeskGrant,
+    now: number,
+  ): boolean;
   rescheduleRevocation(
     outboxId: string,
     owner: string,

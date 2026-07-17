@@ -221,6 +221,16 @@ export class ZendeskRevocationWorker {
     const refreshed = await this.#zendesk.refreshCredential(claim.grant.refreshToken, signal);
     const revokeNow = this.#clock();
     if (revokeNow === undefined) return;
+    if (
+      !this.#store.replaceRevocationGrant(
+        claim.outboxId,
+        this.#owner,
+        refreshed,
+        revokeNow,
+      )
+    ) {
+      return;
+    }
     const revokeLease = this.#leaseDeadline(revokeNow, refreshLease);
     if (
       revokeLease === undefined

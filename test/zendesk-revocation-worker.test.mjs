@@ -1,8 +1,15 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, readFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
+
+import Database from 'better-sqlite3'
 
 import { ZendeskUpstreamError } from '../dist/oauth/errors.js'
 import { ZendeskRevocationWorker } from '../dist/oauth/revocation-worker.js'
+import { openSqliteOAuthStore } from '../dist/oauth/sqlite-store.js'
+import { TokenCipher } from '../dist/oauth/token-cipher.js'
 import { ZendeskOAuthClient } from '../dist/oauth/zendesk-oauth-client.js'
 
 const NOW = 1_700_000_000
@@ -11,6 +18,17 @@ const LEASE_SECONDS = Math.ceil((TIMEOUT_MS + 5_000) / 1_000)
 const ACCESS_SENTINEL = 'access-secret-SENTINEL'
 const REFRESH_SENTINEL = 'refresh-secret-SENTINEL'
 const EMAIL_SENTINEL = 'worker-user@example.test'
+const RESOURCE = 'https://dev-server.tail22145b.ts.net/mcp'
+const REDIRECT_URI = 'http://127.0.0.1:43123/callback'
+const CODE_CHALLENGE = 'C'.repeat(43)
+const VALID_CLIENT = {
+  redirect_uris: [REDIRECT_URI],
+  token_endpoint_auth_method: 'none',
+  grant_types: ['authorization_code', 'refresh_token'],
+  response_types: ['code'],
+  client_name: 'Codex Desktop',
+  scope: 'zendesk:read zendesk:write',
+}
 
 function grant(overrides = {}) {
   return {
@@ -73,6 +91,10 @@ function fakeStore({ nextClaim = claim(), renew = true } = {}) {
       calls.push(['renew', outboxId, owner, leaseExpiresAt])
       return typeof renew === 'function' ? renew() : renew
     },
+    replaceRevocationGrant(outboxId, owner, replacement, now) {
+      calls.push(['replace', outboxId, owner, replacement, now])
+      return true
+    },
     rescheduleRevocation(outboxId, owner, category, nextAttemptAt) {
       calls.push(['reschedule', outboxId, owner, category, nextAttemptAt])
       return true
@@ -86,6 +108,99 @@ function fakeStore({ nextClaim = claim(), renew = true } = {}) {
       return 1
     },
   }
+}
+
+function query(path, sql, ...parameters) {
+  const db = new Database(path, { readonly: true })
+  try {
+    return db.prepare(sql).all(...parameters)
+  } finally {
+    db.close()
+  }
+}
+
+function decryptOutboxGrant(path, cipher) {
+  const row = query(
+    path,
+    `SELECT o.*, p.subdomain
+     FROM revocation_outbox o JOIN principals p ON p.id = o.principal_id`,
+  )[0]
+  assert.ok(row)
+  const plaintext = cipher.decrypt(JSON.parse(row.encrypted_grant_json), {
+    kind: 'disconnect_outbox',
+    rowId: row.id,
+    expiresAt: row.retention_expires_at,
+    subdomain: row.subdomain,
+    principalId: row.principal_id,
+    credentialVersion: row.credential_version,
+    principalEpoch: row.captured_principal_epoch,
+  })
+  return { row, grant: JSON.parse(plaintext) }
+}
+
+async function sqliteWorkerFixture(t, clock) {
+  const directory = await mkdtemp(join(tmpdir(), 'zendesk-revocation-worker-'))
+  const path = join(directory, 'oauth.sqlite')
+  const cipher = new TokenCipher(Buffer.alloc(32, 71))
+  const stores = []
+  const open = () => {
+    const store = openSqliteOAuthStore({
+      path,
+      cipher,
+      mcpResourceUrl: new URL(RESOURCE),
+      now: () => clock.value,
+    })
+    stores.push(store)
+    return store
+  }
+  t.after(() => {
+    for (const store of stores) {
+      if (store.isReady()) store.close()
+    }
+  })
+  const store = open()
+  const client = store.registerClient(VALID_CLIENT)
+  const started = store.beginLogin({
+    clientId: client.client_id,
+    redirectUri: REDIRECT_URI,
+    codeChallenge: CODE_CHALLENGE,
+    scopes: ['zendesk:read', 'zendesk:write'],
+    resource: RESOURCE,
+    originalState: 'worker-crash-state',
+    subdomain: 'example',
+    now: NOW,
+  })
+  const consent = store.decideConsent({
+    transactionToken: started.transactionToken,
+    consentCsrf: started.consentCsrf,
+    browserNonce: started.browserNonce,
+    decision: 'confirm',
+    now: NOW,
+  })
+  assert.equal(consent.kind, 'confirmed')
+  const callback = store.claimZendeskCallback(consent.upstreamState, NOW)
+  assert.ok(callback)
+  const initialGrant = grant({
+    accessToken: 'pre-refresh-access-SENTINEL',
+    refreshToken: 'pre-refresh-refresh-SENTINEL',
+    accessExpiresAt: NOW + 60,
+    refreshExpiresAt: NOW + 3_600,
+  })
+  const staged = store.stageLoginGrant({
+    transactionId: callback.transactionId,
+    subdomain: 'example',
+    grant: initialGrant,
+    now: NOW,
+  })
+  store.commitLogin({
+    transactionId: callback.transactionId,
+    stageId: staged.stageId,
+    zendeskUserId: '424242',
+    now: NOW,
+  })
+  const disconnected = store.disconnectUser('example', '424242', NOW + 10)
+  assert.equal(disconnected.kind, 'disconnected')
+  return { cipher, directory, disconnected, initialGrant, open, path, store }
 }
 
 function worker(options = {}) {
@@ -207,9 +322,87 @@ test('revokes current token directly, and 401 refreshes solely for renewed immed
   ])
   const renewals = refreshStore.calls.filter(([name]) => name === 'renew')
   assert.equal(renewals.length, 2)
+  const replacement = refreshStore.calls.find(([name]) => name === 'replace')
+  assert.deepEqual(replacement, ['replace', 'outbox-1', 'worker-owner-a', refreshed, NOW])
+  assert.equal(
+    refreshStore.calls.findIndex(([name]) => name === 'replace')
+      < refreshStore.calls.findLastIndex(([name]) => name === 'renew'),
+    true,
+  )
   assert.equal(renewals[0][3] > NOW + LEASE_SECONDS, true)
   assert.equal(renewals[1][3] > renewals[0][3], true)
   assert.equal(refreshStore.calls.findIndex(([name]) => name === 'renew') < refreshStore.calls.findIndex(([name]) => name === 'complete'), true)
+})
+
+test('a crash after refresh persistence reclaims and revokes the exact rotated SQLite tombstone', async (t) => {
+  const clock = { value: NOW + 10 }
+  const fixture = await sqliteWorkerFixture(t, clock)
+  const rotated = grant({
+    accessToken: 'crash-rotated-access-SENTINEL',
+    refreshToken: 'crash-rotated-refresh-SENTINEL',
+    accessExpiresAt: NOW + 1_800,
+    refreshExpiresAt: NOW + 172_800,
+  })
+  const secondDelete = deferred()
+  let secondDeleteToken
+  const crashedWorker = new ZendeskRevocationWorker({
+    store: fixture.store,
+    zendesk: {
+      async revokeCurrentToken(token) {
+        if (token === fixture.initialGrant.accessToken) {
+          throw upstream('unauthorized', false, 401)
+        }
+        secondDeleteToken = token
+        return secondDelete.promise
+      },
+      async refreshCredential(token) {
+        assert.equal(token, fixture.initialGrant.refreshToken)
+        return rotated
+      },
+    },
+    timeoutMs: 1_000,
+    now: () => clock.value,
+    randomOwner: () => 'crashed-worker',
+    pollIntervalMs: 1,
+  })
+
+  crashedWorker.start()
+  await waitFor(() => secondDeleteToken !== undefined, 'second delete after durable refresh')
+  assert.equal(secondDeleteToken, rotated.accessToken)
+  assert.deepEqual(decryptOutboxGrant(fixture.path, fixture.cipher).grant, rotated)
+  assert.equal(
+    decryptOutboxGrant(fixture.path, fixture.cipher).row.retention_expires_at,
+    rotated.refreshExpiresAt + 604_800,
+  )
+
+  fixture.store.close()
+  clock.value = NOW + 18
+  const reopened = fixture.open()
+  const replacementTokens = []
+  const replacementWorker = new ZendeskRevocationWorker({
+    store: reopened,
+    zendesk: {
+      async revokeCurrentToken(token) { replacementTokens.push(token) },
+      refreshCredential: () => assert.fail('durable rotated access token must revoke directly'),
+    },
+    timeoutMs: 1_000,
+    now: () => clock.value,
+    randomOwner: () => 'replacement-worker',
+    pollIntervalMs: 1,
+  })
+  replacementWorker.start()
+  await waitFor(
+    () => query(fixture.path, 'SELECT completed_at FROM revocation_outbox')[0].completed_at !== null,
+    'replacement completion',
+  )
+  await replacementWorker.stop()
+
+  assert.deepEqual(replacementTokens, [rotated.accessToken])
+  const backup = join(fixture.directory, 'rotated-backup.sqlite')
+  await reopened.backup(backup)
+  const bytes = await readFile(backup)
+  assert.equal(bytes.includes(Buffer.from(rotated.accessToken)), false)
+  assert.equal(bytes.includes(Buffer.from(rotated.refreshToken)), false)
 })
 
 test('invalid grant, known refresh expiry, and already-revoked outcomes complete terminally', async () => {

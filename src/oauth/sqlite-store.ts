@@ -272,6 +272,7 @@ type LifecycleStore = Pick<
   | "disconnectUser"
   | "claimDueRevocation"
   | "renewRevocationClaim"
+  | "replaceRevocationGrant"
   | "rescheduleRevocation"
   | "completeRevocation"
   | "releaseClaims"
@@ -2432,6 +2433,93 @@ class SqliteOAuthStore implements LifecycleStore {
           leaseExpiresAt,
         ).changes === 1,
     ).immediate();
+  }
+
+  replaceRevocationGrant(
+    outboxId: string,
+    owner: string,
+    grant: ZendeskGrant,
+    now: number,
+  ): boolean {
+    this.assertReady();
+    const normalized = normalizeZendeskGrant(grant, now);
+    if (
+      typeof outboxId !== "string" ||
+      outboxId.length === 0 ||
+      !validClaimOwner(owner) ||
+      !validStoreTime(now) ||
+      normalized === undefined ||
+      normalized.refreshExpiresAt > Number.MAX_SAFE_INTEGER - 604_800
+    ) {
+      return false;
+    }
+    const grantRetentionExpiresAt = normalized.refreshExpiresAt + 604_800;
+
+    return this.#db.transaction(() => {
+      const row = this.#db
+        .prepare<[string, string, number, number], RevocationOutboxRow>(
+          `SELECT revocation_outbox.*, principals.subdomain
+           FROM revocation_outbox
+           JOIN principals ON principals.id = revocation_outbox.principal_id
+           WHERE revocation_outbox.id = ?
+             AND revocation_outbox.status = 'claimed'
+             AND revocation_outbox.completed_at IS NULL
+             AND revocation_outbox.claim_owner = ?
+             AND revocation_outbox.claim_expires_at > ?
+             AND revocation_outbox.retention_expires_at > ?
+             AND principals.status = 'disconnected'
+             AND principals.lifecycle_epoch = revocation_outbox.captured_principal_epoch
+             AND NOT EXISTS (
+               SELECT 1 FROM zendesk_credentials
+               WHERE zendesk_credentials.principal_id = revocation_outbox.principal_id
+             )`,
+        )
+        .get(outboxId, owner, now, now);
+      if (!row || row.claim_expires_at === null) return false;
+      const retentionExpiresAt = Math.max(
+        row.retention_expires_at,
+        grantRetentionExpiresAt,
+      );
+      if (row.claim_expires_at > retentionExpiresAt) return false;
+      const encryptedGrant = this.#cipher.encrypt(JSON.stringify(normalized), {
+        kind: "disconnect_outbox",
+        rowId: row.id,
+        expiresAt: retentionExpiresAt,
+        subdomain: row.subdomain,
+        principalId: row.principal_id,
+        credentialVersion: row.credential_version,
+        principalEpoch: row.captured_principal_epoch,
+      });
+      return (
+        this.#db
+          .prepare(
+            `UPDATE revocation_outbox
+             SET encrypted_grant_json = ?, retention_expires_at = ?
+             WHERE id = ?
+               AND status = 'claimed'
+               AND completed_at IS NULL
+               AND claim_owner = ?
+               AND claim_expires_at > ?
+               AND EXISTS (
+                 SELECT 1 FROM principals
+                 WHERE principals.id = revocation_outbox.principal_id
+                   AND principals.status = 'disconnected'
+                   AND principals.lifecycle_epoch = revocation_outbox.captured_principal_epoch
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM zendesk_credentials
+                 WHERE zendesk_credentials.principal_id = revocation_outbox.principal_id
+               )`,
+          )
+          .run(
+            JSON.stringify(encryptedGrant),
+            retentionExpiresAt,
+            outboxId,
+            owner,
+            now,
+          ).changes === 1
+      );
+    }).immediate();
   }
 
   rescheduleRevocation(

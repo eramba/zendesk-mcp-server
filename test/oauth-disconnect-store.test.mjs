@@ -337,6 +337,59 @@ test('claims are owner-guarded leases with exact retry attempts, renewal, comple
   assert.equal(store.claimDueRevocation('worker-d', NOW + 18, NOW + 80), undefined)
 })
 
+test('rotated revocation grants replace the encrypted tombstone only under a live epoch-fenced owner claim', async (t) => {
+  let clock = NOW + 10
+  const { directory, path, cipher, store, client } = await fixture(t, { now: () => clock })
+  login(store, client.client_id, 'before-rotation')
+  const disconnected = store.disconnectUser(SUBDOMAIN, USER_ID, clock)
+  assert.equal(disconnected.kind, 'disconnected')
+  assert.ok(store.claimDueRevocation('rotation-owner', clock, clock + 30))
+
+  const rotated = grant('durable-rotation', clock)
+  assert.equal(
+    store.replaceRevocationGrant(disconnected.outboxId, 'wrong-owner', rotated, clock),
+    false,
+  )
+  assert.equal(
+    store.replaceRevocationGrant(disconnected.outboxId, 'rotation-owner', rotated, clock),
+    true,
+  )
+  const durable = decryptOutboxGrant(path, cipher, disconnected.outboxId)
+  assert.deepEqual(durable.grant, rotated)
+  assert.equal(durable.row.retention_expires_at, rotated.refreshExpiresAt + 604_800)
+  assert.equal(durable.row.claim_owner, 'rotation-owner')
+  assert.equal(durable.row.claim_expires_at, clock + 30)
+
+  const bytes = await databaseBytes(store, directory, 'rotated-tombstone')
+  assert.equal(bytes.includes(Buffer.from(rotated.accessToken, 'utf8')), false)
+  assert.equal(bytes.includes(Buffer.from(rotated.refreshToken, 'utf8')), false)
+
+  execute(path, (db) => db.prepare(
+    'UPDATE principals SET lifecycle_epoch = lifecycle_epoch + 1 WHERE id = ?',
+  ).run(disconnected.principalId))
+  const rejected = grant('rejected-epoch', clock)
+  assert.equal(
+    store.replaceRevocationGrant(disconnected.outboxId, 'rotation-owner', rejected, clock),
+    false,
+  )
+  assert.deepEqual(decryptOutboxGrant(path, cipher, disconnected.outboxId).grant, rotated)
+
+  execute(path, (db) => db.prepare(
+    `UPDATE principals
+     SET lifecycle_epoch = (
+       SELECT captured_principal_epoch FROM revocation_outbox
+       WHERE principal_id = principals.id
+     )
+     WHERE id = ?`,
+  ).run(disconnected.principalId))
+  clock += 30
+  assert.equal(
+    store.replaceRevocationGrant(disconnected.outboxId, 'rotation-owner', rejected, clock),
+    false,
+  )
+  assert.deepEqual(decryptOutboxGrant(path, cipher, disconnected.outboxId).grant, rotated)
+})
+
 test('an expired lease removes stale owner authority and permits a new owner to reclaim', async (t) => {
   let clock = NOW + 10
   const { path, store, client } = await fixture(t, { now: () => clock })
