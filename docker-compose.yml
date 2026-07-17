@@ -11,7 +11,7 @@ services:
       HOST: 0.0.0.0
       PORT: 3000
     ports:
-      - "${MCP_BIND_ADDRESS:-100.83.206.45}:${MCP_HOST_PORT:-38184}:3000"
+      - "${MCP_BIND_ADDRESS:-127.0.0.1}:${MCP_HOST_PORT:-38184}:3000"
     healthcheck:
       test:
         - CMD

@@ -54,10 +54,10 @@ The endpoints are `POST /mcp` and `GET /healthz`. `GET /mcp` and `DELETE /mcp` r
 
 ### Docker Compose deployment
 
-The default deployment publishes the container only on the `dev-server` Tailscale address, `100.83.206.45:38184`:
+The default deployment publishes plain HTTP only on the host loopback address, `127.0.0.1:38184`. Tailscale Serve provides the tailnet-only HTTPS endpoint:
 
 ```text
-http://dev-server:38184/mcp
+https://dev-server.tail22145b.ts.net/mcp
 ```
 
 Create `.env` from `.env.example`, keep it mode `0600`, set the three `ZENDESK_*` values, and generate the server token with `openssl rand -hex 32`. Then run:
@@ -67,6 +67,8 @@ docker compose config
 docker compose up -d --build --wait
 docker compose ps
 docker compose logs --tail=50 zendesk-mcp
+sudo tailscale serve --bg http://127.0.0.1:38184
+tailscale serve status
 ```
 
 Update an existing checkout with:
@@ -76,13 +78,13 @@ git pull --ff-only origin master
 docker compose up -d --build --wait
 ```
 
-Do not bind the plain-HTTP service to a public interface. Tailscale supplies the encrypted network path; public exposure requires HTTPS and a separate access-control review.
+Do not bind the plain-HTTP service to a public or tailnet interface. Tailscale Serve terminates HTTPS on port `443` and proxies to the loopback-only service; tailnet grants control which clients can connect.
 
 ### Codex URL configuration
 
 ```toml
 [mcp_servers.zendesk]
-url = "http://dev-server:38184/mcp"
+url = "https://dev-server.tail22145b.ts.net/mcp"
 bearer_token_env_var = "ZENDESK_MCP_BEARER_TOKEN"
 ```
 
@@ -105,7 +107,7 @@ Fully quit and reopen the Codex app after changing its environment. Linux servic
 Verify a configured endpoint without returning ticket data:
 
 ```bash
-MCP_URL=http://dev-server:38184/mcp npm run smoke:http
+MCP_URL=https://dev-server.tail22145b.ts.net/mcp npm run smoke:http
 ```
 
 ## Environment variables
