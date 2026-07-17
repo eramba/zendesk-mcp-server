@@ -17,34 +17,7 @@ export type HttpAppOptions = {
   serverFactory?: typeof buildZendeskServer;
 };
 
-type PendingHttpRuntimeOptions = {
-  host: string;
-  allowedHosts: string[];
-  serverFactory?: typeof buildZendeskServer;
-  [legacyOption: string]: unknown;
-};
-
-function hasOAuthDependencies(
-  options: HttpAppOptions | PendingHttpRuntimeOptions,
-): options is HttpAppOptions {
-  return (
-    "provider" in options &&
-    "resolver" in options &&
-    "oauthRouter" in options &&
-    "resourceMetadataUrl" in options &&
-    "isReady" in options
-  );
-}
-
-export function createHttpApp(options: HttpAppOptions): Express;
-/** @deprecated Removed by the Task 20 HTTP runtime composition. */
-export function createHttpApp(options: PendingHttpRuntimeOptions): Express;
-export function createHttpApp(
-  options: HttpAppOptions | PendingHttpRuntimeOptions,
-): Express {
-  if (!hasOAuthDependencies(options)) {
-    throw new Error("OAuth HTTP dependencies are required");
-  }
+export function createHttpApp(options: HttpAppOptions): Express {
   const {
     host,
     allowedHosts,

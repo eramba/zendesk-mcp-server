@@ -1,57 +1,60 @@
 #!/usr/bin/env node
 import "dotenv/config";
-import { readHttpConfig, readZendeskConfig } from "./config.js";
-import { createHttpApp } from "./http-app.js";
-import { ZendeskClient } from "./zendesk-client.js";
+import type { Server } from "node:http";
+
+import { readHttpOAuthConfig } from "./config.js";
+import { attachHttpListener, createHttpRuntime } from "./http-runtime.js";
+
+const SHUTDOWN_GRACE_MS = 10_000;
+
+function closeListener(listener: Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve();
+    };
+    const timer = setTimeout(() => {
+      console.error("HTTP shutdown grace period expired");
+      process.exitCode = 1;
+      listener.closeAllConnections();
+      finish();
+    }, SHUTDOWN_GRACE_MS);
+    timer.unref();
+
+    listener.close((error) => finish(error ?? undefined));
+  });
+}
 
 function main() {
-  const zendeskConfig = readZendeskConfig();
-  const httpConfig = readHttpConfig();
-  const client = new ZendeskClient({
-    subdomain: zendeskConfig.subdomain,
-    auth: {
-      kind: "api_token",
-      email: zendeskConfig.email,
-      apiToken: zendeskConfig.apiKey,
-    },
-  });
-  const app = createHttpApp({
-    host: httpConfig.host,
-    allowedHosts: httpConfig.allowedHosts,
-    bearerToken: httpConfig.bearerToken,
-    client,
-  });
+  const config = readHttpOAuthConfig();
+  const runtime = createHttpRuntime(config);
 
-  const listener = app.listen(httpConfig.port, httpConfig.host, () => {
+  const listener = runtime.app.listen(config.port, config.host, () => {
     console.error(
-      `Zendesk MCP Streamable HTTP server listening on ${httpConfig.host}:${httpConfig.port}`,
+      `Zendesk MCP Streamable HTTP server listening on ${config.host}:${config.port}`,
     );
   });
+  attachHttpListener(runtime, () => closeListener(listener));
+  runtime.startWorker();
 
   listener.on("error", (error) => {
     console.error("HTTP listener error:", error.message);
     process.exitCode = 1;
   });
 
-  let shuttingDown = false;
+  let shutdownStarted = false;
   const shutdown = (signal: NodeJS.Signals) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
+    if (shutdownStarted) return;
+    shutdownStarted = true;
     console.error(`Received ${signal}; stopping HTTP listener`);
-
-    const timer = setTimeout(() => {
-      console.error("HTTP shutdown grace period expired");
-      listener.closeAllConnections();
+    void runtime.shutdown(signal).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : "Unknown error";
+      console.error("HTTP shutdown error:", message);
       process.exitCode = 1;
-    }, 10_000);
-    timer.unref();
-
-    listener.close((error) => {
-      clearTimeout(timer);
-      if (error) {
-        console.error("HTTP shutdown error:", error.message);
-        process.exitCode = 1;
-      }
     });
   };
 

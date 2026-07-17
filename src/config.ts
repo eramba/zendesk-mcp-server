@@ -8,13 +8,6 @@ export type ZendeskConfig = {
   apiKey: string;
 };
 
-export type HttpConfig = {
-  host: string;
-  port: number;
-  bearerToken: string;
-  allowedHosts: string[];
-};
-
 type ListenerConfig = {
   host: string;
   port: number;
@@ -66,17 +59,6 @@ export function readZendeskConfig(
     subdomain: env.ZENDESK_SUBDOMAIN as string,
     email: env.ZENDESK_EMAIL as string,
     apiKey: env.ZENDESK_API_KEY as string,
-  };
-}
-
-export function readHttpConfig(env: Environment = process.env): HttpConfig {
-  if (isBlank(env.MCP_BEARER_TOKEN)) {
-    throw new Error("Missing required environment variable: MCP_BEARER_TOKEN");
-  }
-
-  return {
-    ...readListenerConfig(env),
-    bearerToken: env.MCP_BEARER_TOKEN as string,
   };
 }
 
