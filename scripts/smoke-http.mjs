@@ -41,10 +41,10 @@ function parseBearerChallenge(header) {
   return attributes
 }
 
-async function fetchJson(url, expectedStatus, failureMessage) {
+async function fetchJson(url, expectedStatus, failureMessage, signal) {
   let response
   try {
-    response = await fetch(url)
+    response = await fetch(url, { signal })
   } catch {
     throw new SmokeError(failureMessage)
   }
@@ -56,7 +56,7 @@ async function fetchJson(url, expectedStatus, failureMessage) {
   }
 }
 
-async function run() {
+async function run(signal) {
   let resourceUrl
   try {
     resourceUrl = new URL(requiredEnv('MCP_URL'))
@@ -68,12 +68,12 @@ async function run() {
   assertSmoke(resourceUrl.search === '' && resourceUrl.hash === '', 'MCP_URL must identify the canonical /mcp resource')
 
   const healthUrl = new URL('/healthz', resourceUrl)
-  const health = await fetchJson(healthUrl, 200, 'HTTP readiness check failed')
+  const health = await fetchJson(healthUrl, 200, 'HTTP readiness check failed', signal)
   assertSmoke(exactKeys(health.json, ['ok']) && health.json.ok === true, 'HTTP readiness check failed')
 
   let unauthorized
   try {
-    unauthorized = await fetch(resourceUrl)
+    unauthorized = await fetch(resourceUrl, { signal })
   } catch {
     throw new SmokeError('MCP OAuth challenge check failed')
   }
@@ -106,6 +106,7 @@ async function run() {
     resourceMetadataUrl,
     200,
     'Protected-resource metadata check failed',
+    signal,
   )
   assertSmoke(
     exactKeys(protectedResource.json, ['resource', 'authorization_servers', 'scopes_supported']) &&
@@ -130,6 +131,7 @@ async function run() {
     authorizationMetadataUrl,
     200,
     'Authorization-server metadata check failed',
+    signal,
   )
   const metadata = authorizationServer.json
   assertSmoke(
@@ -167,9 +169,17 @@ async function run() {
   }))
 }
 
+const deadlineSignal = AbortSignal.timeout(5_000)
+
 try {
-  await run()
+  await run(deadlineSignal)
 } catch (error) {
-  console.error(error instanceof SmokeError ? error.message : 'HTTP OAuth smoke failed')
+  console.error(
+    deadlineSignal.aborted
+      ? 'HTTP OAuth smoke timed out'
+      : error instanceof SmokeError
+        ? error.message
+        : 'HTTP OAuth smoke failed',
+  )
   process.exitCode = 1
 }

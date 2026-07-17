@@ -35,14 +35,25 @@ test('documents URL-only Codex login and exact local versus server revocation se
 
 test('documents safe backup, restore, cutover, rollback, retirement, and orphan-grant recovery', async () => {
   const readme = await readFile(README, 'utf8')
+  const restore = readme.match(/## Backup and restore\n([\s\S]*?)(?=## Maintenance-window cutover)/)?.[1]
 
+  assert.ok(restore, 'README must contain a bounded backup and restore section')
   assert.match(
-    readme,
+    restore,
     /npm run oauth:backup -- --destination \/data\/backups\/<new-name>\.sqlite/,
   )
-  assert.match(readme, /checkpoint/i)
-  assert.match(readme, /disposable volume/i)
-  assert.match(readme, /encryption key[\s\S]{0,120}(?:separate|separately)/i)
+  assert.match(restore, /checkpoint/i)
+  assert.match(restore, /disposable volume/i)
+  assert.match(restore, /encryption key[\s\S]{0,120}(?:separate|separately)/i)
+  assert.match(restore, /RESTORE_IMAGE="\$\(docker compose images --quiet zendesk-mcp\)"/)
+  assert.match(restore, /--network none/)
+  assert.match(restore, /--entrypoint node/)
+  assert.match(restore, /--env ZENDESK_SUBDOMAIN/)
+  assert.match(restore, /--env OAUTH_ENCRYPTION_KEY/)
+  assert.match(restore, /--env OAUTH_DB_PATH=\/data\/oauth\.sqlite/)
+  assert.match(restore, /scripts\/oauth-admin\.mjs sessions --zendesk-user-id <known-id>/)
+  assert.match(restore, /docker volume rm zendesk-oauth-restore-drill/)
+  assert.doesNotMatch(restore, /npm (?:run )?start|docker compose up|start the same application image/i)
   assert.match(readme, /maintenance window/i)
   assert.match(readme, /inventory/i)
   assert.match(readme, /http_headers\.Authorization/)
