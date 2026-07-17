@@ -347,7 +347,7 @@ test('invalid and colliding injected random values never consume the code or lea
 
     assert.throws(
       () => issuanceStore.consumeCodeAndIssueFamily(exchangeInput(client.client_id, secondCode.authorizationCode, { now: NOW + 1 })),
-      /unique constraint failed/i,
+      /random source is invalid/i,
     )
     assert.equal(
       query(path, 'SELECT consumed_at FROM authorization_codes WHERE code_hash = ?', hashOpaque(secondCode.authorizationCode))[0].consumed_at,
@@ -362,6 +362,61 @@ test('invalid and colliding injected random values never consume the code or lea
       expiresAt: NOW + ACCESS_TTL,
     })
   })
+})
+
+test('initial issuance rejects cross-table token collisions before one token can resolve to two same-client families', async (t) => {
+  for (const testCase of [
+    {
+      label: 'new access equals existing refresh',
+      generated(first) {
+        return [first.refresh_token, randomOpaque()]
+      },
+      presented(first) {
+        return first.refresh_token
+      },
+    },
+    {
+      label: 'new refresh equals existing access',
+      generated(first) {
+        return [randomOpaque(), first.access_token]
+      },
+      presented(first) {
+        return first.access_token
+      },
+    },
+  ]) {
+    await t.test(testCase.label, async (t) => {
+      const { path, cipher, store, client } = await fixture(t)
+      const firstCode = commitAuthorizationCode(store, client.client_id, `${testCase.label}-first`)
+      const first = store.consumeCodeAndIssueFamily(exchangeInput(client.client_id, firstCode.authorizationCode))
+      const firstFamilyId = query(path, 'SELECT id FROM token_families')[0].id
+      const secondCode = commitAuthorizationCode(store, client.client_id, `${testCase.label}-second`, NOW + 1)
+      const generated = testCase.generated(first)
+      const collidingStore = openIssuanceStore(t, path, cipher, {
+        randomToken: () => generated.shift(),
+      })
+
+      assert.throws(
+        () => collidingStore.consumeCodeAndIssueFamily(exchangeInput(client.client_id, secondCode.authorizationCode, { now: NOW + 1 })),
+        /random source is invalid/i,
+      )
+      assert.equal(
+        query(path, 'SELECT consumed_at FROM authorization_codes WHERE code_hash = ?', hashOpaque(secondCode.authorizationCode))[0].consumed_at,
+        null,
+      )
+      assert.deepEqual(issuanceCounts(path), { families: 1, access: 1, refresh: 1 })
+      assert.deepEqual(
+        query(path, 'SELECT id, revoked_at FROM token_families'),
+        [{ id: firstFamilyId, revoked_at: null }],
+      )
+
+      store.revokeFamilyByPresentedToken(client.client_id, testCase.presented(first), NOW + 2)
+      assert.deepEqual(
+        query(path, 'SELECT id, revoked_at FROM token_families'),
+        [{ id: firstFamilyId, revoked_at: NOW + 2 }],
+      )
+    })
+  }
 })
 
 test('access lookup fails closed when the owning client scope is noncanonical or the client row is missing', async (t) => {

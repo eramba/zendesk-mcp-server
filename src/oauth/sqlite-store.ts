@@ -1315,6 +1315,20 @@ class SqliteOAuthStore implements LifecycleStore {
       ) {
         throw new Error("OAuth store random source is invalid");
       }
+      const accessHash = hashOpaque(accessToken);
+      const refreshHash = hashOpaque(refreshToken);
+      const tokenCollision = this.#db
+        .prepare<[string, string, string, string], { present: number }>(
+          `SELECT 1 AS present FROM (
+             SELECT token_hash FROM access_tokens WHERE token_hash IN (?, ?)
+             UNION ALL
+             SELECT token_hash FROM refresh_token_generations WHERE token_hash IN (?, ?)
+           ) LIMIT 1`,
+        )
+        .get(accessHash, refreshHash, accessHash, refreshHash);
+      if (tokenCollision) {
+        throw new Error("OAuth store random source is invalid");
+      }
 
       const consumed = this.#db
         .prepare(
@@ -1350,7 +1364,7 @@ class SqliteOAuthStore implements LifecycleStore {
            VALUES (?, ?, ?, ?)`,
         )
         .run(
-          hashOpaque(accessToken),
+          accessHash,
           familyId,
           input.now,
           input.now + input.accessTokenTtlSeconds,
@@ -1364,7 +1378,7 @@ class SqliteOAuthStore implements LifecycleStore {
            ) VALUES (?, ?, 1, 'current', ?, ?, NULL, NULL, NULL, NULL)`,
         )
         .run(
-          hashOpaque(refreshToken),
+          refreshHash,
           familyId,
           input.now,
           input.now + MCP_REFRESH_TTL_SECONDS,
