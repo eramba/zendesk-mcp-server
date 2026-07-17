@@ -4,7 +4,9 @@ export type ZendeskErrorCategory =
   | "rate_limited"
   | "invalid_request"
   | "temporarily_unavailable"
-  | "invalid_grant";
+  | "invalid_grant"
+  | "invalid_response"
+  | "aborted";
 
 export class ZendeskUpstreamError extends Error {
   constructor(
