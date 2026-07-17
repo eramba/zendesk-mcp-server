@@ -10,10 +10,12 @@ import {
 import { dirname, isAbsolute } from "node:path";
 
 import Database from "better-sqlite3";
+import { InvalidClientMetadataError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
 
 import { SCHEMA_VERSION, SQLITE_MIGRATIONS } from "./sqlite-schema.js";
 import type { OAuthStore, RecoverySummary, StoreInspection } from "./store.js";
-import { TokenCipher, type EncryptedValue } from "./token-cipher.js";
+import { randomOpaque, TokenCipher, type EncryptedValue } from "./token-cipher.js";
 
 const KEY_CHECK_METADATA = "encryption_key_check";
 const KEY_CHECK_SENTINEL = "oauth-key-check-sentinel";
@@ -26,6 +28,21 @@ const KEY_CHECK_CONTEXT = {
 const STARTUP_ERROR = "OAuth store failed to initialize";
 const INVALID_KEY_ERROR = "OAuth store encryption key is invalid";
 const NEWER_SCHEMA_ERROR = "OAuth store has newer schema version";
+const MCP_SCOPE = "zendesk:read zendesk:write";
+const SUPPORTED_GRANT_TYPES = ["authorization_code", "refresh_token"] as const;
+const SUPPORTED_RESPONSE_TYPES = ["code"] as const;
+const UNSUPPORTED_CLIENT_FIELDS = [
+  "client_uri",
+  "logo_uri",
+  "contacts",
+  "tos_uri",
+  "policy_uri",
+  "jwks_uri",
+  "jwks",
+  "software_id",
+  "software_version",
+  "software_statement",
+] as const;
 
 export type SqliteOAuthStoreOptions = {
   path: string;
@@ -39,12 +56,97 @@ export type SqliteOAuthStoreOptions = {
 type VersionRow = { version: number };
 type CountRow = { count: number };
 type MetadataRow = { value: string };
+type ClientRow = {
+  client_id: string;
+  client_id_issued_at: number;
+  token_endpoint_auth_method: string;
+  grant_types_json: string;
+  response_types_json: string;
+  scope: string;
+  client_name: string | null;
+};
+type RedirectRow = { redirect_uri: string };
 type EffectivePragmas = StoreInspection["pragmas"] & { busyTimeout: number };
 
 type LifecycleStore = Pick<
   OAuthStore,
-  "isReady" | "assertReady" | "recover" | "backup" | "inspectForTest" | "close"
+  | "getClient"
+  | "registerClient"
+  | "isReady"
+  | "assertReady"
+  | "recover"
+  | "backup"
+  | "inspectForTest"
+  | "close"
 >;
+
+type ClientRegistration = Omit<
+  OAuthClientInformationFull,
+  "client_id" | "client_id_issued_at"
+>;
+
+function invalidClientMetadata(): InvalidClientMetadataError {
+  return new InvalidClientMetadataError("invalid_client_metadata");
+}
+
+function sameSet(actual: readonly string[] | undefined, expected: readonly string[]): boolean {
+  return Boolean(
+    actual &&
+      actual.length === expected.length &&
+      expected.every((value) => actual.includes(value)),
+  );
+}
+
+function normalizeRedirectUri(value: string): string {
+  try {
+    const url = new URL(value);
+    const valid =
+      url.protocol === "http:" &&
+      (url.hostname === "127.0.0.1" || url.hostname === "localhost") &&
+      url.port !== "" &&
+      Number(url.port) > 0 &&
+      url.username === "" &&
+      url.password === "" &&
+      url.search === "" &&
+      url.hash === "";
+    if (!valid) throw invalidClientMetadata();
+    return url.href;
+  } catch (error) {
+    if (error instanceof InvalidClientMetadataError) throw error;
+    throw invalidClientMetadata();
+  }
+}
+
+function validateClientRegistration(client: ClientRegistration): {
+  redirectUris: string[];
+  clientName: string;
+} {
+  const runtimeClient = client as ClientRegistration & Record<string, unknown>;
+  if (
+    client.token_endpoint_auth_method !== "none" ||
+    !sameSet(client.grant_types, SUPPORTED_GRANT_TYPES) ||
+    !sameSet(client.response_types, SUPPORTED_RESPONSE_TYPES) ||
+    (client.scope !== undefined && client.scope !== MCP_SCOPE) ||
+    typeof client.client_name !== "string" ||
+    !/^[\x20-\x7e]{1,200}$/.test(client.client_name) ||
+    !Array.isArray(client.redirect_uris) ||
+    client.redirect_uris.length === 0 ||
+    client.redirect_uris.some((value) => typeof value !== "string") ||
+    UNSUPPORTED_CLIENT_FIELDS.some((field) => runtimeClient[field] !== undefined) ||
+    runtimeClient.client_id !== undefined ||
+    runtimeClient.client_id_issued_at !== undefined ||
+    client.client_secret !== undefined ||
+    client.client_secret_expires_at !== undefined
+  ) {
+    throw invalidClientMetadata();
+  }
+
+  const redirectUris = [
+    ...new Set(client.redirect_uris.map((value) => normalizeRedirectUri(value))),
+  ].sort();
+  if (redirectUris.length === 0) throw invalidClientMetadata();
+  return { redirectUris, clientName: client.client_name };
+}
 
 function schemaVersion(db: Database.Database): number {
   const exists = db
@@ -163,10 +265,14 @@ function recoverRows(db: Database.Database, now: number): RecoverySummary {
 
 class SqliteOAuthStore implements LifecycleStore {
   readonly #db: Database.Database;
+  readonly #now: () => number;
+  readonly #randomToken: (bytes?: number) => string;
   #ready = false;
 
-  constructor(db: Database.Database) {
+  constructor(db: Database.Database, now: () => number, randomToken: (bytes?: number) => string) {
     this.#db = db;
+    this.#now = now;
+    this.#randomToken = randomToken;
   }
 
   markReady(): void {
@@ -179,6 +285,90 @@ class SqliteOAuthStore implements LifecycleStore {
 
   assertReady(): void {
     if (!this.isReady()) throw new Error("OAuth store is not ready");
+  }
+
+  getClient(clientId: string): OAuthClientInformationFull | undefined {
+    this.assertReady();
+    const row = this.#db
+      .prepare<[string], ClientRow>(
+        `SELECT client_id, client_id_issued_at, token_endpoint_auth_method,
+                grant_types_json, response_types_json, scope, client_name
+         FROM oauth_clients
+         WHERE client_id = ?`,
+      )
+      .get(clientId);
+    if (!row) return undefined;
+
+    const redirectUris = this.#db
+      .prepare<[string], RedirectRow>(
+        `SELECT redirect_uri
+         FROM oauth_client_redirect_uris
+         WHERE client_id = ?
+         ORDER BY redirect_uri`,
+      )
+      .all(clientId)
+      .map(({ redirect_uri }) => redirect_uri);
+
+    return {
+      client_id: row.client_id,
+      client_id_issued_at: row.client_id_issued_at,
+      redirect_uris: redirectUris,
+      token_endpoint_auth_method: row.token_endpoint_auth_method,
+      grant_types: JSON.parse(row.grant_types_json) as string[],
+      response_types: JSON.parse(row.response_types_json) as string[],
+      scope: row.scope,
+      client_name: row.client_name ?? undefined,
+    };
+  }
+
+  registerClient(client: ClientRegistration): OAuthClientInformationFull {
+    this.assertReady();
+    const { redirectUris, clientName } = validateClientRegistration(client);
+    const clientId = this.#randomToken(32);
+    const issuedAt = Math.floor(this.#now());
+    if (!Number.isSafeInteger(issuedAt) || issuedAt < 0) {
+      throw new Error("OAuth store clock is invalid");
+    }
+
+    const registered: OAuthClientInformationFull = {
+      client_id: clientId,
+      client_id_issued_at: issuedAt,
+      redirect_uris: redirectUris,
+      token_endpoint_auth_method: "none",
+      grant_types: [...SUPPORTED_GRANT_TYPES],
+      response_types: [...SUPPORTED_RESPONSE_TYPES],
+      scope: MCP_SCOPE,
+      client_name: clientName,
+    };
+
+    this.#db.transaction(() => {
+      this.#db
+        .prepare(
+          `INSERT INTO oauth_clients (
+             client_id, client_id_issued_at, token_endpoint_auth_method,
+             grant_types_json, response_types_json, scope, client_name,
+             metadata_json, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          clientId,
+          issuedAt,
+          registered.token_endpoint_auth_method,
+          JSON.stringify(registered.grant_types),
+          JSON.stringify(registered.response_types),
+          registered.scope,
+          clientName,
+          JSON.stringify(registered),
+          issuedAt,
+        );
+      const insertRedirect = this.#db.prepare(
+        `INSERT INTO oauth_client_redirect_uris (client_id, redirect_uri)
+         VALUES (?, ?)`,
+      );
+      for (const redirectUri of redirectUris) insertRedirect.run(clientId, redirectUri);
+    })();
+
+    return registered;
   }
 
   recover(now: number): RecoverySummary {
@@ -228,6 +418,9 @@ class SqliteOAuthStore implements LifecycleStore {
       schemaVersion: schemaVersion(this.#db),
       migrationCount:
         this.#db.prepare<[], CountRow>("SELECT COUNT(*) AS count FROM schema_migrations").get()
+          ?.count ?? 0,
+      clientCount:
+        this.#db.prepare<[], CountRow>("SELECT COUNT(*) AS count FROM oauth_clients").get()
           ?.count ?? 0,
       pragmas: {
         foreignKeys: pragmas.foreignKeys,
@@ -293,7 +486,11 @@ export function openSqliteOAuthStore(options: SqliteOAuthStoreOptions): OAuthSto
     chmodSync(options.path, 0o600);
     verifyEncryptionKey(db, options.cipher);
 
-    const store = new SqliteOAuthStore(db);
+    const store = new SqliteOAuthStore(
+      db,
+      options.now ?? (() => Math.floor(Date.now() / 1000)),
+      options.randomToken ?? randomOpaque,
+    );
     store.recoverDuringStartup(now);
     store.markReady();
     return store as unknown as OAuthStore;
