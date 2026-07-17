@@ -37,6 +37,14 @@ async function oauthRouterModule() {
   return import('../dist/oauth/oauth-router.js')
 }
 
+async function waitFor(predicate, message) {
+  const deadline = Date.now() + 2_000
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${message}`)
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+}
+
 function fixture(overrides = {}) {
   const events = []
   let ready = true
@@ -301,22 +309,30 @@ test('forced connection close still waits for the listener close callback before
   const shutdown = runtime.shutdown('SIGTERM').finally(() => {
     shutdownSettled = true
   })
-  await new Promise((resolve) => setTimeout(resolve, 5))
+  try {
+    await waitFor(
+      () => f.events.includes('force close connections'),
+      'forced listener connection close',
+    )
 
-  assert.equal(shutdownSettled, false)
-  assert.deepEqual(f.events, [
-    'readiness',
-    'worker start',
-    'stop claims',
-    'abort/drain worker',
-    'listener close requested',
-    'grace expired',
-    'force close connections',
-  ])
+    assert.equal(shutdownSettled, false)
+    assert.deepEqual(f.events, [
+      'readiness',
+      'worker start',
+      'stop claims',
+      'abort/drain worker',
+      'listener close requested',
+      'grace expired',
+      'force close connections',
+    ])
+  } finally {
+    if (typeof closeCallback === 'function') {
+      f.events.push('listener close callback')
+      closeCallback()
+    }
+    await Promise.allSettled([shutdown])
+  }
 
-  f.events.push('listener close callback')
-  closeCallback()
-  await shutdown
   assert.deepEqual(f.events, [
     'readiness',
     'worker start',
