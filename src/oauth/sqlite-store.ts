@@ -1,5 +1,12 @@
 import { timingSafeEqual } from "node:crypto";
-import { chmodSync, mkdirSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  fchmodSync,
+  mkdirSync,
+  openSync,
+  unlinkSync,
+} from "node:fs";
 import { dirname, isAbsolute } from "node:path";
 
 import Database from "better-sqlite3";
@@ -32,6 +39,7 @@ export type SqliteOAuthStoreOptions = {
 type VersionRow = { version: number };
 type CountRow = { count: number };
 type MetadataRow = { value: string };
+type EffectivePragmas = StoreInspection["pragmas"] & { busyTimeout: number };
 
 type LifecycleStore = Pick<
   OAuthStore,
@@ -52,11 +60,23 @@ function schemaVersion(db: Database.Database): number {
   );
 }
 
-function applyMigrations(db: Database.Database, currentVersion: number, now: number): void {
+function applyMigrations(
+  db: Database.Database,
+  currentVersion: number,
+  now: number,
+  cipher: TokenCipher,
+): void {
   for (const migration of SQLITE_MIGRATIONS) {
     if (migration.version <= currentVersion) continue;
     db.transaction(() => {
       db.exec(migration.sql);
+      if (migration.version === 1) {
+        const encrypted = cipher.encrypt(KEY_CHECK_SENTINEL, KEY_CHECK_CONTEXT);
+        db.prepare("INSERT INTO store_metadata (key, value) VALUES (?, ?)").run(
+          KEY_CHECK_METADATA,
+          JSON.stringify(encrypted),
+        );
+      }
       db.prepare("INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(
         migration.version,
         now,
@@ -70,14 +90,7 @@ function verifyEncryptionKey(db: Database.Database, cipher: TokenCipher): void {
     .prepare<[string], MetadataRow>("SELECT value FROM store_metadata WHERE key = ?")
     .get(KEY_CHECK_METADATA);
 
-  if (!metadata) {
-    const encrypted = cipher.encrypt(KEY_CHECK_SENTINEL, KEY_CHECK_CONTEXT);
-    db.prepare("INSERT INTO store_metadata (key, value) VALUES (?, ?)").run(
-      KEY_CHECK_METADATA,
-      JSON.stringify(encrypted),
-    );
-    return;
-  }
+  if (!metadata) throw new Error(INVALID_KEY_ERROR);
 
   try {
     const decrypted = Buffer.from(
@@ -92,6 +105,31 @@ function verifyEncryptionKey(db: Database.Database, cipher: TokenCipher): void {
     }
   } catch {
     throw new Error(INVALID_KEY_ERROR);
+  }
+}
+
+function readEffectivePragmas(db: Database.Database): EffectivePragmas {
+  return {
+    foreignKeys: db.pragma("foreign_keys", { simple: true }) as number,
+    journalMode: db.pragma("journal_mode", { simple: true }) as string,
+    synchronous: db.pragma("synchronous", { simple: true }) as number,
+    busyTimeout: db.pragma("busy_timeout", { simple: true }) as number,
+    trustedSchema: db.pragma("trusted_schema", { simple: true }) as number,
+    secureDelete: db.pragma("secure_delete", { simple: true }) as number,
+  };
+}
+
+function verifyEffectivePragmas(db: Database.Database, busyTimeoutMs: number): void {
+  const pragmas = readEffectivePragmas(db);
+  if (
+    pragmas.foreignKeys !== 1 ||
+    pragmas.journalMode !== "wal" ||
+    pragmas.synchronous !== 2 ||
+    pragmas.busyTimeout !== busyTimeoutMs ||
+    pragmas.trustedSchema !== 0 ||
+    pragmas.secureDelete !== 1
+  ) {
+    throw new Error("OAuth store pragma verification failed");
   }
 }
 
@@ -154,23 +192,49 @@ class SqliteOAuthStore implements LifecycleStore {
 
   async backup(destination: string): Promise<void> {
     this.assertReady();
-    await this.#db.backup(destination);
-    chmodSync(destination, 0o600);
+    let descriptor: number | undefined;
+    let created = false;
+    try {
+      descriptor = openSync(destination, "wx", 0o600);
+      created = true;
+      fchmodSync(descriptor, 0o600);
+      closeSync(descriptor);
+      descriptor = undefined;
+      await this.#db.backup(destination);
+      chmodSync(destination, 0o600);
+    } catch (error) {
+      if (descriptor !== undefined) {
+        try {
+          closeSync(descriptor);
+        } catch {
+          // Continue cleanup of the private destination.
+        }
+      }
+      if (created) {
+        try {
+          unlinkSync(destination);
+        } catch {
+          // Preserve the original backup failure.
+        }
+      }
+      throw error;
+    }
   }
 
   inspectForTest(): StoreInspection {
     this.assertReady();
+    const pragmas = readEffectivePragmas(this.#db);
     return {
       schemaVersion: schemaVersion(this.#db),
       migrationCount:
         this.#db.prepare<[], CountRow>("SELECT COUNT(*) AS count FROM schema_migrations").get()
           ?.count ?? 0,
       pragmas: {
-        foreignKeys: this.#db.pragma("foreign_keys", { simple: true }) as number,
-        journalMode: this.#db.pragma("journal_mode", { simple: true }) as string,
-        synchronous: this.#db.pragma("synchronous", { simple: true }) as number,
-        trustedSchema: this.#db.pragma("trusted_schema", { simple: true }) as number,
-        secureDelete: this.#db.pragma("secure_delete", { simple: true }) as number,
+        foreignKeys: pragmas.foreignKeys,
+        journalMode: pragmas.journalMode,
+        synchronous: pragmas.synchronous,
+        trustedSchema: pragmas.trustedSchema,
+        secureDelete: pragmas.secureDelete,
       },
     };
   }
@@ -220,11 +284,12 @@ export function openSqliteOAuthStore(options: SqliteOAuthStoreOptions): OAuthSto
     db.pragma(`busy_timeout = ${busyTimeoutMs}`);
     db.pragma("trusted_schema = OFF");
     db.pragma("secure_delete = ON");
+    verifyEffectivePragmas(db, busyTimeoutMs);
 
     const currentVersion = schemaVersion(db);
     if (currentVersion > SCHEMA_VERSION) throw new Error(NEWER_SCHEMA_ERROR);
     const now = options.now?.() ?? Math.floor(Date.now() / 1000);
-    applyMigrations(db, currentVersion, now);
+    applyMigrations(db, currentVersion, now, options.cipher);
     chmodSync(options.path, 0o600);
     verifyEncryptionKey(db, options.cipher);
 
