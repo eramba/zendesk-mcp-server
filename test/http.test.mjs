@@ -433,6 +433,12 @@ test('concurrent principal A/B POSTs keep Zendesk Bearer results and errors isol
     { authorization: 'Bearer zendesk-principal-a', ticketId: 303 },
     { authorization: 'Bearer zendesk-principal-b', ticketId: 404 },
   ])
+  assert.equal(
+    zendeskRequests.some(({ authorization }) =>
+      authorization === null || authorization.startsWith('Basic ')),
+    false,
+    'HTTP requests must never fall back to a missing or shared Basic identity',
+  )
   assert.ok(resolverCalls.includes('principal-a'))
   assert.ok(resolverCalls.includes('principal-b'))
   assert.equal(calls.servers.length, resolverCalls.length)

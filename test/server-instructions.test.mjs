@@ -34,6 +34,11 @@ test('publishes safe Zendesk attachment retrieval instructions during MCP initia
     assert.match(instructions, /dedicated directory/i)
     assert.match(instructions, /never execute/i)
     assert.match(instructions, /report download, extraction, or inspection failures/i)
+    assert.doesNotMatch(
+      instructions,
+      /ZENDESK_(?:EMAIL|API_KEY)|MCP_BEARER_TOKEN|Authorization:\s*Bearer/i,
+      'model-visible instructions must not teach credential or bearer injection',
+    )
   } finally {
     await client.close()
     await server.close()
