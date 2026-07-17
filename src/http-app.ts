@@ -2,6 +2,11 @@ import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Express, Router } from "express";
+import {
+  createStandaloneHttpOperationTracker,
+  type HttpOperationTracker,
+  trackHttpHandler,
+} from "./http-operation-tracker.js";
 import type { ZendeskBrokerOAuthProvider } from "./oauth/zendesk-broker-provider.js";
 import type { ZendeskClientResolverLike } from "./oauth/zendesk-client-resolver.js";
 import { buildZendeskServer } from "./server.js";
@@ -14,6 +19,7 @@ export type HttpAppOptions = {
   oauthRouter: Router;
   resourceMetadataUrl: string;
   isReady: () => boolean;
+  operationTracker?: HttpOperationTracker;
   serverFactory?: typeof buildZendeskServer;
 };
 
@@ -26,6 +32,7 @@ export function createHttpApp(options: HttpAppOptions): Express {
     oauthRouter,
     resourceMetadataUrl,
     isReady,
+    operationTracker = createStandaloneHttpOperationTracker(),
     serverFactory = buildZendeskServer,
   } = options;
   const app = createMcpExpressApp({ host, allowedHosts });
@@ -39,11 +46,14 @@ export function createHttpApp(options: HttpAppOptions): Express {
 
   app.use(
     "/mcp",
-    requireBearerAuth({
-      verifier: provider,
-      requiredScopes: ["zendesk:read", "zendesk:write"],
-      resourceMetadataUrl,
-    }),
+    trackHttpHandler(
+      operationTracker,
+      requireBearerAuth({
+        verifier: provider,
+        requiredScopes: ["zendesk:read", "zendesk:write"],
+        resourceMetadataUrl,
+      }),
+    ),
   );
 
   app.get("/mcp", (_req, res) => {
@@ -64,7 +74,7 @@ export function createHttpApp(options: HttpAppOptions): Express {
     });
   });
 
-  app.post("/mcp", async (req, res) => {
+  app.post("/mcp", trackHttpHandler(operationTracker, async (req, res) => {
     let server: ReturnType<typeof buildZendeskServer> | undefined;
     let transport: StreamableHTTPServerTransport | undefined;
     let responseClosed = false;
@@ -128,7 +138,7 @@ export function createHttpApp(options: HttpAppOptions): Express {
         });
       }
     }
-  });
+  }));
 
   return app;
 }

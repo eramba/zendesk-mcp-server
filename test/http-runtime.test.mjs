@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
+import { once } from 'node:events'
 import { readFile } from 'node:fs/promises'
+import { createServer, request } from 'node:http'
 import test from 'node:test'
 
 const CONFIG = {
@@ -25,6 +27,14 @@ async function runtimeModule() {
 
 async function lifecycleModule() {
   return import('../dist/http-lifecycle.js')
+}
+
+async function appModule() {
+  return import('../dist/http-app.js')
+}
+
+async function oauthRouterModule() {
+  return import('../dist/oauth/oauth-router.js')
 }
 
 function fixture(overrides = {}) {
@@ -321,6 +331,166 @@ test('forced connection close still waits for the listener close callback before
   ])
 })
 
+test('real forced listener close does not tear down the store before an aborted handler promise drains', async () => {
+  const [
+    { createHttpApp },
+    { closeHttpListener },
+    { createZendeskOAuthRouter },
+    { attachHttpListener, createHttpRuntime },
+  ] = await Promise.all([
+    appModule(),
+    lifecycleModule(),
+    oauthRouterModule(),
+    runtimeModule(),
+  ])
+  let shutdownSignal
+  let handlerSawReady
+  let resolveHandlerStarted
+  let resolveHandlerContinuation
+  let resolveListenerClosed
+  const handlerStarted = new Promise((resolve) => {
+    resolveHandlerStarted = resolve
+  })
+  const handlerContinuation = new Promise((resolve) => {
+    resolveHandlerContinuation = resolve
+  })
+  const listenerClosed = new Promise((resolve) => {
+    resolveListenerClosed = resolve
+  })
+  const f = fixture({
+    createZendesk(options) {
+      shutdownSignal = options.shutdownSignal
+      return { kind: 'zendesk-gateway' }
+    },
+    createConsent() {
+      return {
+        begin: async () => {},
+        async handlePost(_request, response) {
+          f.events.push('handler start')
+          resolveHandlerStarted()
+          if (!shutdownSignal.aborted) {
+            await once(shutdownSignal, 'abort')
+          }
+          f.events.push('handler abort observed')
+          await handlerContinuation
+          f.events.push('handler continuation')
+          handlerSawReady = f.store.isReady()
+          response.status(204).end()
+        },
+      }
+    },
+    createProvider() {
+      return {
+        kind: 'provider',
+        clientsStore: {
+          async registerClient(client) { return client },
+        },
+        async revokeToken() {},
+      }
+    },
+    createWorker() {
+      return {
+        start() {},
+        async stop() {
+          f.events.push('stop claims')
+          assert.equal(shutdownSignal.aborted, false)
+          await Promise.resolve()
+          assert.equal(shutdownSignal.aborted, true)
+          f.events.push('abort/drain worker')
+        },
+      }
+    },
+    createRouter: createZendeskOAuthRouter,
+    createApp: createHttpApp,
+  })
+  const closeStore = f.store.close
+  f.store.close = () => {
+    f.ready = false
+    closeStore.call(f.store)
+  }
+  const runtime = createHttpRuntime(CONFIG, f.dependencies)
+  f.events.length = 0
+  const listener = runtime.app.listen(0, '127.0.0.1')
+  await once(listener, 'listening')
+  const address = listener.address()
+  assert.notEqual(address, null)
+  assert.equal(typeof address, 'object')
+  attachHttpListener(runtime, async () => {
+    await closeHttpListener(listener, { graceMs: 0 })
+    f.events.push('listener close callback')
+    resolveListenerClosed()
+  })
+
+  const clientRequest = new Promise((resolve) => {
+    const outgoing = request({
+      host: '127.0.0.1',
+      port: address.port,
+      path: '/oauth/consent',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/x-www-form-urlencoded',
+        host: '127.0.0.1',
+      },
+    }, (response) => {
+      response.resume()
+      response.on('end', resolve)
+    })
+    outgoing.on('error', resolve)
+    outgoing.end('decision=deny')
+  })
+  await handlerStarted
+
+  const shutdown = runtime.shutdown('SIGTERM')
+  await listenerClosed
+  await new Promise((resolve) => setImmediate(resolve))
+  try {
+    assert.equal(f.events.includes('handler abort observed'), true)
+    assert.equal(f.events.includes('store close'), false)
+    assert.equal(f.events.some((event) => event.startsWith('release claims:')), false)
+  } finally {
+    resolveHandlerContinuation()
+    await Promise.allSettled([shutdown, clientRequest])
+  }
+
+  assert.equal(handlerSawReady, true)
+  assert.ok(f.events.indexOf('handler continuation') < f.events.indexOf('store close'))
+  assert.ok(f.events.indexOf('local readiness') < f.events.indexOf('store close'))
+  assert.deepEqual(f.events.slice(-2), [
+    'release claims:runtime-worker-owner:1700000000',
+    'store close',
+  ])
+})
+
+test('operation drain timeout fails safely without releasing claims or closing the live store', async () => {
+  const { attachHttpListener, createHttpRuntime } = await runtimeModule()
+  const f = fixture({ operationDrainTimeoutMs: 0 })
+  const runtime = createHttpRuntime(CONFIG, f.dependencies)
+  f.events.length = 0
+  let keepOperationPending
+  const pending = new Promise((resolve) => {
+    keepOperationPending = resolve
+  })
+  void f.appOptions.operationTracker.track(async () => pending)
+  attachHttpListener(runtime, async () => {
+    f.events.push('listener close')
+  })
+
+  try {
+    await assert.rejects(
+      runtime.shutdown('SIGTERM'),
+      { message: 'HTTP operations did not drain before shutdown deadline' },
+    )
+    assert.deepEqual(f.events, [
+      'stop claims',
+      'abort/drain worker',
+      'listener close',
+    ])
+    assert.equal(f.ready, true)
+  } finally {
+    keepOperationPending()
+  }
+})
+
 test('asynchronous listen errors enter the same one-shot runtime shutdown as signals', async () => {
   const [
     { startHttpLifecycle },
@@ -393,6 +563,71 @@ test('asynchronous listen errors enter the same one-shot runtime shutdown as sig
   assert.deepEqual(f.events, errorShutdownEvents)
 })
 
+test('real EADDRINUSE listen failure treats an unstarted listener as closed and tears down once', async () => {
+  const [
+    { startHttpLifecycle },
+    { createHttpRuntime },
+  ] = await Promise.all([lifecycleModule(), runtimeModule()])
+  const occupied = createServer()
+  occupied.listen(0, '127.0.0.1')
+  await once(occupied, 'listening')
+  const address = occupied.address()
+  assert.ok(address && typeof address === 'object')
+
+  const f = fixture()
+  const runtime = createHttpRuntime(CONFIG, f.dependencies)
+  f.events.length = 0
+  let resolveStoreClosed
+  const storeClosed = new Promise((resolve) => {
+    resolveStoreClosed = resolve
+  })
+  const closeStore = f.store.close
+  f.store.close = () => {
+    closeStore.call(f.store)
+    resolveStoreClosed()
+  }
+  const listener = createServer()
+  const listenerError = once(listener, 'error')
+  const logs = []
+  const processState = {
+    exitCode: undefined,
+    once() {},
+  }
+
+  try {
+    listener.listen(address.port, '127.0.0.1')
+    startHttpLifecycle(runtime, listener, {
+      process: processState,
+      logError(...values) {
+        logs.push(values.join(' '))
+      },
+    })
+    const [error] = await listenerError
+    assert.equal(error.code, 'EADDRINUSE')
+    await Promise.race([
+      storeClosed,
+      new Promise((_, reject) => setTimeout(
+        () => reject(new Error('store did not close after EADDRINUSE')),
+        50,
+      )),
+    ])
+  } finally {
+    await new Promise((resolve) => occupied.close(resolve))
+  }
+
+  assert.equal(processState.exitCode, 1)
+  assert.equal(logs.some((message) => message.startsWith('HTTP listener error:')), true)
+  assert.equal(logs.some((message) => message.startsWith('HTTP shutdown error:')), false)
+  assert.deepEqual(f.events, [
+    'readiness',
+    'worker start',
+    'stop claims',
+    'abort/drain worker',
+    'release claims:runtime-worker-owner:1700000000',
+    'store close',
+  ])
+})
+
 test('HTTP entrypoint has no shared bearer, Basic credentials, or global ZendeskClient', async () => {
   const source = await readFile(new URL('../src/http.ts', import.meta.url), 'utf8')
   assert.doesNotMatch(source, /readHttpConfig|readZendeskConfig|MCP_BEARER_TOKEN/)
@@ -416,4 +651,22 @@ test('HTTP runtime has no global credential-bound ZendeskClient', async () => {
   ])
   assert.equal(typeof createHttpRuntime, 'function')
   assert.doesNotMatch(source, /from ["']\.\/zendesk-client\.js["']|new ZendeskClient\s*\(/)
+})
+
+test('HTTP runtime composes promise-based operation tracking across mutable OAuth and MCP routes', async () => {
+  const [runtimeSource, appSource, routerSource] = await Promise.all([
+    readFile(new URL('../src/http-runtime.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/http-app.ts', import.meta.url), 'utf8'),
+    readFile(new URL('../src/oauth/oauth-router.ts', import.meta.url), 'utf8'),
+  ])
+
+  assert.match(runtimeSource, /operationTracker\.drain/)
+  assert.match(appSource, /operationTracker/)
+  assert.match(appSource, /requireBearerAuth/)
+  assert.match(appSource, /app\.post\("\/mcp"/)
+  assert.match(routerSource, /operationTracker/)
+  assert.match(routerSource, /consentHandler/)
+  assert.match(routerSource, /callbackHandler/)
+  assert.match(routerSource, /authorizationHandler|clientRegistrationHandler/)
+  assert.match(routerSource, /tokenHandler|revocationHandler/)
 })

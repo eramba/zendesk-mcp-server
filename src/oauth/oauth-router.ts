@@ -14,6 +14,12 @@ import {
 } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import type { OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
 
+import {
+  createStandaloneHttpOperationTracker,
+  type HttpOperationTracker,
+  trackHttpHandler,
+  trackRouterOperations,
+} from "../http-operation-tracker.js";
 import { MCP_SCOPES, OAUTH_PATHS } from "./constants.js";
 import { consentPostResponseHeaders } from "./consent.js";
 import type { ZendeskBrokerOAuthProvider } from "./zendesk-broker-provider.js";
@@ -37,11 +43,14 @@ export type ZendeskOAuthRouterOptions = {
   resourceUrl: URL;
   consentHandler: RequestHandler;
   callbackHandler: RequestHandler;
+  operationTracker?: HttpOperationTracker;
 };
 
 export function createZendeskOAuthRouter(
   options: ZendeskOAuthRouterOptions,
 ): Router {
+  const operationTracker =
+    options.operationTracker ?? createStandaloneHttpOperationTracker();
   const oauthMetadata: OAuthMetadata = {
     ...createOAuthMetadata({
       provider: options.provider,
@@ -67,32 +76,44 @@ export function createZendeskOAuthRouter(
   );
   router.use(
     OAUTH_PATHS.register,
-    clientRegistrationHandler({
-      clientsStore: options.provider.clientsStore,
-      clientIdGeneration: false,
-      rateLimit: standardRateLimit(ONE_HOUR_MS, 20),
-    }),
+    trackRouterOperations(
+      clientRegistrationHandler({
+        clientsStore: options.provider.clientsStore,
+        clientIdGeneration: false,
+        rateLimit: standardRateLimit(ONE_HOUR_MS, 20),
+      }),
+      operationTracker,
+    ),
   );
   router.use(
     OAUTH_PATHS.authorize,
-    authorizationHandler({
-      provider: options.provider,
-      rateLimit: standardRateLimit(FIFTEEN_MINUTES_MS, 60),
-    }),
+    trackRouterOperations(
+      authorizationHandler({
+        provider: options.provider,
+        rateLimit: standardRateLimit(FIFTEEN_MINUTES_MS, 60),
+      }),
+      operationTracker,
+    ),
   );
   router.use(
     OAUTH_PATHS.token,
-    tokenHandler({
-      provider: options.provider,
-      rateLimit: standardRateLimit(FIFTEEN_MINUTES_MS, 120),
-    }),
+    trackRouterOperations(
+      tokenHandler({
+        provider: options.provider,
+        rateLimit: standardRateLimit(FIFTEEN_MINUTES_MS, 120),
+      }),
+      operationTracker,
+    ),
   );
   router.use(
     OAUTH_PATHS.revoke,
-    revocationHandler({
-      provider: options.provider,
-      rateLimit: standardRateLimit(FIFTEEN_MINUTES_MS, 120),
-    }),
+    trackRouterOperations(
+      revocationHandler({
+        provider: options.provider,
+        rateLimit: standardRateLimit(FIFTEEN_MINUTES_MS, 120),
+      }),
+      operationTracker,
+    ),
   );
   router.post(
     OAUTH_PATHS.consent,
@@ -103,12 +124,12 @@ export function createZendeskOAuthRouter(
       limit: "4kb",
       parameterLimit: 4,
     }),
-    options.consentHandler,
+    trackHttpHandler(operationTracker, options.consentHandler),
   );
   router.get(
     OAUTH_PATHS.zendeskCallback,
     browserRateLimit(),
-    options.callbackHandler,
+    trackHttpHandler(operationTracker, options.callbackHandler),
   );
 
   return router;

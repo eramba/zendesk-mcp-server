@@ -1,8 +1,7 @@
 import type { Server } from "node:http";
 
 import { attachHttpListener, type HttpRuntime } from "./http-runtime.js";
-
-const SHUTDOWN_GRACE_MS = 10_000;
+import { DEFAULT_HTTP_SHUTDOWN_TIMEOUT_MS } from "./http-operation-tracker.js";
 
 type ClosableHttpListener = Pick<Server, "close" | "closeAllConnections">;
 type ManagedHttpListener = ClosableHttpListener & Pick<Server, "on">;
@@ -26,7 +25,7 @@ export function closeHttpListener(
   listener: ClosableHttpListener,
   options: CloseHttpListenerOptions = {},
 ): Promise<void> {
-  const graceMs = options.graceMs ?? SHUTDOWN_GRACE_MS;
+  const graceMs = options.graceMs ?? DEFAULT_HTTP_SHUTDOWN_TIMEOUT_MS;
   if (!Number.isSafeInteger(graceMs) || graceMs < 0) {
     throw new Error("HTTP shutdown grace period must be a non-negative integer");
   }
@@ -46,7 +45,10 @@ export function closeHttpListener(
     }, graceMs);
     timer.unref();
 
-    listener.close((error) => finish(error ?? undefined));
+    listener.close((error) => {
+      const closeError = error as NodeJS.ErrnoException | undefined;
+      finish(closeError?.code === "ERR_SERVER_NOT_RUNNING" ? undefined : closeError);
+    });
   });
 }
 

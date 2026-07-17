@@ -4,6 +4,10 @@ import type { Express, Router } from "express";
 
 import type { HttpOAuthConfig } from "./config.js";
 import { createHttpApp, type HttpAppOptions } from "./http-app.js";
+import {
+  DEFAULT_HTTP_SHUTDOWN_TIMEOUT_MS,
+  HttpOperationTracker,
+} from "./http-operation-tracker.js";
 import { ConsentController, type ConsentControllerOptions } from "./oauth/consent.js";
 import { OAUTH_PATHS, ZENDESK_SCOPES } from "./oauth/constants.js";
 import {
@@ -59,6 +63,7 @@ type RuntimeDependencies = {
     options: ConstructorParameters<typeof ZendeskRevocationWorker>[0],
   ): RevocationWorkerLike;
   createApp(options: HttpAppOptions): Express;
+  operationDrainTimeoutMs?: number;
 };
 
 const defaultDependencies: RuntimeDependencies = {
@@ -74,6 +79,7 @@ const defaultDependencies: RuntimeDependencies = {
   createResolver: (options) => new ZendeskClientResolver(options),
   createWorker: (options) => new ZendeskRevocationWorker(options),
   createApp: createHttpApp,
+  operationDrainTimeoutMs: DEFAULT_HTTP_SHUTDOWN_TIMEOUT_MS,
 };
 
 type ListenerCloser = () => Promise<void>;
@@ -95,6 +101,7 @@ export function createHttpRuntime(
   dependencies: RuntimeDependencies = defaultDependencies,
 ): HttpRuntime {
   const shutdownController = new AbortController();
+  const operationTracker = new HttpOperationTracker(shutdownController.signal);
   let store: OAuthStore | undefined;
 
   try {
@@ -142,6 +149,7 @@ export function createHttpRuntime(
       resourceUrl: config.mcpResourceUrl,
       consentHandler: consent.handlePost,
       callbackHandler: callback.handle,
+      operationTracker,
     });
     const resolver = dependencies.createResolver({
       store: initializedStore,
@@ -169,6 +177,7 @@ export function createHttpRuntime(
         config.publicBaseUrl,
       ).href,
       isReady: () => initializedStore.isReady(),
+      operationTracker,
     });
 
     let shutdownPromise: Promise<void> | undefined;
@@ -192,23 +201,36 @@ export function createHttpRuntime(
       }
 
       const closeListener = listenerClosers.get(runtime);
+      let safeToCloseStore = true;
       if (closeListener) {
         try {
           await closeListener();
         } catch (error) {
           failures.push(error);
+          safeToCloseStore = false;
         }
       }
 
       try {
-        initializedStore.releaseClaims(workerOwner, dependencies.now());
+        await operationTracker.drain(
+          dependencies.operationDrainTimeoutMs ?? DEFAULT_HTTP_SHUTDOWN_TIMEOUT_MS,
+        );
       } catch (error) {
         failures.push(error);
+        safeToCloseStore = false;
       }
-      try {
-        initializedStore.close();
-      } catch (error) {
-        failures.push(error);
+
+      if (safeToCloseStore) {
+        try {
+          initializedStore.releaseClaims(workerOwner, dependencies.now());
+        } catch (error) {
+          failures.push(error);
+        }
+        try {
+          initializedStore.close();
+        } catch (error) {
+          failures.push(error);
+        }
       }
 
       if (failures.length === 1) throw failures[0];
