@@ -76,7 +76,7 @@ async function waitFor(predicate, message = 'condition') {
   }
 }
 
-function fakeStore({ nextClaim = claim(), renew = true } = {}) {
+function fakeStore({ nextClaim = claim(), renew = true, reschedule = true } = {}) {
   let available = nextClaim
   const calls = []
   return {
@@ -95,9 +95,9 @@ function fakeStore({ nextClaim = claim(), renew = true } = {}) {
       calls.push(['replace', outboxId, owner, replacement, now])
       return true
     },
-    rescheduleRevocation(outboxId, owner, category, nextAttemptAt) {
-      calls.push(['reschedule', outboxId, owner, category, nextAttemptAt])
-      return true
+    rescheduleRevocation(outboxId, owner, category) {
+      calls.push(['reschedule', outboxId, owner, category])
+      return reschedule
     },
     completeRevocation(outboxId, owner, now) {
       calls.push(['complete', outboxId, owner, now])
@@ -443,8 +443,8 @@ test('invalid grant, known refresh expiry, and already-revoked outcomes complete
   }
 })
 
-test('only retryable gateway failures use exact exponential backoff', async () => {
-  for (const [attemptCount, delay] of [[1, 5], [2, 10], [9, 900]]) {
+test('only retryable gateway failures enter store-owned exponential rescheduling', async () => {
+  for (const attemptCount of [1, 2, 9]) {
     const store = fakeStore({ nextClaim: claim({ attemptCount, outboxId: `outbox-${attemptCount}` }) })
     const instance = worker({
       store,
@@ -461,7 +461,6 @@ test('only retryable gateway failures use exact exponential backoff', async () =
       `outbox-${attemptCount}`,
       'worker-owner-a',
       'temporarily_unavailable',
-      NOW + delay,
     ])
   }
 
@@ -477,6 +476,22 @@ test('only retryable gateway failures use exact exponential backoff', async () =
   await waitFor(() => terminalStore.calls.some(([name]) => name === 'complete'), 'terminal completion')
   await terminal.stop()
   assert.equal(terminalStore.calls.some(([name]) => name === 'reschedule'), false)
+
+  const fallbackStore = fakeStore({ reschedule: false })
+  const fallback = worker({
+    store: fallbackStore,
+    zendesk: {
+      revokeCurrentToken: async () => { throw upstream('temporarily_unavailable', true, 503) },
+      refreshCredential: () => assert.fail('retryable DELETE must not refresh'),
+    },
+  })
+  fallback.start()
+  await waitFor(() => fallbackStore.calls.some(([name]) => name === 'reschedule'), 'failed reschedule')
+  await fallback.drain()
+  await fallback.stop()
+  assert.deepEqual(fallbackStore.calls.filter(([name]) => name === 'release'), [
+    ['release', 'worker-owner-a', NOW],
+  ])
 })
 
 test('startup reclaims a process-crash lease only after expiry', async () => {
@@ -548,7 +563,7 @@ test('stop aborts in-flight cleanup and immediately releases it for rescheduling
   assert.equal(store.calls.some(([name]) => name === 'complete' || name === 'reschedule'), false)
 })
 
-test('gateway request timeout preserves the tombstone and releases the claim safely', async () => {
+test('gateway request timeout preserves the tombstone with retryable network rescheduling', async () => {
   const store = fakeStore()
   const gateway = new ZendeskOAuthClient({
     subdomain: 'acme',
@@ -568,15 +583,55 @@ test('gateway request timeout preserves the tombstone and releases the claim saf
 
   instance.start()
   await waitFor(
-    () => store.calls.some(([name]) => name === 'release' || name === 'complete'),
+    () => store.calls.some(([name]) => ['reschedule', 'release', 'complete'].includes(name)),
     'gateway timeout outcome',
   )
   await instance.stop()
 
-  assert.deepEqual(store.calls.filter(([name]) => name === 'release'), [
-    ['release', 'worker-owner-a', NOW],
+  assert.deepEqual(store.calls.filter(([name]) => name === 'reschedule'), [
+    ['reschedule', 'outbox-1', 'worker-owner-a', 'temporarily_unavailable'],
   ])
-  assert.equal(store.calls.some(([name]) => name === 'complete' || name === 'reschedule'), false)
+  assert.equal(store.calls.some(([name]) => name === 'complete' || name === 'release'), false)
+})
+
+test('SQLite schedules retry from its transaction clock across a worker second rollover', async (t) => {
+  const storeClock = { value: NOW + 10 }
+  const fixture = await sqliteWorkerFixture(t, storeClock)
+  storeClock.value = NOW + 11
+  let attempted = false
+  const instance = new ZendeskRevocationWorker({
+    store: fixture.store,
+    zendesk: {
+      async revokeCurrentToken() {
+        attempted = true
+        throw upstream('temporarily_unavailable', true, 503)
+      },
+      refreshCredential: () => assert.fail('retryable DELETE must not refresh'),
+    },
+    timeoutMs: 1_000,
+    now: () => NOW + 10,
+    randomOwner: () => 'rollover-worker',
+    pollIntervalMs: 1,
+  })
+
+  instance.start()
+  await waitFor(() => attempted, 'rollover retry attempt')
+  await instance.drain()
+  const row = query(
+    fixture.path,
+    `SELECT status, next_attempt_at, claim_owner, claim_expires_at,
+            last_error_category
+     FROM revocation_outbox`,
+  )[0]
+  await instance.stop()
+
+  assert.deepEqual(row, {
+    status: 'pending',
+    next_attempt_at: NOW + 16,
+    claim_owner: null,
+    claim_expires_at: null,
+    last_error_category: 'temporarily_unavailable',
+  })
 })
 
 test('captured-epoch fences prevent claims after reactivation and refresh after a lost renewal', async () => {

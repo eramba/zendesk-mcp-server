@@ -234,7 +234,6 @@ export interface OAuthStore extends OAuthRegisteredClientsStore {
     outboxId: string,
     owner: string,
     category: string,
-    nextAttemptAt: number,
   ): boolean;
   completeRevocation(outboxId: string, owner: string, now: number): boolean;
   releaseClaims(owner: string, now: number): number;

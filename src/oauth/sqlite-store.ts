@@ -2526,7 +2526,6 @@ class SqliteOAuthStore implements LifecycleStore {
     outboxId: string,
     owner: string,
     category: string,
-    nextAttemptAt: number,
   ): boolean {
     this.assertReady();
     const storeNow = Math.floor(this.#now());
@@ -2535,8 +2534,7 @@ class SqliteOAuthStore implements LifecycleStore {
       outboxId.length === 0 ||
       !validClaimOwner(owner) ||
       !validErrorCategory(category) ||
-      !validStoreTime(storeNow) ||
-      !validStoreTime(nextAttemptAt)
+      !validStoreTime(storeNow)
     ) {
       return false;
     }
@@ -2555,11 +2553,11 @@ class SqliteOAuthStore implements LifecycleStore {
       const backoffSeconds = revocationBackoffSeconds(row.attempt_count);
       if (
         backoffSeconds === undefined ||
-        storeNow > Number.MAX_SAFE_INTEGER - backoffSeconds ||
-        nextAttemptAt !== storeNow + backoffSeconds
+        storeNow > Number.MAX_SAFE_INTEGER - backoffSeconds
       ) {
         return false;
       }
+      const nextAttemptAt = storeNow + backoffSeconds;
       return (
         this.#db
           .prepare(

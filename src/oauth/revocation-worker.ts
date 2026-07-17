@@ -6,7 +6,6 @@ import type { ZendeskOAuthGateway } from "./zendesk-oauth-client.js";
 
 const LEASE_MARGIN_MS = 5_000;
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
-const MAX_RETRY_SECONDS = 900;
 
 export type ZendeskRevocationWorkerOptions = {
   store: OAuthStore;
@@ -19,11 +18,6 @@ export type ZendeskRevocationWorkerOptions = {
 
 function validOwner(owner: string): boolean {
   return /^[\x20-\x7e]{1,200}$/.test(owner);
-}
-
-function retryDelaySeconds(attemptCount: number): number | undefined {
-  if (!Number.isSafeInteger(attemptCount) || attemptCount < 1) return undefined;
-  return Math.min(MAX_RETRY_SECONDS, 5 * 2 ** Math.min(30, attemptCount - 1));
 }
 
 function waitWithSignal(promise: Promise<void>, signal?: AbortSignal): Promise<void> {
@@ -150,20 +144,20 @@ export class ZendeskRevocationWorker {
         this.#store.releaseClaims(this.#owner, failureNow);
         return;
       }
-      if (error instanceof ZendeskUpstreamError && error.retryable) {
-        const delay = retryDelaySeconds(claim.attemptCount);
-        if (delay !== undefined && failureNow <= Number.MAX_SAFE_INTEGER - delay) {
-          this.#store.rescheduleRevocation(
-            claim.outboxId,
-            this.#owner,
-            error.category,
-            failureNow + delay,
-          );
-        }
-        return;
-      }
-      if (error instanceof ZendeskUpstreamError && error.category === "aborted") {
-        this.#store.releaseClaims(this.#owner, failureNow);
+      const retryCategory = error instanceof ZendeskUpstreamError
+        ? error.retryable
+          ? error.category
+          : error.category === "aborted"
+            ? "temporarily_unavailable"
+            : undefined
+        : undefined;
+      if (retryCategory !== undefined) {
+        const rescheduled = this.#store.rescheduleRevocation(
+          claim.outboxId,
+          this.#owner,
+          retryCategory,
+        );
+        if (!rescheduled) this.#store.releaseClaims(this.#owner, failureNow);
         return;
       }
       if (error instanceof ZendeskUpstreamError) {

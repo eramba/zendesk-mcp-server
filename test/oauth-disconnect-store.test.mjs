@@ -302,9 +302,9 @@ test('claims are owner-guarded leases with exact retry attempts, renewal, comple
   assert.equal(query(path, 'SELECT claim_expires_at FROM revocation_outbox')[0].claim_expires_at, NOW + 50)
 
   const firstBackoff = Math.min(900, 5 * 2 ** Math.max(0, first.attemptCount - 1))
-  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker-b', 'transport', NOW + 10 + firstBackoff), false)
-  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker-a', '', NOW + 10 + firstBackoff), false)
-  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker-a', 'transport', NOW + 10 + firstBackoff), true)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker-b', 'transport'), false)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker-a', ''), false)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker-a', 'transport'), true)
   assert.deepEqual(
     query(path, 'SELECT status, attempt_count, next_attempt_at, claim_owner, claim_expires_at, last_error_category FROM revocation_outbox'),
     [{
@@ -401,7 +401,7 @@ test('an expired lease removes stale owner authority and permits a new owner to 
 
   clock += 10
   assert.equal(store.renewRevocationClaim(disconnected.outboxId, 'stale-owner', clock + 30), false)
-  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'stale-owner', 'transport', clock + 10), false)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'stale-owner', 'transport'), false)
   assert.equal(store.completeRevocation(disconnected.outboxId, 'stale-owner', clock), false)
   assert.equal(store.releaseClaims('stale-owner', clock), 0)
   assert.deepEqual(query(path, 'SELECT * FROM revocation_outbox')[0], beforeExpiry)
@@ -440,7 +440,7 @@ test('post-disconnect login cancels an expired claim without prior recovery but 
   assert.equal(query(path, 'SELECT * FROM revocation_outbox').length, 0)
 })
 
-test('reschedule accepts only exact clock-based exponential backoff including the 900-second cap', async (t) => {
+test('reschedule atomically derives exact clock-based exponential backoff including the 900-second cap', async (t) => {
   let clock = NOW + 10
   const { path, store, client } = await fixture(t, { now: () => clock })
   login(store, client.client_id, 'backoff')
@@ -448,18 +448,17 @@ test('reschedule accepts only exact clock-based exponential backoff including th
   const first = store.claimDueRevocation('worker', clock, clock + 100)
   assert.equal(first.attemptCount, 1)
 
-  for (const wrong of [clock, clock + 4, clock + 6]) {
-    assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', wrong), false)
-    assert.equal(query(path, 'SELECT status FROM revocation_outbox')[0].status, 'claimed')
-  }
-  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 5), true)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'wrong-worker', 'transport'), false)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', ''), false)
+  assert.equal(query(path, 'SELECT status FROM revocation_outbox')[0].status, 'claimed')
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport'), true)
+  assert.equal(query(path, 'SELECT next_attempt_at FROM revocation_outbox')[0].next_attempt_at, clock + 5)
 
   clock += 5
   const second = store.claimDueRevocation('worker', clock, clock + 100)
   assert.equal(second.attemptCount, 2)
-  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 9), false)
-  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 11), false)
-  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 10), true)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport'), true)
+  assert.equal(query(path, 'SELECT next_attempt_at FROM revocation_outbox')[0].next_attempt_at, clock + 10)
 
   clock += 10
   execute(path, (db) => db.prepare(
@@ -469,9 +468,8 @@ test('reschedule accepts only exact clock-based exponential backoff including th
   ).run(clock, disconnected.outboxId))
   const capped = store.claimDueRevocation('worker', clock, clock + 100)
   assert.equal(capped.attemptCount, 9)
-  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 899), false)
-  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 901), false)
-  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 900), true)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport'), true)
+  assert.equal(query(path, 'SELECT next_attempt_at FROM revocation_outbox')[0].next_attempt_at, clock + 900)
 })
 
 test('recovery terminalizes pending and stranded claimed tombstones at the retention boundary', async (t) => {
@@ -723,5 +721,5 @@ test('disconnect and lease APIs reject invalid identifiers, times, leases, and o
   assert.equal(store.releaseClaims('', NOW + 10), 0)
   assert.equal(store.releaseClaims('worker', -1), 0)
   assert.equal(store.completeRevocation(disconnected.outboxId, '', NOW + 10), false)
-  assert.equal(store.rescheduleRevocation(disconnected.outboxId, '', 'transport', NOW + 20), false)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, '', 'transport'), false)
 })
