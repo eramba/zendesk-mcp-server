@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import test from 'node:test'
 
 import {
@@ -41,6 +42,33 @@ function oauthClient(fetch, onUnauthorized, overrides = {}) {
     },
     fetch,
     ...overrides,
+  })
+}
+
+function runNodeScript(source) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '--eval', source], {
+      cwd: process.cwd(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stdout.on('data', (chunk) => { stdout += chunk })
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    child.on('error', reject)
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`child exited ${code}: ${stderr || stdout}`))
+        return
+      }
+      try {
+        resolve(JSON.parse(stdout.trim()))
+      } catch (error) {
+        reject(new Error(`invalid child output: ${stdout}\n${stderr}`, { cause: error }))
+      }
+    })
   })
 }
 
@@ -100,12 +128,22 @@ test('api-token auth sends Basic credentials and preserves pagination normalizat
   ])
 })
 
-test('OAuth retries the original request once with the resolver credential', async () => {
+test('OAuth retries the exact POST once with only the resolver credential changed', async () => {
   const requests = []
   const callbacks = []
+  const requestBody = JSON.stringify({ ticket: { subject: 'request-body-sentinel' } })
   const client = oauthClient(
     async (input, init) => {
-      requests.push({ url: String(input), authorization: new Headers(init?.headers).get('authorization') })
+      const headers = new Headers(init?.headers)
+      requests.push({
+        url: String(input),
+        method: init?.method,
+        body: init?.body,
+        accept: headers.get('accept'),
+        contentType: headers.get('content-type'),
+        custom: headers.get('x-request-sentinel'),
+        authorization: headers.get('authorization'),
+      })
       return requests.length === 1
         ? jsonResponse({ error: 'expired-access-sentinel' }, 401)
         : jsonResponse({ ticket: { id: 42, subject: 'retried' } })
@@ -121,13 +159,37 @@ test('OAuth retries the original request once with the resolver credential', asy
     },
   )
 
-  const ticket = await client.getTicket(42)
+  const result = await client.request('/tickets.json', {
+    method: 'POST',
+    body: requestBody,
+    headers: {
+      Accept: 'application/vnd.zendesk+json',
+      Authorization: 'Bearer caller-controlled-sentinel',
+      'Content-Type': 'application/vnd.zendesk+json',
+      'X-Request-Sentinel': 'custom-header-sentinel',
+    },
+  })
 
-  assert.equal(ticket.id, 42)
-  assert.equal(ticket.subject, 'retried')
-  assert.deepEqual(requests.map(({ url, authorization }) => ({ url, authorization })), [
-    { url: 'https://example.zendesk.com/api/v2/tickets/42.json', authorization: 'Bearer oauth-access-1' },
-    { url: 'https://example.zendesk.com/api/v2/tickets/42.json', authorization: 'Bearer oauth-access-2' },
+  assert.deepEqual(result, { ticket: { id: 42, subject: 'retried' } })
+  assert.deepEqual(requests, [
+    {
+      url: 'https://example.zendesk.com/api/v2/tickets.json',
+      method: 'POST',
+      body: requestBody,
+      accept: 'application/vnd.zendesk+json',
+      contentType: 'application/vnd.zendesk+json',
+      custom: 'custom-header-sentinel',
+      authorization: 'Bearer oauth-access-1',
+    },
+    {
+      url: 'https://example.zendesk.com/api/v2/tickets.json',
+      method: 'POST',
+      body: requestBody,
+      accept: 'application/vnd.zendesk+json',
+      contentType: 'application/vnd.zendesk+json',
+      custom: 'custom-header-sentinel',
+      authorization: 'Bearer oauth-access-2',
+    },
   ])
   assert.equal(callbacks.length, 1)
   assert.equal(callbacks[0].principalEpoch, 7)
@@ -347,4 +409,70 @@ test('an outer abort signal cancels the in-flight fetch', async () => {
     return true
   })
   assert.equal(observedSignal.aborted, true)
+})
+
+test('a pre-aborted outer signal skips fetch and has no unhandled rejection', async () => {
+  const outcome = await runNodeScript(`
+    import { ZendeskClient } from './dist/zendesk-client.js'
+
+    const unhandled = []
+    process.on('unhandledRejection', (error) => unhandled.push(String(error?.message ?? error)))
+    const outer = new AbortController()
+    outer.abort(new Error('pre-abort-sentinel'))
+    let fetchCalls = 0
+    const client = new ZendeskClient({
+      subdomain: 'example',
+      auth: { kind: 'api_token', email: 'agent@example.test', apiToken: 'token-sentinel' },
+      timeoutMs: 100,
+      fetch: async () => {
+        fetchCalls += 1
+        return await new Promise((resolve, reject) => {
+          setTimeout(() => reject(new Error('late-fetch-rejection')), 10)
+        })
+      },
+    })
+
+    const category = await client.getTicket(42, outer.signal).then(
+      () => 'unexpected-success',
+      (error) => error.category,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    console.log(JSON.stringify({ category, fetchCalls, unhandled }))
+  `)
+
+  assert.deepEqual(outcome, { category: 'aborted', fetchCalls: 0, unhandled: [] })
+})
+
+test('timeout during a pending body read observes a late cancellation rejection', async () => {
+  const outcome = await runNodeScript(`
+    import { ZendeskClient } from './dist/zendesk-client.js'
+
+    const unhandled = []
+    process.on('unhandledRejection', (error) => unhandled.push(String(error?.message ?? error)))
+    const stream = new ReadableStream({
+      pull() {
+        return new Promise(() => {})
+      },
+      cancel() {
+        return new Promise((resolve, reject) => {
+          setTimeout(() => reject(new Error('late-cancel-rejection')), 10)
+        })
+      },
+    })
+    const client = new ZendeskClient({
+      subdomain: 'example',
+      auth: { kind: 'api_token', email: 'agent@example.test', apiToken: 'token-sentinel' },
+      timeoutMs: 5,
+      fetch: async () => new Response(stream, { status: 503 }),
+    })
+
+    const category = await client.getTicket(42).then(
+      () => 'unexpected-success',
+      (error) => error.category,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    console.log(JSON.stringify({ category, unhandled }))
+  `)
+
+  assert.deepEqual(outcome, { category: 'aborted', unhandled: [] })
 })

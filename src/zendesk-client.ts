@@ -197,9 +197,11 @@ function createRequestSignal(
 }
 
 function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
   return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
     signal.addEventListener("abort", onAbort, { once: true });
     promise.then(
       (value) => {
@@ -211,6 +213,7 @@ function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T>
         reject(error);
       },
     );
+    if (signal.aborted) onAbort();
   });
 }
 
@@ -374,6 +377,7 @@ export class ZendeskClient {
     auth: BasicZendeskAuth | OAuthZendeskAuth,
     signal: AbortSignal,
   ): Promise<Response> {
+    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
     const headers = new Headers(init?.headers);
     headers.set("Authorization", this.authorization(auth));
     if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
