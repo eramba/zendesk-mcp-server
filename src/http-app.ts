@@ -94,16 +94,27 @@ export function createHttpApp(
   app.post("/mcp", async (req, res) => {
     let server: ReturnType<typeof buildZendeskServer> | undefined;
     let transport: StreamableHTTPServerTransport | undefined;
-    let closed = false;
+    let responseClosed = false;
+    let resourcesClosed = false;
+    let resourcesClosing: Promise<void> | undefined;
 
-    const closeResources = async () => {
-      if (closed) return;
-      closed = true;
-      if (transport) await transport.close().catch(() => undefined);
-      if (server) await server.close().catch(() => undefined);
+    const closeResources = (): Promise<void> => {
+      if (resourcesClosing) return resourcesClosing;
+      if (resourcesClosed || (!transport && !server)) return Promise.resolve();
+      resourcesClosed = true;
+      const allocatedTransport = transport;
+      const allocatedServer = server;
+      resourcesClosing = (async () => {
+        if (allocatedTransport) {
+          await allocatedTransport.close().catch(() => undefined);
+        }
+        if (allocatedServer) await allocatedServer.close().catch(() => undefined);
+      })();
+      return resourcesClosing;
     };
 
     res.once("close", () => {
+      responseClosed = true;
       void closeResources();
     });
 
@@ -113,14 +124,28 @@ export function createHttpApp(
         throw new Error("Authenticated principal is unavailable");
       }
       const client = await resolver.resolve(principalId);
+      if (responseClosed) return;
       server = serverFactory(client);
+      if (responseClosed) {
+        await closeResources();
+        return;
+      }
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });
+      if (responseClosed) {
+        await closeResources();
+        return;
+      }
       await server.connect(transport);
+      if (responseClosed) {
+        await closeResources();
+        return;
+      }
       await transport.handleRequest(req, res, req.body);
     } catch {
       await closeResources();
+      if (responseClosed) return;
       console.error("Error handling MCP request");
       if (!res.headersSent) {
         res.status(500).json({

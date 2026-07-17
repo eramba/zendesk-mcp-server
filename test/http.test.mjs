@@ -24,6 +24,14 @@ const TOKENS = {
   numericPrincipal: 'mcp-numeric-principal',
 }
 
+function deferred() {
+  let resolve
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
 function oauthRouter() {
   const router = express.Router()
   for (const [method, path] of [
@@ -428,6 +436,68 @@ test('concurrent principal A/B POSTs keep Zendesk Bearer results and errors isol
   assert.ok(resolverCalls.includes('principal-a'))
   assert.ok(resolverCalls.includes('principal-b'))
   assert.equal(calls.servers.length, resolverCalls.length)
+})
+
+test('disconnect during principal resolution prevents later server and transport allocation', async (t) => {
+  const resolverEntered = deferred()
+  const releaseResolver = deferred()
+  const resolverReturned = deferred()
+  const responseClosed = deferred()
+  const observedRouter = oauthRouter()
+  observedRouter.use('/mcp', (_req, res, next) => {
+    res.once('close', () => responseClosed.resolve())
+    next()
+  })
+  const lifecycle = { factory: 0, connect: 0, close: 0 }
+  const resolver = {
+    async resolve(principalId) {
+      assert.equal(principalId, 'principal-a')
+      resolverEntered.resolve()
+      const client = await releaseResolver.promise
+      resolverReturned.resolve()
+      return client
+    },
+  }
+  const serverFactory = () => {
+    lifecycle.factory += 1
+    return {
+      async connect() {
+        lifecycle.connect += 1
+        throw new Error('server connected after response close')
+      },
+      async close() {
+        lifecycle.close += 1
+      },
+    }
+  }
+  const { app } = makeApp({
+    oauthRouter: observedRouter,
+    resolver,
+    serverFactory,
+  })
+  const baseUrl = await listen(t, app)
+  const target = new URL(`${baseUrl}/mcp`)
+  const req = request({
+    hostname: target.hostname,
+    port: target.port,
+    path: target.pathname,
+    method: 'POST',
+    headers: {
+      ...bearer(TOKENS.principalA),
+      'Content-Type': 'application/json',
+    },
+  })
+  req.on('error', () => undefined)
+  req.end('{}')
+
+  await resolverEntered.promise
+  req.destroy()
+  await responseClosed.promise
+  releaseResolver.resolve({ principal: 'a' })
+  await resolverReturned.promise
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.deepEqual(lifecycle, { factory: 0, connect: 0, close: 0 })
 })
 
 test('non-string principals and setup failures return sanitized protocol 500 responses', async (t) => {
