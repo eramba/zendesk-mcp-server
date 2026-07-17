@@ -164,6 +164,16 @@ function assertCookieCleared(response) {
   assert.equal(response.headers.get('set-cookie'), CLEAR_COOKIE)
 }
 
+function assertConsentResponseHardened(response) {
+  assert.deepEqual({
+    cacheControl: response.headers.get('cache-control'),
+    setCookie: response.headers.get('set-cookie'),
+  }, {
+    cacheControl: 'no-store',
+    setCookie: CLEAR_COOKIE,
+  })
+}
+
 test('renders escaped browser consent with exact security headers and strict cookie', async (t) => {
   const fixture = await startFixture(t)
   const consent = await beginConsent(fixture)
@@ -299,6 +309,7 @@ test('fails closed on malformed, unbound, mixed, transplanted, and oversized con
     body: new URLSearchParams({ transaction: 'x'.repeat(4_097) }),
   })
   assert.equal(oversized.status, 413)
+  assertConsentResponseHardened(oversized)
   assert.equal(fixture.authorizationStates.length, 0)
 
   const validAfterFailures = await consentRequest(fixture.baseUrl, first)

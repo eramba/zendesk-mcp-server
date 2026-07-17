@@ -1,4 +1,4 @@
-import type { Request, Response } from "express";
+import type { Request, RequestHandler, Response } from "express";
 import type { AuthorizationParams } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
 
@@ -10,6 +10,8 @@ import type { ZendeskOAuthGateway } from "./zendesk-oauth-client.js";
 const CONSENT_COOKIE = "__Secure-zendesk_oauth_consent";
 const CONSENT_COOKIE_ATTRIBUTES =
   `HttpOnly; Secure; SameSite=Strict; Path=${OAUTH_PATHS.consent}`;
+const CLEAR_CONSENT_COOKIE =
+  `${CONSENT_COOKIE}=; ${CONSENT_COOKIE_ATTRIBUTES}; Max-Age=0`;
 const CONSENT_CSP =
   "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'";
 
@@ -41,6 +43,16 @@ function isFormContentType(value: string | undefined): boolean {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+function hardenConsentPostResponse(res: Response): void {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Set-Cookie", CLEAR_CONSENT_COOKIE);
+}
+
+export const consentPostResponseHeaders: RequestHandler = (_req, res, next) => {
+  hardenConsentPostResponse(res);
+  next();
+};
 
 function readNamedCookie(header: string | undefined): string | undefined {
   if (header === undefined) return undefined;
@@ -151,11 +163,7 @@ export class ConsentController {
   };
 
   readonly handlePost = async (req: Request, res: Response): Promise<void> => {
-    res.setHeader("Cache-Control", "no-store");
-    res.setHeader(
-      "Set-Cookie",
-      `${CONSENT_COOKIE}=; ${CONSENT_COOKIE_ATTRIBUTES}; Max-Age=0`,
-    );
+    hardenConsentPostResponse(res);
 
     const browserNonce = readNamedCookie(req.headers.cookie);
     const body: unknown = req.body;

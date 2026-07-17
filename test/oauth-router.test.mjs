@@ -12,6 +12,7 @@ const REDIRECT_URI = 'http://127.0.0.1:43123/callback'
 const SCOPES = ['zendesk:read', 'zendesk:write']
 const VERIFIER = 'v'.repeat(43)
 const CHALLENGE = createHash('sha256').update(VERIFIER).digest('base64url')
+const CLEAR_CONSENT_COOKIE = '__Secure-zendesk_oauth_consent=; HttpOnly; Secure; SameSite=Strict; Path=/oauth/consent; Max-Age=0'
 
 const PUBLIC_CLIENT = {
   client_id: 'public-client',
@@ -123,6 +124,16 @@ function formRequest(body) {
   }
 }
 
+function assertConsentResponseHardened(response) {
+  assert.deepEqual({
+    cacheControl: response.headers.get('cache-control'),
+    setCookie: response.headers.get('set-cookie'),
+  }, {
+    cacheControl: 'no-store',
+    setCookie: CLEAR_CONSENT_COOKIE,
+  })
+}
+
 async function assertLimiter(baseUrl, path, expectedLimit, expectedWindow, request) {
   let response
   for (let count = 1; count <= expectedLimit; count += 1) {
@@ -135,6 +146,7 @@ async function assertLimiter(baseUrl, path, expectedLimit, expectedWindow, reque
 
   response = await fetch(`${baseUrl}${path}`, request(expectedLimit + 1))
   assert.equal(response.status, 429, `${path} must reject request ${expectedLimit + 1}`)
+  return response
 }
 
 test('serves exact path-specific resource and corrected public-client authorization metadata', async (t) => {
@@ -257,11 +269,12 @@ test('applies the exact standard-only limiter policies to all OAuth and browser 
     client_id: PUBLIC_CLIENT.client_id,
     token: 'access-token',
   }))
-  await assertLimiter(baseUrl, '/oauth/consent', 60, 900, () => formRequest({
+  const limitedConsent = await assertLimiter(baseUrl, '/oauth/consent', 60, 900, () => formRequest({
     transaction: 'transaction',
     csrf: 'csrf',
     decision: 'confirm',
   }))
+  assertConsentResponseHardened(limitedConsent)
   await assertLimiter(baseUrl, '/oauth/zendesk/callback', 60, 900, () => ({
     method: 'GET',
   }))
@@ -292,10 +305,12 @@ test('consent accepts only small flat URL-encoded forms', async (t) => {
     five: '5',
   }))
   assert.equal(tooManyParameters.status, 413)
+  assertConsentResponseHardened(tooManyParameters)
 
   const tooLarge = await fetch(`${baseUrl}/oauth/consent`, formRequest({
     transaction: 'x'.repeat(4_097),
   }))
   assert.equal(tooLarge.status, 413)
+  assertConsentResponseHardened(tooLarge)
   assert.equal(calls.consent.length, 1)
 })

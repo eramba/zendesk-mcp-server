@@ -15,6 +15,7 @@ import {
 import type { OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
 
 import { MCP_SCOPES, OAUTH_PATHS } from "./constants.js";
+import { consentPostResponseHeaders } from "./consent.js";
 import type { ZendeskBrokerOAuthProvider } from "./zendesk-broker-provider.js";
 
 const FIFTEEN_MINUTES_MS = 15 * 60 * 1_000;
@@ -95,6 +96,7 @@ export function createZendeskOAuthRouter(
   );
   router.post(
     OAUTH_PATHS.consent,
+    consentPostResponseHeaders,
     browserRateLimit(),
     express.urlencoded({
       extended: false,
