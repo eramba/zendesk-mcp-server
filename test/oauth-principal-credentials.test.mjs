@@ -3,6 +3,7 @@ import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
+import { Worker } from 'node:worker_threads'
 
 import Database from 'better-sqlite3'
 
@@ -14,6 +15,7 @@ const REDIRECT_URI = 'http://127.0.0.1:43123/callback'
 const RESOURCE = 'https://dev-server.tail22145b.ts.net/mcp'
 const CODE_CHALLENGE = 'C'.repeat(43)
 const MCP_SCOPES = ['zendesk:read', 'zendesk:write']
+const ZENDESK_SCOPES = ['read', 'tickets:write']
 const SUBDOMAIN = 'example'
 const USER_ID = '424242'
 const VALID_CLIENT = {
@@ -75,8 +77,71 @@ function grant(label, now = NOW) {
     refreshToken: `refresh-${label}-SENTINEL`,
     accessExpiresAt: now + 3_600,
     refreshExpiresAt: now + 86_400,
-    scopes: ['read', 'tickets:write'],
+    scopes: [...ZENDESK_SCOPES],
   }
+}
+
+function commitWorker(workerData) {
+  const sqliteStoreUrl = new URL('../dist/oauth/sqlite-store.js', import.meta.url).href
+  const tokenCipherUrl = new URL('../dist/oauth/token-cipher.js', import.meta.url).href
+  const source = `
+    import { parentPort, workerData } from 'node:worker_threads'
+    import { openSqliteOAuthStore } from ${JSON.stringify(sqliteStoreUrl)}
+    import { TokenCipher } from ${JSON.stringify(tokenCipherUrl)}
+
+    const gate = new Int32Array(workerData.gate)
+    const testHooks = workerData.hold ? {
+      beforeLoginCommit() {
+        parentPort.postMessage({ event: 'held' })
+        Atomics.wait(gate, 0, 0)
+      },
+    } : undefined
+    const store = openSqliteOAuthStore({
+      path: workerData.path,
+      cipher: new TokenCipher(Buffer.alloc(32, 23)),
+      mcpResourceUrl: new URL(workerData.resource),
+      now: () => workerData.now,
+      busyTimeoutMs: 5_000,
+      testHooks,
+    })
+    parentPort.postMessage({ event: 'ready' })
+    Atomics.wait(gate, workerData.startIndex, 0)
+    parentPort.postMessage({ event: 'starting' })
+    try {
+      const result = store.commitLogin(workerData.input)
+      parentPort.postMessage({ event: 'result', result })
+    } catch (error) {
+      parentPort.postMessage({ event: 'error', message: error instanceof Error ? error.message : String(error) })
+    } finally {
+      store.close()
+    }
+  `
+  return new Worker(new URL(`data:text/javascript,${encodeURIComponent(source)}`), { workerData })
+}
+
+function waitForWorkerEvent(worker, event, timeoutMs = 3_000) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => finish(new Error(`worker did not emit ${event}`)), timeoutMs)
+    const onError = (error) => finish(error)
+    const onMessage = (message) => {
+      if (message?.event === 'error') {
+        finish(new Error(message.message))
+      } else if (message?.event === event) {
+        finish(undefined, message)
+      } else if (event === 'held' && message?.event === 'result') {
+        finish(new Error('worker committed before the late hold hook'))
+      }
+    }
+    function finish(error, message) {
+      clearTimeout(timeout)
+      worker.off('error', onError)
+      worker.off('message', onMessage)
+      if (error) reject(error)
+      else resolve(message)
+    }
+    worker.on('error', onError)
+    worker.on('message', onMessage)
+  })
 }
 
 function query(path, sql, ...parameters) {
@@ -227,6 +292,64 @@ test('staged login grants are encrypted, unavailable as credentials, and discard
   assertSecretsAbsent(captured.join('\n'), [stagedGrant.accessToken, stagedGrant.refreshToken])
 })
 
+test('staging requires the exact Zendesk scope set and stores canonical scope order', async (t) => {
+  const { path, cipher, store, client } = await fixture(t)
+  const invalidScopes = [
+    ['read'],
+    ['read', 'tickets:write', 'users:read'],
+    ['read', 'tickets:write', 'read'],
+    ['read', 42],
+  ]
+
+  for (const [index, scopes] of invalidScopes.entries()) {
+    const { callback } = claimLogin(store, client.client_id, `invalid-scope-${index}`, NOW + index)
+    assert.throws(
+      () => store.stageLoginGrant({
+        transactionId: callback.transactionId,
+        subdomain: SUBDOMAIN,
+        grant: { ...grant(`invalid-scope-${index}`, NOW + index), scopes },
+        now: NOW + index,
+      }),
+      /invalid login commit/i,
+    )
+  }
+  assert.equal(query(path, 'SELECT * FROM staged_grants').length, 0)
+
+  const { callback } = claimLogin(store, client.client_id, 'canonical-scope', NOW + 10)
+  const reordered = {
+    ...grant('canonical-scope', NOW + 10),
+    scopes: [...ZENDESK_SCOPES].reverse(),
+  }
+  const { stageId } = store.stageLoginGrant({
+    transactionId: callback.transactionId,
+    subdomain: SUBDOMAIN,
+    grant: reordered,
+    now: NOW + 10,
+  })
+  const stagedRow = query(path, 'SELECT * FROM staged_grants WHERE id = ?', stageId)[0]
+  const stagedGrant = JSON.parse(cipher.decrypt(JSON.parse(stagedRow.encrypted_grant_json), {
+    kind: 'staged_grant',
+    rowId: stageId,
+    expiresAt: stagedRow.expires_at,
+    purpose: 'login',
+    subdomain: SUBDOMAIN,
+    expectedPrincipalId: null,
+    expectedCredentialVersion: null,
+    expectedPrincipalEpoch: null,
+  }))
+  assert.deepEqual(stagedGrant.scopes, ZENDESK_SCOPES)
+  store.commitLogin({
+    transactionId: callback.transactionId,
+    stageId,
+    zendeskUserId: USER_ID,
+    now: NOW + 10,
+  })
+
+  const credential = inspectCredential(path, cipher)
+  assert.deepEqual(credential.grant.scopes, ZENDESK_SCOPES)
+  assert.equal(credential.row.scopes, ZENDESK_SCOPES.join(' '))
+})
+
 test('first callback atomically creates the stable principal, credential, code, and completed login', async (t) => {
   const { path, cipher, store, client } = await fixture(t)
   const originalState = 'first-state-SENTINEL'
@@ -281,7 +404,7 @@ test('first callback atomically creates the stable principal, credential, code, 
 test('injected commit failure rolls back principal, credential, code, login, and stage changes', async (t) => {
   const failure = new Error('injected login commit failure')
   const { path, store, client } = await fixture(t, {
-    testHooks: { beforeLoginWrites: () => { throw failure } },
+    testHooks: { beforeLoginCommit: () => { throw failure } },
   })
   const { callback } = claimLogin(store, client.client_id, 'rollback-state')
   const { stageId } = store.stageLoginGrant({
@@ -306,6 +429,44 @@ test('injected commit failure rolls back principal, credential, code, login, and
   assert.equal(query(path, 'SELECT status FROM login_transactions')[0].status, 'callback_claimed')
   assert.equal(query(path, 'SELECT id, status FROM staged_grants')[0].id, stageId)
   assert.equal(query(path, 'SELECT id, status FROM staged_grants')[0].status, 'staged')
+})
+
+test('commitLogin crosses the driver boundary through an immediate transaction', async (t) => {
+  const { store, client } = await fixture(t)
+  const { callback } = claimLogin(store, client.client_id, 'immediate-boundary')
+  const { stageId } = store.stageLoginGrant({
+    transactionId: callback.transactionId,
+    subdomain: SUBDOMAIN,
+    grant: grant('immediate-boundary'),
+    now: NOW,
+  })
+  const originalTransaction = Database.prototype.transaction
+  let deferredCalls = 0
+  let immediateCalls = 0
+  Database.prototype.transaction = function (...args) {
+    const transaction = originalTransaction.apply(this, args)
+    const wrapped = (...callArgs) => {
+      deferredCalls += 1
+      return transaction(...callArgs)
+    }
+    wrapped.immediate = (...callArgs) => {
+      immediateCalls += 1
+      return transaction.immediate(...callArgs)
+    }
+    return wrapped
+  }
+  try {
+    store.commitLogin({
+      transactionId: callback.transactionId,
+      stageId,
+      zendeskUserId: USER_ID,
+      now: NOW,
+    })
+  } finally {
+    Database.prototype.transaction = originalTransaction
+  }
+  assert.equal(immediateCalls, 1)
+  assert.equal(deferredCalls, 0)
 })
 
 test('active re-login increments only credential version and preserves every family marker', async (t) => {
@@ -387,6 +548,74 @@ test('concurrent callbacks serialize to the last credential without upstream cle
   const current = inspectCredential(path, cipher)
   assert.equal(current.row.credential_version, 2)
   assert.deepEqual(current.grant, secondGrant)
+  assert.equal(query(path, 'SELECT * FROM staged_grants').length, 0)
+  assert.equal(query(path, 'SELECT * FROM revocation_outbox').length, 0)
+})
+
+test('overlapping worker commits serialize across two store connections', async (t) => {
+  const { path, cipher, store, client } = await fixture(t)
+  const first = claimLogin(store, client.client_id, 'worker-first')
+  const second = claimLogin(store, client.client_id, 'worker-second', NOW + 1)
+  const firstGrant = grant('worker-first')
+  const secondGrant = grant('worker-second', NOW + 1)
+  const firstStage = store.stageLoginGrant({ transactionId: first.callback.transactionId, subdomain: SUBDOMAIN, grant: firstGrant, now: NOW })
+  const secondStage = store.stageLoginGrant({ transactionId: second.callback.transactionId, subdomain: SUBDOMAIN, grant: secondGrant, now: NOW + 1 })
+  const gateBuffer = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3)
+  const gate = new Int32Array(gateBuffer)
+  const workers = []
+  t.after(async () => {
+    Atomics.store(gate, 0, 1)
+    Atomics.notify(gate, 0)
+    await Promise.all(workers.map((worker) => worker.terminate()))
+  })
+  const firstWorker = commitWorker({
+    path,
+    resource: RESOURCE,
+    now: NOW + 2,
+    gate: gateBuffer,
+    startIndex: 1,
+    hold: true,
+    input: { transactionId: first.callback.transactionId, stageId: firstStage.stageId, zendeskUserId: USER_ID, now: NOW + 2 },
+  })
+  workers.push(firstWorker)
+  const secondWorker = commitWorker({
+    path,
+    resource: RESOURCE,
+    now: NOW + 2,
+    gate: gateBuffer,
+    startIndex: 2,
+    hold: false,
+    input: { transactionId: second.callback.transactionId, stageId: secondStage.stageId, zendeskUserId: USER_ID, now: NOW + 2 },
+  })
+  workers.push(secondWorker)
+  await Promise.all([
+    waitForWorkerEvent(firstWorker, 'ready'),
+    waitForWorkerEvent(secondWorker, 'ready'),
+  ])
+  Atomics.store(gate, 1, 1)
+  Atomics.notify(gate, 1)
+  await waitForWorkerEvent(firstWorker, 'held')
+  Atomics.store(gate, 2, 1)
+  Atomics.notify(gate, 2)
+  await waitForWorkerEvent(secondWorker, 'starting')
+  const secondResultPromise = waitForWorkerEvent(secondWorker, 'result', 6_000)
+  Atomics.store(gate, 0, 1)
+  Atomics.notify(gate, 0)
+  const [firstResult, secondResult] = await Promise.all([
+    waitForWorkerEvent(firstWorker, 'result', 6_000),
+    secondResultPromise,
+  ])
+
+  assert.equal(firstResult.result.principalId, secondResult.result.principalId)
+  assert.equal(firstResult.result.principalEpoch, 1)
+  assert.equal(secondResult.result.principalEpoch, 1)
+  const current = inspectCredential(path, cipher)
+  assert.equal(current.row.credential_version, 2)
+  const winner = current.grant.accessToken === firstGrant.accessToken ? firstGrant : secondGrant
+  assert.deepEqual(current.grant, winner, 'final credential must be one complete committed grant')
+  assert.deepEqual(current.grant.scopes, ZENDESK_SCOPES)
+  assert.equal(query(path, "SELECT * FROM login_transactions WHERE status = 'complete'").length, 2)
+  assert.equal(query(path, 'SELECT * FROM authorization_codes').length, 2)
   assert.equal(query(path, 'SELECT * FROM staged_grants').length, 0)
   assert.equal(query(path, 'SELECT * FROM revocation_outbox').length, 0)
 })

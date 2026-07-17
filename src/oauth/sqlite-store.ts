@@ -17,6 +17,7 @@ import {
   AUTHORIZATION_CODE_TTL_SECONDS,
   LOGIN_TTL_SECONDS,
   MCP_SCOPES,
+  ZENDESK_SCOPES,
   normalizeMcpScopes,
 } from "./constants.js";
 import { SCHEMA_VERSION, SQLITE_MIGRATIONS } from "./sqlite-schema.js";
@@ -79,7 +80,7 @@ export type SqliteOAuthStoreOptions = {
   randomToken?: (bytes?: number) => string;
   busyTimeoutMs?: number;
   testHooks?: {
-    beforeLoginWrites?: () => void;
+    beforeLoginCommit?: () => void;
   };
 };
 
@@ -313,23 +314,25 @@ function validStoreTime(now: number): boolean {
   return Number.isSafeInteger(now) && now >= 0;
 }
 
-function validZendeskGrant(grant: ZendeskGrant, now: number): boolean {
-  return Boolean(
-    grant &&
-      typeof grant === "object" &&
-      typeof grant.accessToken === "string" &&
-      grant.accessToken.length > 0 &&
-      typeof grant.refreshToken === "string" &&
-      grant.refreshToken.length > 0 &&
-      Number.isSafeInteger(grant.accessExpiresAt) &&
-      grant.accessExpiresAt > now &&
-      Number.isSafeInteger(grant.refreshExpiresAt) &&
-      grant.refreshExpiresAt > grant.accessExpiresAt &&
-      Array.isArray(grant.scopes) &&
-      grant.scopes.length > 0 &&
-      grant.scopes.every((scope) => typeof scope === "string" && scope.length > 0) &&
-      new Set(grant.scopes).size === grant.scopes.length,
-  );
+function normalizeZendeskGrant(grant: ZendeskGrant, now: number): ZendeskGrant | undefined {
+  if (
+    !grant ||
+    typeof grant !== "object" ||
+    typeof grant.accessToken !== "string" ||
+    grant.accessToken.length === 0 ||
+    typeof grant.refreshToken !== "string" ||
+    grant.refreshToken.length === 0 ||
+    !Number.isSafeInteger(grant.accessExpiresAt) ||
+    grant.accessExpiresAt <= now ||
+    !Number.isSafeInteger(grant.refreshExpiresAt) ||
+    grant.refreshExpiresAt <= grant.accessExpiresAt ||
+    !Array.isArray(grant.scopes) ||
+    !grant.scopes.every((scope) => typeof scope === "string") ||
+    !sameSet(grant.scopes, ZENDESK_SCOPES)
+  ) {
+    return undefined;
+  }
+  return { ...grant, scopes: [...ZENDESK_SCOPES] };
 }
 
 function stagedGrantCipherContext(row: StagedGrantRow) {
@@ -356,8 +359,9 @@ function decryptStagedGrant(
       stagedGrantCipherContext(row),
     ),
   ) as ZendeskGrant;
-  if (!validZendeskGrant(grant, now)) throw invalidLoginCommit();
-  return grant;
+  const normalized = normalizeZendeskGrant(grant, now);
+  if (!normalized) throw invalidLoginCommit();
+  return normalized;
 }
 
 function validateClientRegistration(client: ClientRegistration): {
@@ -852,11 +856,12 @@ class SqliteOAuthStore implements LifecycleStore {
 
   stageLoginGrant(input: StageLoginGrantInput): { stageId: string } {
     this.assertReady();
+    const grant = normalizeZendeskGrant(input.grant, input.now);
     if (
       !validStoreTime(input.now) ||
       typeof input.transactionId !== "string" ||
       !/^(?!-)[a-z0-9-]{1,63}(?<!-)$/.test(input.subdomain) ||
-      !validZendeskGrant(input.grant, input.now)
+      !grant
     ) {
       throw invalidLoginCommit();
     }
@@ -895,7 +900,7 @@ class SqliteOAuthStore implements LifecycleStore {
         expires_at: login.expires_at,
       };
       const encrypted = this.#cipher.encrypt(
-        JSON.stringify(input.grant),
+        JSON.stringify(grant),
         stagedGrantCipherContext(stage),
       );
       this.#db
@@ -1048,8 +1053,6 @@ class SqliteOAuthStore implements LifecycleStore {
           .run(principalEpoch, input.now, principalId);
       }
 
-      this.#testHooks?.beforeLoginWrites?.();
-
       const encryptedCredential = this.#cipher.encrypt(JSON.stringify(grant), {
         kind: "zendesk_credential",
         rowId: principalId,
@@ -1134,6 +1137,8 @@ class SqliteOAuthStore implements LifecycleStore {
         .run(stage.id).changes;
       if (completed !== 1 || deletedStage !== 1) throw invalidLoginCommit();
 
+      this.#testHooks?.beforeLoginCommit?.();
+
       return {
         redirectUri: payload.redirectUri,
         originalState: payload.originalState,
@@ -1141,7 +1146,7 @@ class SqliteOAuthStore implements LifecycleStore {
         principalEpoch,
         authorizationCode,
       };
-    })();
+    }).immediate();
   }
 
   discardStagedGrant(stageId: string, now: number): boolean {
