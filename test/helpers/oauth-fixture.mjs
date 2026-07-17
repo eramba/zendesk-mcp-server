@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
-import { readFile, mkdtemp } from 'node:fs/promises'
+import { readFile, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -50,14 +50,29 @@ function createIntegratedFakeZendesk(now) {
   const refreshOwners = new Map()
   const ticketFailures = new Map()
   const waiters = []
+  const barriers = []
   let refreshSequence = 0
 
   function notify(request) {
     for (let index = waiters.length - 1; index >= 0; index -= 1) {
       if (waiters[index].predicate(request)) {
-        const [{ resolve }] = waiters.splice(index, 1)
-        resolve(request)
+        const [waiter] = waiters.splice(index, 1)
+        waiter.resolve(request)
       }
+    }
+  }
+
+  async function waitAtBarrier(request) {
+    const barrier = barriers.find((candidate) =>
+      !candidate.released && candidate.predicate(request))
+    if (!barrier) return
+    barrier.active += 1
+    barrier.maxActive = Math.max(barrier.maxActive, barrier.active)
+    if (barrier.active >= barrier.expectedCount) barrier.resolveReached()
+    try {
+      await barrier.pendingRelease
+    } finally {
+      barrier.active -= 1
     }
   }
 
@@ -83,6 +98,7 @@ function createIntegratedFakeZendesk(now) {
     }
     requests.push(request)
     notify(request)
+    await waitAtBarrier(request)
 
     if (method === 'POST' && url.pathname === '/oauth/tokens') {
       if (json?.grant_type === 'authorization_code') {
@@ -186,10 +202,72 @@ function createIntegratedFakeZendesk(now) {
     failTicket(zendeskUserId, ticketId, sentinel) {
       ticketFailures.set(`${zendeskUserId}:${ticketId}`, sentinel)
     },
-    waitForRequest(predicate) {
+    waitForRequest(predicate, { timeoutMs = 1_000 } = {}) {
       const existing = requests.find(predicate)
       if (existing) return Promise.resolve(existing)
-      return new Promise((resolve) => waiters.push({ predicate, resolve }))
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+        return Promise.reject(new Error('Fake Zendesk wait timeout must be a positive integer'))
+      }
+      return new Promise((resolve, reject) => {
+        const waiter = {
+          predicate,
+          resolve(request) {
+            clearTimeout(waiter.timeout)
+            resolve(request)
+          },
+          timeout: undefined,
+        }
+        waiter.timeout = setTimeout(() => {
+          const index = waiters.indexOf(waiter)
+          if (index !== -1) waiters.splice(index, 1)
+          reject(new Error(`Timed out waiting for fake Zendesk request after ${timeoutMs}ms`))
+        }, timeoutMs)
+        waiters.push(waiter)
+      })
+    },
+    holdRequests(predicate, expectedCount, { timeoutMs = 1_000 } = {}) {
+      if (!Number.isSafeInteger(expectedCount) || expectedCount <= 0) {
+        throw new Error('Fake Zendesk barrier count must be a positive integer')
+      }
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+        throw new Error('Fake Zendesk barrier timeout must be a positive integer')
+      }
+      let resolveReached
+      let rejectReached
+      let resolveRelease
+      const barrier = {
+        active: 0,
+        maxActive: 0,
+        expectedCount,
+        predicate,
+        reached: new Promise((resolve, reject) => {
+          resolveReached = resolve
+          rejectReached = reject
+        }),
+        pendingRelease: new Promise((resolve) => { resolveRelease = resolve }),
+        released: false,
+        resolveReached() {
+          clearTimeout(barrier.timeout)
+          resolveReached()
+        },
+        release() {
+          if (barrier.released) return
+          barrier.released = true
+          clearTimeout(barrier.timeout)
+          resolveRelease()
+          const index = barriers.indexOf(barrier)
+          if (index !== -1) barriers.splice(index, 1)
+        },
+        timeout: undefined,
+      }
+      barrier.timeout = setTimeout(() => {
+        barrier.release()
+        rejectReached(new Error(
+          `Timed out waiting for ${expectedCount} concurrent fake Zendesk requests after ${timeoutMs}ms`,
+        ))
+      }, timeoutMs)
+      barriers.push(barrier)
+      return barrier
     },
     accessOwner(accessToken) {
       return accessOwners.get(accessToken)
@@ -213,7 +291,8 @@ async function closeListener(listener) {
 
 export async function createOAuthFixture(t, options = {}) {
   const now = options.currentTime ?? { value: Math.floor(Date.now() / 1_000) }
-  const directory = await mkdtemp(join(tmpdir(), 'zendesk-oauth-e2e-'))
+  const directoryPrefix = join(tmpdir(), 'zendesk-oauth-e2e-')
+  const directory = await mkdtemp(directoryPrefix)
   const dbPath = join(directory, 'oauth.sqlite')
   const publicBaseUrl = new URL('https://broker.example.test/')
   const resourceUrl = new URL('/mcp', publicBaseUrl)
@@ -319,16 +398,39 @@ export async function createOAuthFixture(t, options = {}) {
   t.after(async () => {
     if (closed) return
     closed = true
+    const failures = []
     try {
-      await worker?.stop()
-      await closeListener(listener)
-      store?.close()
+      try {
+        await worker?.stop()
+      } catch (error) {
+        failures.push(error)
+      }
+      try {
+        await closeListener(listener)
+      } catch (error) {
+        failures.push(error)
+      }
+      try {
+        store?.close()
+      } catch (error) {
+        failures.push(error)
+      }
+      try {
+        if (!directory.startsWith(directoryPrefix)) {
+          throw new Error('OAuth fixture cleanup path escaped its temporary prefix')
+        }
+        await rm(directory, { recursive: true, force: true })
+      } catch (error) {
+        failures.push(error)
+      }
     } finally {
       globalThis.fetch = originalFetch
       console.error = originalConsole.error
       console.log = originalConsole.log
       console.warn = originalConsole.warn
     }
+    if (failures.length === 1) throw failures[0]
+    if (failures.length > 1) throw new AggregateError(failures, 'OAuth fixture cleanup failed')
   })
 
   let runtime
@@ -558,7 +660,7 @@ export async function createOAuthFixture(t, options = {}) {
       runtime = await buildRuntime()
       return fixture
     },
-    async runRevocationWorker() {
+    async runRevocationWorker({ timeoutMs = 1_000 } = {}) {
       worker = new ZendeskRevocationWorker({
         store,
         zendesk: runtime.zendesk,
@@ -569,12 +671,15 @@ export async function createOAuthFixture(t, options = {}) {
       })
       const requestSeen = fakeZendesk.waitForRequest(
         ({ method, pathname }) => method === 'DELETE' && pathname === '/api/v2/oauth/tokens/current.json',
+        { timeoutMs },
       )
       worker.start()
-      const requestResult = await requestSeen
-      await worker.stop()
-      worker = undefined
-      return requestResult
+      try {
+        return await requestSeen
+      } finally {
+        await worker.stop()
+        worker = undefined
+      }
     },
     disconnect(zendeskUserId) {
       return store.disconnectUser('example', String(zendeskUserId), now.value)

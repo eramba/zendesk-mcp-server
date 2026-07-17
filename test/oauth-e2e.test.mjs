@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { access } from 'node:fs/promises'
 import test from 'node:test'
 
 import { createOAuthFixture } from './helpers/oauth-fixture.mjs'
@@ -40,6 +41,12 @@ function toolResult(rpcResponse) {
   return JSON.parse(rpcResponse.json.result.content[0].text)
 }
 
+function oauthError(result) {
+  if (result.json?.error) return result.json.error
+  const location = result.response.headers.get('location')
+  return location ? new URL(location).searchParams.get('error') : undefined
+}
+
 test('completes discovery, browser login, code exchange, and authenticated MCP use', async (t) => {
   const fixture = await createOAuthFixture(t)
 
@@ -79,9 +86,17 @@ test('completes discovery, browser login, code exchange, and authenticated MCP u
     ['analyze-ticket', 'draft-ticket-response'],
   )
 
+  const resources = await fixture.callMcp(tokens.access_token, {
+    jsonrpc: '2.0', id: 4, method: 'resources/list', params: {},
+  })
+  assert.deepEqual(
+    resources.json.result.resources.map(({ uri }) => uri).toSorted(),
+    ['zendesk://knowledge-base'],
+  )
+
   const ticket = await fixture.callMcp(tokens.access_token, {
     jsonrpc: '2.0',
-    id: 4,
+    id: 5,
     method: 'tools/call',
     params: { name: 'get_ticket', arguments: { ticket_id: 42 } },
   })
@@ -89,7 +104,7 @@ test('completes discovery, browser login, code exchange, and authenticated MCP u
 
   const resource = await fixture.callMcp(tokens.access_token, {
     jsonrpc: '2.0',
-    id: 5,
+    id: 6,
     method: 'resources/read',
     params: { uri: 'zendesk://knowledge-base' },
   })
@@ -102,9 +117,24 @@ test('keeps concurrent principal Bearers, results, and resource caches isolated'
   const a = await fixture.loginPrincipal({ zendeskUserId: '101', label: 'a' })
   const b = await fixture.loginPrincipal({ zendeskUserId: '202', label: 'b' })
 
-  const [ticketA, ticketB, resourceA, resourceB] = await Promise.all([
+  const barrier = fixture.fakeZendesk.holdRequests(
+    ({ pathname }) => pathname.startsWith('/api/v2/tickets/'),
+    2,
+  )
+  const ticketRequests = Promise.all([
     fixture.callMcp(a.access_token, toolCall(10, 101)),
     fixture.callMcp(b.access_token, toolCall(11, 202)),
+  ])
+  await barrier.reached
+  try {
+    assert.equal(barrier.active, 2)
+    assert.equal(barrier.maxActive, 2)
+  } finally {
+    barrier.release()
+  }
+  const [ticketA, ticketB] = await ticketRequests
+
+  const [resourceA, resourceB] = await Promise.all([
     fixture.callMcp(a.access_token, resourceRead(12)),
     fixture.callMcp(b.access_token, resourceRead(13)),
   ])
@@ -115,6 +145,15 @@ test('keeps concurrent principal Bearers, results, and resource caches isolated'
   assert.doesNotMatch(resourceA.json.result.contents[0].text, /Principal 202 article/)
   assert.match(resourceB.json.result.contents[0].text, /Principal 202 article/)
   assert.doesNotMatch(resourceB.json.result.contents[0].text, /Principal 101 article/)
+
+  const [resourceBAfterCache, resourceAAfterCache] = await Promise.all([
+    fixture.callMcp(b.access_token, resourceRead(14)),
+    fixture.callMcp(a.access_token, resourceRead(15)),
+  ])
+  assert.match(resourceBAfterCache.json.result.contents[0].text, /Principal 202 article/)
+  assert.doesNotMatch(resourceBAfterCache.json.result.contents[0].text, /Principal 101 article/)
+  assert.match(resourceAAfterCache.json.result.contents[0].text, /Principal 101 article/)
+  assert.doesNotMatch(resourceAAfterCache.json.result.contents[0].text, /Principal 202 article/)
 
   const apiAuthorizations = fixture.fakeZendesk.requests
     .filter(({ pathname }) => pathname.startsWith('/api/v2/tickets/'))
@@ -134,11 +173,23 @@ test('enforces metadata, resource, redirect, PKCE, code, refresh, and revoke bin
     authorization_servers: [fixture.publicBaseUrl.href],
     scopes_supported: fixture.SCOPES,
   })
-  assert.equal(discovery.authorization.token_endpoint_auth_methods_supported[0], 'none')
-  assert.equal(discovery.authorization.revocation_endpoint_auth_methods_supported[0], 'none')
-  assert.deepEqual(discovery.authorization.code_challenge_methods_supported, ['S256'])
+  assert.deepEqual(discovery.authorization, {
+    issuer: fixture.publicBaseUrl.href,
+    authorization_endpoint: new URL('/authorize', fixture.publicBaseUrl).href,
+    response_types_supported: ['code'],
+    code_challenge_methods_supported: ['S256'],
+    token_endpoint: new URL('/token', fixture.publicBaseUrl).href,
+    token_endpoint_auth_methods_supported: ['none'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
+    scopes_supported: fixture.SCOPES,
+    revocation_endpoint: new URL('/revoke', fixture.publicBaseUrl).href,
+    revocation_endpoint_auth_methods_supported: ['none'],
+    registration_endpoint: new URL('/register', fixture.publicBaseUrl).href,
+  })
 
   const firstClient = await fixture.registerClient()
+  const wrongPkceMethod = await fixture.beginBrowserLogin({ codeChallengeMethod: 'plain' })
+  assert.equal(oauthError(wrongPkceMethod), 'invalid_request')
   const missingResource = await fixture.beginBrowserLogin({ omitResource: true })
   assert.equal(missingResource.status, 302)
   assert.equal(
@@ -176,7 +227,24 @@ test('enforces metadata, resource, redirect, PKCE, code, refresh, and revoke bin
   })
   assert.equal(crossClientCode.status, 400)
   assert.equal(crossClientCode.json.error, 'invalid_grant')
+  const successfulCode = fixture.mcpCode
   const tokens = await fixture.exchangeMcpCode({ clientId: firstClient.client_id })
+
+  const replayedCode = await fixture.exchangeMcpCode({
+    clientId: firstClient.client_id,
+    code: successfulCode,
+    raw: true,
+  })
+  assert.equal(replayedCode.status, 400)
+  assert.equal(replayedCode.json.error, 'invalid_grant')
+
+  const crossClientRefresh = await fixture.refreshMcp(tokens.refresh_token, {
+    clientId: secondClient.client_id,
+    raw: true,
+  })
+  assert.equal(crossClientRefresh.status, 400)
+  assert.equal(crossClientRefresh.json.error, 'invalid_grant')
+  assert.equal((await fixture.callMcp(tokens.access_token, toolCall(16, 303))).status, 200)
 
   const crossClientRevoke = await fixture.revoke(tokens.refresh_token, {
     clientId: secondClient.client_id,
@@ -192,6 +260,16 @@ test('enforces metadata, resource, redirect, PKCE, code, refresh, and revoke bin
   assert.equal(wrongRefreshResource.status, 400)
   assert.equal(wrongRefreshResource.json.error, 'invalid_target')
   assert.equal((await fixture.callMcp(tokens.access_token, toolCall(15, 303))).status, 401)
+
+  const scopeFamily = await fixture.loginPrincipal({ zendeskUserId: '304', label: 'scope' })
+  const wrongRefreshScope = await fixture.refreshMcp(scopeFamily.refresh_token, {
+    clientId: secondClient.client_id,
+    scope: 'zendesk:read',
+    raw: true,
+  })
+  assert.equal(wrongRefreshScope.status, 400)
+  assert.equal(wrongRefreshScope.json.error, 'invalid_grant')
+  assert.equal((await fixture.callMcp(scopeFamily.access_token, toolCall(17, 304))).status, 401)
 })
 
 test('rotates MCP R1 to R2 to R3, refreshes upstream once, and survives restart with omitted resource', async (t) => {
@@ -243,6 +321,10 @@ test('distinguishes local credential deletion from RFC 7009 family revocation', 
 
 test('disconnect invalidates locally before an eligible outbox revokes through fake upstream', async (t) => {
   const fixture = await createOAuthFixture(t)
+  await assert.rejects(
+    fixture.runRevocationWorker({ timeoutMs: 20 }),
+    /Timed out waiting for fake Zendesk request/,
+  )
   const tokens = await fixture.loginPrincipal({ zendeskUserId: '606', label: 'disconnect' })
 
   const disconnected = fixture.disconnect('606')
@@ -278,6 +360,7 @@ test('keeps secret sentinels out of logs, database, HTTP errors, MCP output, and
     refreshToken: sentinels[3],
   })
   const tokens = await fixture.exchangeMcpCode()
+  sentinels.push(fixture.mcpCode, tokens.access_token, tokens.refresh_token)
   fixture.fakeZendesk.failTicket('707', 707, sentinels[5])
 
   const tool = await fixture.callMcp(tokens.access_token, toolCall(50, 707))
@@ -367,4 +450,19 @@ test('a principal A failure never falls back to B or a default account', async (
     'Bearer upstream-access-909',
   ])
   assert.equal(relevant.some(({ authorization }) => !authorization?.startsWith('Bearer ')), false)
+})
+
+test('bounds absent fake Zendesk requests and removes the complete fixture directory', async (t) => {
+  let directory
+  await t.test('fixture scope', async (fixtureTest) => {
+    const fixture = await createOAuthFixture(fixtureTest)
+    directory = fixture.directory
+    await fixture.databaseBytes()
+    await assert.rejects(
+      fixture.fakeZendesk.waitForRequest(() => false, { timeoutMs: 20 }),
+      /Timed out waiting for fake Zendesk request/,
+    )
+  })
+
+  await assert.rejects(access(directory), { code: 'ENOENT' })
 })
