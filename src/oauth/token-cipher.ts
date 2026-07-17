@@ -69,6 +69,17 @@ function aad(context: CipherContext): Buffer {
   return Buffer.from(JSON.stringify(canonical(context)), "utf8");
 }
 
+function decodeCanonicalBase64url(value: string, field: string): Buffer {
+  if (!/^[A-Za-z0-9_-]*$/.test(value)) {
+    throw new Error(`${field} must be canonical base64url`);
+  }
+  const decoded = Buffer.from(value, "base64url");
+  if (decoded.toString("base64url") !== value) {
+    throw new Error(`${field} must be canonical base64url`);
+  }
+  return decoded;
+}
+
 export function randomOpaque(bytes = 32): string {
   if (!Number.isSafeInteger(bytes) || bytes < 32) {
     throw new Error("opaque values require at least 32 random bytes");
@@ -110,15 +121,19 @@ export class TokenCipher {
 
   decrypt(envelope: EncryptedValue, context: CipherContext): string {
     if (envelope.version !== 1) throw new Error("Unsupported encrypted value version");
+    const nonce = decodeCanonicalBase64url(envelope.nonce, "nonce");
+    if (nonce.length !== 12) throw new Error("nonce must decode to exactly 12 bytes");
+    const tag = decodeCanonicalBase64url(envelope.tag, "tag");
+    if (tag.length !== 16) throw new Error("tag must decode to exactly 16 bytes");
     const decipher = createDecipheriv(
       "aes-256-gcm",
       this.#key,
-      Buffer.from(envelope.nonce, "base64url"),
+      nonce,
     );
     decipher.setAAD(aad(context));
-    decipher.setAuthTag(Buffer.from(envelope.tag, "base64url"));
+    decipher.setAuthTag(tag);
     return Buffer.concat([
-      decipher.update(Buffer.from(envelope.ciphertext, "base64url")),
+      decipher.update(decodeCanonicalBase64url(envelope.ciphertext, "ciphertext")),
       decipher.final(),
     ]).toString("utf8");
   }

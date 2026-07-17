@@ -50,6 +50,33 @@ test('TokenCipher rejects wrong keys and tampering', () => {
   assert.throws(() => cipher.decrypt({ ...encrypted, tag: flip(encrypted.tag) }, credentialContext))
 })
 
+test('TokenCipher rejects non-canonical base64url envelope encodings', () => {
+  const cipher = new TokenCipher(key)
+  const encrypted = cipher.encrypt('secret', credentialContext)
+
+  for (const malformed of [
+    { ...encrypted, nonce: `${encrypted.nonce}!` },
+    { ...encrypted, ciphertext: ` ${encrypted.ciphertext}` },
+    { ...encrypted, tag: `${encrypted.tag}=` },
+  ]) {
+    assert.throws(() => cipher.decrypt(malformed, credentialContext), /canonical base64url/)
+  }
+})
+
+test('TokenCipher rejects envelope nonce and tag lengths before decryption', () => {
+  const cipher = new TokenCipher(key)
+  const encrypted = cipher.encrypt('secret', credentialContext)
+
+  assert.throws(
+    () => cipher.decrypt({ ...encrypted, nonce: Buffer.alloc(11).toString('base64url') }, credentialContext),
+    /nonce must decode to exactly 12 bytes/,
+  )
+  assert.throws(
+    () => cipher.decrypt({ ...encrypted, tag: Buffer.alloc(15).toString('base64url') }, credentialContext),
+    /tag must decode to exactly 16 bytes/,
+  )
+})
+
 test('TokenCipher rejects moving every record kind across its bound dimensions', () => {
   const cipher = new TokenCipher(key)
   const contexts = [
