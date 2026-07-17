@@ -39,6 +39,7 @@ import type {
   OAuthStore,
   RefreshExchangeInput,
   RefreshExchangeResult,
+  RevokeFamilyResult,
   RevocationClaim,
   RecoverySummary,
   IssuedTokens,
@@ -46,6 +47,7 @@ import type {
   StageRefreshInput,
   StoredAuthInfo,
   StoreInspection,
+  SessionSummary,
   ZendeskGrant,
   ZendeskCallbackContext,
 } from "./store.js";
@@ -269,6 +271,8 @@ type LifecycleStore = Pick<
   | "consumeCodeAndIssueFamily"
   | "rotateRefreshToken"
   | "revokeFamilyByPresentedToken"
+  | "listSessions"
+  | "revokeFamilyById"
   | "disconnectUser"
   | "claimDueRevocation"
   | "renewRevocationClaim"
@@ -2160,6 +2164,94 @@ class SqliteOAuthStore implements LifecycleStore {
              )`,
         )
         .run(now, clientId, tokenHash, tokenHash);
+    }).immediate();
+  }
+
+  listSessions(
+    subdomain: string,
+    zendeskUserId: string,
+    now: number,
+  ): SessionSummary[] {
+    this.assertReady();
+    if (
+      !validSubdomain(subdomain) ||
+      !validZendeskUserId(zendeskUserId) ||
+      !validStoreTime(now)
+    ) {
+      return [];
+    }
+
+    type SessionRow = {
+      family_id: string;
+      client_name: string | null;
+      redirect_uri: string;
+      created_at: number;
+      last_used_at: number;
+      expires_at: number;
+      revoked_at: number | null;
+    };
+    return this.#db
+      .prepare<[string, string], SessionRow>(
+        `SELECT token_families.id AS family_id,
+                oauth_clients.client_name,
+                MIN(oauth_client_redirect_uris.redirect_uri) AS redirect_uri,
+                token_families.created_at,
+                token_families.last_used_at,
+                MAX(refresh_token_generations.expires_at) AS expires_at,
+                token_families.revoked_at
+         FROM token_families
+         JOIN principals ON principals.id = token_families.principal_id
+         JOIN oauth_clients ON oauth_clients.client_id = token_families.client_id
+         JOIN oauth_client_redirect_uris
+           ON oauth_client_redirect_uris.client_id = token_families.client_id
+         JOIN refresh_token_generations
+           ON refresh_token_generations.family_id = token_families.id
+         WHERE principals.subdomain = ? AND principals.zendesk_user_id = ?
+         GROUP BY token_families.id, oauth_clients.client_name,
+                  token_families.created_at, token_families.last_used_at,
+                  token_families.revoked_at
+         ORDER BY token_families.created_at, token_families.id`,
+      )
+      .all(subdomain, zendeskUserId)
+      .map((row) => ({
+        familyId: row.family_id,
+        clientName: row.client_name,
+        redirectUri: row.redirect_uri,
+        createdAt: row.created_at,
+        lastUsedAt: row.last_used_at,
+        expiresAt: row.expires_at,
+        status:
+          row.revoked_at !== null
+            ? "revoked" as const
+            : row.expires_at <= now
+              ? "expired" as const
+              : "active" as const,
+      }));
+  }
+
+  revokeFamilyById(familyId: string, now: number): RevokeFamilyResult {
+    this.assertReady();
+    if (!isOpaque(familyId) || !validStoreTime(now)) return { kind: "not_found" };
+
+    return this.#db.transaction((): RevokeFamilyResult => {
+      const row = this.#db
+        .prepare<[string], { id: string; revoked_at: number | null }>(
+          "SELECT id, revoked_at FROM token_families WHERE id = ?",
+        )
+        .get(familyId);
+      if (!row) return { kind: "not_found" };
+      if (row.revoked_at !== null) {
+        return { kind: "already_revoked", familyId: row.id };
+      }
+      const changed = this.#db
+        .prepare(
+          `UPDATE token_families
+           SET revoked_at = ?, revoke_reason = 'operator'
+           WHERE id = ? AND revoked_at IS NULL`,
+        )
+        .run(now, familyId).changes;
+      if (changed !== 1) throw new Error("OAuth token family changed concurrently");
+      return { kind: "revoked", familyId };
     }).immediate();
   }
 

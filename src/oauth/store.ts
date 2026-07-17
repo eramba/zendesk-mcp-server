@@ -91,6 +91,21 @@ export type DisconnectResult =
   | { kind: "not_found" }
   | { kind: "already_disconnected"; principalId: string };
 
+export type SessionSummary = {
+  familyId: string;
+  clientName: string | null;
+  redirectUri: string;
+  createdAt: number;
+  lastUsedAt: number;
+  expiresAt: number;
+  status: "active" | "revoked" | "expired";
+};
+
+export type RevokeFamilyResult =
+  | { kind: "revoked"; familyId: string }
+  | { kind: "not_found" }
+  | { kind: "already_revoked"; familyId: string };
+
 export type RevocationClaim = {
   outboxId: string;
   principalId: string;
@@ -209,6 +224,12 @@ export interface OAuthStore extends OAuthRegisteredClientsStore {
   consumeCodeAndIssueFamily(input: CodeExchangeInput): IssuedTokens;
   rotateRefreshToken(input: RefreshExchangeInput): RefreshExchangeResult;
   revokeFamilyByPresentedToken(clientId: string, token: string, now: number): void;
+  listSessions(
+    subdomain: string,
+    zendeskUserId: string,
+    now: number,
+  ): SessionSummary[];
+  revokeFamilyById(familyId: string, now: number): RevokeFamilyResult;
   disconnectUser(
     subdomain: string,
     zendeskUserId: string,

@@ -15,6 +15,10 @@
     "smoke:http": "node scripts/smoke-http.mjs",
     "start": "node dist/index.js",
     "start:http": "node dist/http.js",
+    "oauth:sessions": "node scripts/oauth-admin.mjs sessions",
+    "oauth:revoke-family": "node scripts/oauth-admin.mjs revoke-family",
+    "oauth:disconnect-user": "node scripts/oauth-admin.mjs disconnect-user",
+    "oauth:backup": "node scripts/oauth-admin.mjs backup",
     "test": "npm run build && node --test test/*.test.mjs",
     "check": "tsc -p tsconfig.json --noEmit"
   },

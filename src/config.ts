@@ -79,6 +79,12 @@ export type HttpOAuthConfig = {
   zendeskHttpTimeoutMs: number;
 };
 
+export type OAuthAdminConfig = {
+  zendeskSubdomain: string;
+  oauthEncryptionKey: Buffer;
+  oauthDbPath: string;
+};
+
 const HTTP_OAUTH_REQUIRED_KEYS = [
   "PUBLIC_BASE_URL",
   "ZENDESK_SUBDOMAIN",
@@ -87,6 +93,49 @@ const HTTP_OAUTH_REQUIRED_KEYS = [
   "OAUTH_ENCRYPTION_KEY",
   "OAUTH_DB_PATH",
 ] as const;
+
+const OAUTH_ADMIN_REQUIRED_KEYS = [
+  "ZENDESK_SUBDOMAIN",
+  "OAUTH_ENCRYPTION_KEY",
+  "OAUTH_DB_PATH",
+] as const;
+
+function readOAuthPersistenceConfig(env: Environment): OAuthAdminConfig {
+  const missing = OAUTH_ADMIN_REQUIRED_KEYS.filter((key) => isBlank(env[key]));
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
+  }
+
+  const zendeskSubdomain = env.ZENDESK_SUBDOMAIN as string;
+  if (!/^(?!-)[a-z0-9-]{1,63}(?<!-)$/i.test(zendeskSubdomain)) {
+    throw new Error("ZENDESK_SUBDOMAIN must be one DNS label");
+  }
+
+  const oauthEncryptionKey = Buffer.from(
+    env.OAUTH_ENCRYPTION_KEY as string,
+    "base64",
+  );
+  if (oauthEncryptionKey.length !== 32) {
+    throw new Error("OAUTH_ENCRYPTION_KEY must decode to exactly 32 decoded bytes");
+  }
+
+  const oauthDbPath = env.OAUTH_DB_PATH as string;
+  if (!isAbsolute(oauthDbPath)) {
+    throw new Error("OAUTH_DB_PATH must be an absolute path");
+  }
+
+  return {
+    zendeskSubdomain: zendeskSubdomain.toLowerCase(),
+    oauthEncryptionKey,
+    oauthDbPath,
+  };
+}
+
+export function readOAuthAdminConfig(
+  env: Environment = process.env,
+): OAuthAdminConfig {
+  return readOAuthPersistenceConfig(env);
+}
 
 function boundedInteger(
   name: string,
@@ -129,20 +178,7 @@ export function readHttpOAuthConfig(
     throw new Error("PUBLIC_BASE_URL hostname must appear in MCP_ALLOWED_HOSTS");
   }
 
-  const zendeskSubdomain = env.ZENDESK_SUBDOMAIN as string;
-  if (!/^(?!-)[a-z0-9-]{1,63}(?<!-)$/i.test(zendeskSubdomain)) {
-    throw new Error("ZENDESK_SUBDOMAIN must be one DNS label");
-  }
-
-  const encryptionKey = Buffer.from(env.OAUTH_ENCRYPTION_KEY as string, "base64");
-  if (encryptionKey.length !== 32) {
-    throw new Error("OAUTH_ENCRYPTION_KEY must decode to exactly 32 decoded bytes");
-  }
-
-  const databasePath = env.OAUTH_DB_PATH as string;
-  if (!isAbsolute(databasePath)) {
-    throw new Error("OAUTH_DB_PATH must be an absolute path");
-  }
+  const persistence = readOAuthPersistenceConfig(env);
 
   return {
     host: listener.host,
@@ -152,11 +188,11 @@ export function readHttpOAuthConfig(
     issuerUrl: new URL(publicBaseUrl.origin),
     mcpResourceUrl: new URL("/mcp", publicBaseUrl),
     zendeskCallbackUrl: new URL("/oauth/zendesk/callback", publicBaseUrl),
-    zendeskSubdomain: zendeskSubdomain.toLowerCase(),
+    zendeskSubdomain: persistence.zendeskSubdomain,
     zendeskOAuthClientId: env.ZENDESK_OAUTH_CLIENT_ID as string,
     zendeskOAuthClientSecret: env.ZENDESK_OAUTH_CLIENT_SECRET as string,
-    oauthEncryptionKey: encryptionKey,
-    oauthDbPath: databasePath,
+    oauthEncryptionKey: persistence.oauthEncryptionKey,
+    oauthDbPath: persistence.oauthDbPath,
     mcpAccessTokenTtlSeconds: boundedInteger(
       "MCP_ACCESS_TOKEN_TTL_SECONDS",
       env.MCP_ACCESS_TOKEN_TTL_SECONDS,
