@@ -278,7 +278,7 @@ test('disconnect rolls every local mutation back when tombstone staging fails', 
 })
 
 test('claims are owner-guarded leases with exact retry attempts, renewal, completion, and abort release', async (t) => {
-  const { path, store, client } = await fixture(t)
+  const { path, store, client } = await fixture(t, { now: () => NOW + 10 })
   const installed = login(store, client.client_id, 'leased')
   const disconnected = store.disconnectUser(SUBDOMAIN, USER_ID, NOW + 10)
   assert.equal(disconnected.kind, 'disconnected')
@@ -330,8 +330,119 @@ test('claims are owner-guarded leases with exact retry attempts, renewal, comple
   assert.equal(store.completeRevocation(disconnected.outboxId, 'worker-b', NOW + 17), false)
   assert.equal(store.completeRevocation(disconnected.outboxId, 'worker-c', NOW + 17), true)
   assert.equal(store.completeRevocation(disconnected.outboxId, 'worker-c', NOW + 18), false)
-  assert.equal(query(path, 'SELECT completed_at FROM revocation_outbox')[0].completed_at, NOW + 17)
+  assert.deepEqual(
+    query(path, 'SELECT completed_at, encrypted_grant_json FROM revocation_outbox'),
+    [{ completed_at: NOW + 17, encrypted_grant_json: '{}' }],
+  )
   assert.equal(store.claimDueRevocation('worker-d', NOW + 18, NOW + 80), undefined)
+})
+
+test('an expired lease removes stale owner authority and permits a new owner to reclaim', async (t) => {
+  let clock = NOW + 10
+  const { path, store, client } = await fixture(t, { now: () => clock })
+  login(store, client.client_id, 'stale-owner')
+  const disconnected = store.disconnectUser(SUBDOMAIN, USER_ID, clock)
+  const stale = store.claimDueRevocation('stale-owner', clock, clock + 10)
+  assert.ok(stale)
+  const beforeExpiry = query(path, 'SELECT * FROM revocation_outbox')[0]
+
+  clock += 10
+  assert.equal(store.renewRevocationClaim(disconnected.outboxId, 'stale-owner', clock + 30), false)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'stale-owner', 'transport', clock + 10), false)
+  assert.equal(store.completeRevocation(disconnected.outboxId, 'stale-owner', clock), false)
+  assert.equal(store.releaseClaims('stale-owner', clock), 0)
+  assert.deepEqual(query(path, 'SELECT * FROM revocation_outbox')[0], beforeExpiry)
+
+  const reclaimed = store.claimDueRevocation('new-owner', clock, clock + 30)
+  assert.ok(reclaimed)
+  assert.equal(reclaimed.attemptCount, 2)
+  assert.equal(store.renewRevocationClaim(disconnected.outboxId, 'stale-owner', clock + 40), false)
+  assert.equal(store.completeRevocation(disconnected.outboxId, 'stale-owner', clock + 1), false)
+  assert.equal(store.releaseClaims('stale-owner', clock + 1), 0)
+  assert.equal(query(path, 'SELECT claim_owner FROM revocation_outbox')[0].claim_owner, 'new-owner')
+})
+
+test('post-disconnect login cancels an expired claim without prior recovery but a live claim still fences', async (t) => {
+  const { path, store, client } = await fixture(t)
+  login(store, client.client_id, 'expired-reactivation')
+  const disconnected = store.disconnectUser(SUBDOMAIN, USER_ID, NOW + 10)
+  assert.ok(store.claimDueRevocation('expired-owner', NOW + 10, NOW + 20))
+
+  const callback = beginClaimedLogin(store, client.client_id, 'after-expired-claim', { now: NOW + 20 })
+  const staged = store.stageLoginGrant({
+    transactionId: callback.transactionId,
+    subdomain: SUBDOMAIN,
+    grant: grant('after-expired-claim', NOW + 20),
+    now: NOW + 20,
+  })
+  const reactivated = store.commitLogin({
+    transactionId: callback.transactionId,
+    stageId: staged.stageId,
+    zendeskUserId: USER_ID,
+    now: NOW + 20,
+  })
+
+  assert.equal(reactivated.principalId, disconnected.principalId)
+  assert.equal(reactivated.principalEpoch, 3)
+  assert.equal(query(path, 'SELECT * FROM revocation_outbox').length, 0)
+})
+
+test('reschedule accepts only exact clock-based exponential backoff including the 900-second cap', async (t) => {
+  let clock = NOW + 10
+  const { path, store, client } = await fixture(t, { now: () => clock })
+  login(store, client.client_id, 'backoff')
+  const disconnected = store.disconnectUser(SUBDOMAIN, USER_ID, clock)
+  const first = store.claimDueRevocation('worker', clock, clock + 100)
+  assert.equal(first.attemptCount, 1)
+
+  for (const wrong of [clock, clock + 4, clock + 6]) {
+    assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', wrong), false)
+    assert.equal(query(path, 'SELECT status FROM revocation_outbox')[0].status, 'claimed')
+  }
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 5), true)
+
+  clock += 5
+  const second = store.claimDueRevocation('worker', clock, clock + 100)
+  assert.equal(second.attemptCount, 2)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 9), false)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 11), false)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 10), true)
+
+  clock += 10
+  execute(path, (db) => db.prepare(
+    `UPDATE revocation_outbox
+     SET attempt_count = 8, next_attempt_at = ?
+     WHERE id = ?`,
+  ).run(clock, disconnected.outboxId))
+  const capped = store.claimDueRevocation('worker', clock, clock + 100)
+  assert.equal(capped.attemptCount, 9)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 899), false)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 901), false)
+  assert.equal(store.rescheduleRevocation(disconnected.outboxId, 'worker', 'transport', clock + 900), true)
+})
+
+test('recovery deletes pending and stranded claimed tombstones at the retention boundary', async (t) => {
+  const { path, store, client } = await fixture(t)
+  const pending = login(store, client.client_id, 'retention-pending', {
+    subdomain: 'alpha',
+    zendeskUserId: 'user-a',
+  })
+  const claimed = login(store, client.client_id, 'retention-claimed', {
+    subdomain: 'beta',
+    zendeskUserId: 'user-b',
+  })
+  const pendingDisconnect = store.disconnectUser('alpha', 'user-a', NOW + 10)
+  const claimedDisconnect = store.disconnectUser('beta', 'user-b', NOW + 10)
+  const retention = pending.grant.refreshExpiresAt + 604_800
+  assert.equal(claimed.grant.refreshExpiresAt + 604_800, retention)
+  assert.ok(store.claimDueRevocation('stranded-owner', NOW + 10, retention))
+  assert.equal(query(path, 'SELECT COUNT(*) AS count FROM revocation_outbox')[0].count, 2)
+
+  store.recover(retention)
+  assert.equal(query(path, 'SELECT * FROM revocation_outbox').length, 0)
+  assert.equal(store.claimDueRevocation('new-owner', retention, retention + 10), undefined)
+  assert.equal(pendingDisconnect.kind, 'disconnected')
+  assert.equal(claimedDisconnect.kind, 'disconnected')
 })
 
 test('an expired claim is reclaimed after reopen and only for the still-disconnected captured epoch', async (t) => {

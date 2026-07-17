@@ -436,6 +436,12 @@ function validErrorCategory(category: string): boolean {
   return typeof category === "string" && /^[\x20-\x7e]{1,100}$/.test(category);
 }
 
+function revocationBackoffSeconds(attemptCount: number): number | undefined {
+  if (!Number.isSafeInteger(attemptCount) || attemptCount < 1) return undefined;
+  const exponent = attemptCount - 1;
+  return exponent >= 8 ? 900 : 5 * 2 ** exponent;
+}
+
 function normalizeZendeskGrant(grant: ZendeskGrant, now: number): ZendeskGrant | undefined {
   if (
     !grant ||
@@ -702,6 +708,10 @@ function recoverRows(db: Database.Database, now: number): RecoverySummary {
          WHERE status = 'staged' AND expires_at <= ?`,
       )
       .run(now).changes;
+    db.prepare(
+      `DELETE FROM revocation_outbox
+       WHERE retention_expires_at <= ?`,
+    ).run(now);
     const reclaimedClaims = db
       .prepare(
         `UPDATE revocation_outbox
@@ -1199,15 +1209,16 @@ class SqliteOAuthStore implements LifecycleStore {
           throw invalidLoginCommit();
         }
         const claimed = this.#db
-          .prepare<[string, number], ClaimedOutboxRow>(
+          .prepare<[string, number, number], ClaimedOutboxRow>(
             `SELECT 1 AS present FROM revocation_outbox
              WHERE principal_id = ?
                AND captured_principal_epoch = ?
                AND status = 'claimed'
                AND completed_at IS NULL
+               AND claim_expires_at > ?
              LIMIT 1`,
           )
-          .get(existing.id, existing.lifecycle_epoch);
+          .get(existing.id, existing.lifecycle_epoch, input.now);
         if (claimed) throw invalidLoginCommit();
         principalEpoch += 1;
       }
@@ -1244,10 +1255,13 @@ class SqliteOAuthStore implements LifecycleStore {
               `DELETE FROM revocation_outbox
                WHERE principal_id = ?
                  AND captured_principal_epoch = ?
-                 AND status = 'pending'
-                 AND completed_at IS NULL`,
+                 AND completed_at IS NULL
+                 AND (
+                   status = 'pending'
+                   OR (status = 'claimed' AND claim_expires_at <= ?)
+                 )`,
             )
-            .run(existing.id, existing.lifecycle_epoch);
+            .run(existing.id, existing.lifecycle_epoch, input.now);
         }
         this.#db
           .prepare(
@@ -2068,11 +2082,14 @@ class SqliteOAuthStore implements LifecycleStore {
     leaseExpiresAt: number,
   ): boolean {
     this.assertReady();
+    const storeNow = Math.floor(this.#now());
     if (
       typeof outboxId !== "string" ||
       outboxId.length === 0 ||
       !validClaimOwner(owner) ||
-      !validStoreTime(leaseExpiresAt)
+      !validStoreTime(storeNow) ||
+      !validStoreTime(leaseExpiresAt) ||
+      leaseExpiresAt <= storeNow
     ) {
       return false;
     }
@@ -2085,6 +2102,7 @@ class SqliteOAuthStore implements LifecycleStore {
              AND status = 'claimed'
              AND completed_at IS NULL
              AND claim_owner = ?
+             AND claim_expires_at > ?
              AND claim_expires_at < ?
              AND retention_expires_at >= ?
              AND EXISTS (
@@ -2102,6 +2120,7 @@ class SqliteOAuthStore implements LifecycleStore {
           leaseExpiresAt,
           outboxId,
           owner,
+          storeNow,
           leaseExpiresAt,
           leaseExpiresAt,
         ).changes === 1,
@@ -2115,29 +2134,62 @@ class SqliteOAuthStore implements LifecycleStore {
     nextAttemptAt: number,
   ): boolean {
     this.assertReady();
+    const storeNow = Math.floor(this.#now());
     if (
       typeof outboxId !== "string" ||
       outboxId.length === 0 ||
       !validClaimOwner(owner) ||
       !validErrorCategory(category) ||
+      !validStoreTime(storeNow) ||
       !validStoreTime(nextAttemptAt)
     ) {
       return false;
     }
-    return (
-      this.#db
-        .prepare(
-          `UPDATE revocation_outbox
-           SET status = 'pending', next_attempt_at = ?, claim_owner = NULL,
-               claim_expires_at = NULL, last_error_category = ?
+    return this.#db.transaction(() => {
+      const row = this.#db
+        .prepare<[string, string, number], { attempt_count: number }>(
+          `SELECT attempt_count FROM revocation_outbox
            WHERE id = ?
              AND status = 'claimed'
              AND completed_at IS NULL
              AND claim_owner = ?
-             AND retention_expires_at > ?`,
+             AND claim_expires_at > ?`,
         )
-        .run(nextAttemptAt, category, outboxId, owner, nextAttemptAt).changes === 1
-    );
+        .get(outboxId, owner, storeNow);
+      if (!row) return false;
+      const backoffSeconds = revocationBackoffSeconds(row.attempt_count);
+      if (
+        backoffSeconds === undefined ||
+        storeNow > Number.MAX_SAFE_INTEGER - backoffSeconds ||
+        nextAttemptAt !== storeNow + backoffSeconds
+      ) {
+        return false;
+      }
+      return (
+        this.#db
+          .prepare(
+            `UPDATE revocation_outbox
+             SET status = 'pending', next_attempt_at = ?, claim_owner = NULL,
+                 claim_expires_at = NULL, last_error_category = ?
+             WHERE id = ?
+               AND status = 'claimed'
+               AND completed_at IS NULL
+               AND claim_owner = ?
+               AND claim_expires_at > ?
+               AND retention_expires_at > ?
+               AND attempt_count = ?`,
+          )
+          .run(
+            nextAttemptAt,
+            category,
+            outboxId,
+            owner,
+            storeNow,
+            nextAttemptAt,
+            row.attempt_count,
+          ).changes === 1
+      );
+    }).immediate();
   }
 
   completeRevocation(outboxId: string, owner: string, now: number): boolean {
@@ -2151,32 +2203,41 @@ class SqliteOAuthStore implements LifecycleStore {
       return false;
     }
     return (
-      this.#db
-        .prepare(
-          `UPDATE revocation_outbox
-           SET completed_at = ?, claim_owner = NULL, claim_expires_at = NULL
-           WHERE id = ?
-             AND status = 'claimed'
-             AND completed_at IS NULL
-             AND claim_owner = ?`,
-        )
-        .run(now, outboxId, owner).changes === 1
+      this.#db.transaction(() =>
+        this.#db
+          .prepare(
+            `UPDATE revocation_outbox
+             SET completed_at = ?, encrypted_grant_json = '{}',
+                 claim_owner = NULL, claim_expires_at = NULL
+             WHERE id = ?
+               AND status = 'claimed'
+               AND completed_at IS NULL
+               AND claim_owner = ?
+               AND claim_expires_at > ?
+               AND retention_expires_at > ?`,
+          )
+          .run(now, outboxId, owner, now, now).changes === 1,
+      ).immediate()
     );
   }
 
   releaseClaims(owner: string, now: number): number {
     this.assertReady();
     if (!validClaimOwner(owner) || !validStoreTime(now)) return 0;
-    return this.#db
-      .prepare(
-        `UPDATE revocation_outbox
-         SET status = 'pending', next_attempt_at = ?, claim_owner = NULL,
-             claim_expires_at = NULL
-         WHERE status = 'claimed'
-           AND completed_at IS NULL
-           AND claim_owner = ?`,
-      )
-      .run(now, owner).changes;
+    return this.#db.transaction(() =>
+      this.#db
+        .prepare(
+          `UPDATE revocation_outbox
+           SET status = 'pending', next_attempt_at = ?, claim_owner = NULL,
+               claim_expires_at = NULL
+           WHERE status = 'claimed'
+             AND completed_at IS NULL
+             AND claim_owner = ?
+             AND claim_expires_at > ?
+             AND retention_expires_at > ?`,
+        )
+        .run(now, owner, now, now).changes,
+    ).immediate();
   }
 
   lookupAccessToken(token: string, now: number): StoredAuthInfo | undefined {

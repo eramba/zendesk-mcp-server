@@ -683,12 +683,16 @@ test('a claimed disconnect cleanup blocks reactivation until release or completi
   const completedClaim = claimLogin(store, client.client_id, 'claimed-completed', secondDisconnect + 1)
   const completedStage = store.stageLoginGrant({ transactionId: completedClaim.callback.transactionId, subdomain: SUBDOMAIN, grant: grant('claimed-completed', secondDisconnect + 1), now: secondDisconnect + 1 })
   execute(path, (db) => db.prepare(
-    `UPDATE revocation_outbox SET completed_at = ? WHERE principal_id = ?`,
+    `UPDATE revocation_outbox
+     SET completed_at = ?, encrypted_grant_json = '{}'
+     WHERE principal_id = ?`,
   ).run(secondDisconnect + 1, installed.principalId))
   const afterCompletion = store.commitLogin({ transactionId: completedClaim.callback.transactionId, stageId: completedStage.stageId, zendeskUserId: USER_ID, now: secondDisconnect + 2 })
   assert.equal(afterCompletion.principalEpoch, 3)
-  assert.equal(query(path, 'SELECT completed_at FROM revocation_outbox').length, 1)
-  assert.equal(query(path, 'SELECT completed_at FROM revocation_outbox')[0].completed_at, secondDisconnect + 1)
+  assert.deepEqual(
+    query(path, 'SELECT completed_at, encrypted_grant_json FROM revocation_outbox'),
+    [{ completed_at: secondDisconnect + 1, encrypted_grant_json: '{}' }],
+  )
 })
 
 test('plaintext grants, OAuth state, MCP codes, and email sentinels never reach DB bytes or logs', async (t) => {
