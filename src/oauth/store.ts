@@ -96,6 +96,24 @@ export type CodeExchangeInput = {
   accessTokenTtlSeconds: number;
 };
 
+export type RefreshExchangeInput = {
+  clientId: string;
+  refreshToken: string;
+  scopes: string[] | undefined;
+  resource: string | undefined;
+  canonicalResource: string;
+  now: number;
+  accessTokenTtlSeconds: number;
+};
+
+export type RefreshExchangeResult =
+  | { kind: "issued"; tokens: IssuedTokens }
+  | { kind: "idempotent"; tokens: IssuedTokens }
+  | {
+      kind: "invalid_grant";
+      reason: "expired" | "replay" | "revoked" | "binding_mismatch";
+    };
+
 export type StoredAuthInfo = {
   clientId: string;
   principalId: string;
@@ -138,6 +156,8 @@ export interface OAuthStore extends OAuthRegisteredClientsStore {
     now: number,
   ): string | undefined;
   consumeCodeAndIssueFamily(input: CodeExchangeInput): IssuedTokens;
+  rotateRefreshToken(input: RefreshExchangeInput): RefreshExchangeResult;
+  revokeFamilyByPresentedToken(clientId: string, token: string, now: number): void;
   lookupAccessToken(token: string, now: number): StoredAuthInfo | undefined;
   discardStagedGrant(stageId: string, now: number): boolean;
   failLogin(transactionId: string, now: number): OAuthRedirectContext | undefined;

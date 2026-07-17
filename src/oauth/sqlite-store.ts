@@ -16,6 +16,7 @@ import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/share
 import {
   AUTHORIZATION_CODE_TTL_SECONDS,
   LOGIN_TTL_SECONDS,
+  MCP_REFRESH_RETRY_SECONDS,
   MCP_REFRESH_TTL_SECONDS,
   MCP_SCOPE,
   MCP_SCOPES,
@@ -33,6 +34,8 @@ import type {
   LoginStart,
   OAuthRedirectContext,
   OAuthStore,
+  RefreshExchangeInput,
+  RefreshExchangeResult,
   RecoverySummary,
   IssuedTokens,
   StageLoginGrantInput,
@@ -172,6 +175,32 @@ type AccessTokenRow = {
   lifecycle_epoch: number;
   client_scope: string;
 };
+type RefreshGenerationRow = {
+  token_hash: string;
+  family_id: string;
+  generation: number;
+  status: "current" | "consumed";
+  created_at: number;
+  expires_at: number;
+  consumed_at: number | null;
+  successor_generation: number | null;
+  encrypted_retry_response_json: string | null;
+  retry_response_expires_at: number | null;
+  client_id: string;
+  principal_id: string;
+  principal_epoch: number;
+  scopes: string;
+  resource: string;
+  revoked_at: number | null;
+  principal_status: PrincipalRow["status"];
+  lifecycle_epoch: number;
+  client_scope: string;
+};
+type SuccessorGenerationRow = {
+  token_hash: string;
+  status: "current" | "consumed";
+  consumed_at: number | null;
+};
 
 type EncryptedLoginPayload = {
   originalState: string | undefined;
@@ -202,6 +231,8 @@ type LifecycleStore = Pick<
   | "commitLogin"
   | "challengeForAuthorizationCode"
   | "consumeCodeAndIssueFamily"
+  | "rotateRefreshToken"
+  | "revokeFamilyByPresentedToken"
   | "lookupAccessToken"
   | "discardStagedGrant"
   | "failLogin"
@@ -519,6 +550,12 @@ function verifyEffectivePragmas(db: Database.Database, busyTimeoutMs: number): v
 
 function recoverRows(db: Database.Database, now: number): RecoverySummary {
   return db.transaction(() => {
+    db.prepare(
+      `UPDATE refresh_token_generations
+       SET encrypted_retry_response_json = NULL
+       WHERE retry_response_expires_at IS NOT NULL
+         AND retry_response_expires_at <= ?`,
+    ).run(now);
     const expiredLogins = db
       .prepare(
         `UPDATE login_transactions
@@ -1340,6 +1377,320 @@ class SqliteOAuthStore implements LifecycleStore {
         refresh_token: refreshToken,
         scope: MCP_SCOPE,
       };
+    }).immediate();
+  }
+
+  rotateRefreshToken(input: RefreshExchangeInput): RefreshExchangeResult {
+    this.assertReady();
+    if (
+      typeof input !== "object" ||
+      input === null ||
+      typeof input.clientId !== "string" ||
+      typeof input.refreshToken !== "string" ||
+      !isOpaque(input.refreshToken)
+    ) {
+      return { kind: "invalid_grant", reason: "replay" };
+    }
+    if (
+      !validStoreTime(input.now) ||
+      !Number.isSafeInteger(input.accessTokenTtlSeconds) ||
+      input.accessTokenTtlSeconds <= 0 ||
+      input.now > Number.MAX_SAFE_INTEGER - input.accessTokenTtlSeconds ||
+      input.now > Number.MAX_SAFE_INTEGER - MCP_REFRESH_TTL_SECONDS ||
+      typeof input.canonicalResource !== "string" ||
+      (input.resource !== undefined && typeof input.resource !== "string") ||
+      (input.scopes !== undefined &&
+        (!Array.isArray(input.scopes) ||
+          !input.scopes.every((scope) => typeof scope === "string")))
+    ) {
+      return { kind: "invalid_grant", reason: "binding_mismatch" };
+    }
+
+    return this.#db.transaction((): RefreshExchangeResult => {
+      this.#db.prepare(
+        `UPDATE refresh_token_generations
+         SET encrypted_retry_response_json = NULL
+         WHERE retry_response_expires_at IS NOT NULL
+           AND retry_response_expires_at <= ?`,
+      ).run(input.now);
+
+      const row = this.#db
+        .prepare<[string], RefreshGenerationRow>(
+          `SELECT refresh_token_generations.*,
+                  token_families.client_id,
+                  token_families.principal_id,
+                  token_families.principal_epoch,
+                  token_families.scopes,
+                  token_families.resource,
+                  token_families.revoked_at,
+                  principals.status AS principal_status,
+                  principals.lifecycle_epoch,
+                  oauth_clients.scope AS client_scope
+           FROM refresh_token_generations
+           JOIN token_families
+             ON token_families.id = refresh_token_generations.family_id
+           JOIN principals ON principals.id = token_families.principal_id
+           JOIN oauth_clients ON oauth_clients.client_id = token_families.client_id
+           WHERE refresh_token_generations.token_hash = ?`,
+        )
+        .get(hashOpaque(input.refreshToken));
+      if (!row) return { kind: "invalid_grant", reason: "replay" };
+      if (row.expires_at <= input.now) {
+        return { kind: "invalid_grant", reason: "expired" };
+      }
+      if (row.client_id !== input.clientId) {
+        return { kind: "invalid_grant", reason: "binding_mismatch" };
+      }
+      if (row.revoked_at !== null) {
+        return { kind: "invalid_grant", reason: "revoked" };
+      }
+
+      const scopesMatch =
+        input.scopes === undefined || sameSet(input.scopes, MCP_SCOPES);
+      const bindingsMatch =
+        scopesMatch &&
+        row.scopes === MCP_SCOPE &&
+        row.client_scope === MCP_SCOPE &&
+        this.#mcpResource !== undefined &&
+        row.resource === this.#mcpResource &&
+        input.canonicalResource === this.#mcpResource &&
+        (input.resource === undefined || input.resource === row.resource);
+      if (!bindingsMatch) {
+        this.#db
+          .prepare(
+            `UPDATE token_families
+             SET revoked_at = ?, revoke_reason = 'refresh_binding_mismatch'
+             WHERE id = ? AND client_id = ? AND revoked_at IS NULL`,
+          )
+          .run(input.now, row.family_id, input.clientId);
+        return { kind: "invalid_grant", reason: "binding_mismatch" };
+      }
+
+      if (
+        row.principal_status !== "active" ||
+        row.lifecycle_epoch !== row.principal_epoch
+      ) {
+        this.#db
+          .prepare(
+            `UPDATE token_families
+             SET revoked_at = ?, revoke_reason = 'principal_inactive'
+             WHERE id = ? AND client_id = ? AND revoked_at IS NULL`,
+          )
+          .run(input.now, row.family_id, input.clientId);
+        return { kind: "invalid_grant", reason: "revoked" };
+      }
+
+      if (row.status === "consumed") {
+        const successor =
+          row.successor_generation === null
+            ? undefined
+            : this.#db
+                .prepare<[string, number], SuccessorGenerationRow>(
+                  `SELECT token_hash, status, consumed_at
+                   FROM refresh_token_generations
+                   WHERE family_id = ? AND generation = ?`,
+                )
+                .get(row.family_id, row.successor_generation);
+        if (
+          row.encrypted_retry_response_json !== null &&
+          row.retry_response_expires_at !== null &&
+          row.retry_response_expires_at > input.now &&
+          successor?.status === "current" &&
+          successor.consumed_at === null
+        ) {
+          try {
+            const tokens = JSON.parse(
+              this.#cipher.decrypt(
+                JSON.parse(row.encrypted_retry_response_json) as EncryptedValue,
+                {
+                  kind: "mcp_refresh_retry",
+                  rowId: row.token_hash,
+                  expiresAt: row.expires_at,
+                  familyId: row.family_id,
+                  clientId: row.client_id,
+                  resource: row.resource,
+                  scopes: row.scopes,
+                  generation: row.generation,
+                },
+              ),
+            ) as Partial<IssuedTokens>;
+            const accessPresent =
+              typeof tokens.access_token === "string" &&
+              this.#db
+                .prepare<[string, string], { present: number }>(
+                  `SELECT 1 AS present FROM access_tokens
+                   WHERE token_hash = ? AND family_id = ?`,
+                )
+                .get(hashOpaque(tokens.access_token), row.family_id);
+            if (
+              typeof tokens.access_token === "string" &&
+              isOpaque(tokens.access_token) &&
+              typeof tokens.refresh_token === "string" &&
+              isOpaque(tokens.refresh_token) &&
+              tokens.access_token !== tokens.refresh_token &&
+              tokens.token_type === "Bearer" &&
+              Number.isSafeInteger(tokens.expires_in) &&
+              (tokens.expires_in ?? 0) > 0 &&
+              tokens.scope === MCP_SCOPE &&
+              hashOpaque(tokens.refresh_token) === successor.token_hash &&
+              Boolean(accessPresent)
+            ) {
+              return { kind: "idempotent", tokens: tokens as IssuedTokens };
+            }
+          } catch {
+            // Treat an undecryptable or malformed cache as a replay below.
+          }
+        }
+
+        this.#db
+          .prepare(
+            `UPDATE token_families
+             SET revoked_at = ?, revoke_reason = 'refresh_replay'
+             WHERE id = ? AND client_id = ? AND revoked_at IS NULL`,
+          )
+          .run(input.now, row.family_id, input.clientId);
+        return { kind: "invalid_grant", reason: "replay" };
+      }
+
+      const successorGeneration = row.generation + 1;
+      if (!Number.isSafeInteger(successorGeneration)) {
+        throw new Error("OAuth refresh generation overflow");
+      }
+      const accessToken = this.#randomToken(32);
+      const refreshToken = this.#randomToken(32);
+      if (
+        !isOpaque(accessToken) ||
+        !isOpaque(refreshToken) ||
+        new Set([input.refreshToken, accessToken, refreshToken]).size !== 3
+      ) {
+        throw new Error("OAuth store random source is invalid");
+      }
+      const accessHash = hashOpaque(accessToken);
+      const refreshHash = hashOpaque(refreshToken);
+      const collision = this.#db
+        .prepare<[string, string, string, string, string, string], { present: number }>(
+          `SELECT 1 AS present FROM (
+             SELECT token_hash AS value FROM access_tokens
+             WHERE token_hash IN (?, ?)
+             UNION ALL
+             SELECT token_hash AS value FROM refresh_token_generations
+             WHERE token_hash IN (?, ?)
+             UNION ALL
+             SELECT code_hash AS value FROM authorization_codes
+             WHERE code_hash IN (?, ?)
+           ) LIMIT 1`,
+        )
+        .get(
+          accessHash,
+          refreshHash,
+          accessHash,
+          refreshHash,
+          accessHash,
+          refreshHash,
+        );
+      if (collision) throw new Error("OAuth store random source is invalid");
+
+      const tokens: IssuedTokens = {
+        access_token: accessToken,
+        token_type: "Bearer",
+        expires_in: input.accessTokenTtlSeconds,
+        refresh_token: refreshToken,
+        scope: MCP_SCOPE,
+      };
+      const encryptedRetry = this.#cipher.encrypt(JSON.stringify(tokens), {
+        kind: "mcp_refresh_retry",
+        rowId: row.token_hash,
+        expiresAt: row.expires_at,
+        familyId: row.family_id,
+        clientId: row.client_id,
+        resource: row.resource,
+        scopes: row.scopes,
+        generation: row.generation,
+      });
+      const consumed = this.#db
+        .prepare(
+          `UPDATE refresh_token_generations
+           SET status = 'consumed', consumed_at = ?, successor_generation = ?,
+               encrypted_retry_response_json = ?, retry_response_expires_at = ?
+           WHERE token_hash = ?
+             AND family_id = ?
+             AND status = 'current'
+             AND consumed_at IS NULL
+             AND expires_at > ?`,
+        )
+        .run(
+          input.now,
+          successorGeneration,
+          JSON.stringify(encryptedRetry),
+          input.now + MCP_REFRESH_RETRY_SECONDS,
+          row.token_hash,
+          row.family_id,
+          input.now,
+        ).changes;
+      if (consumed !== 1) {
+        throw new Error("OAuth refresh generation changed concurrently");
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO access_tokens (token_hash, family_id, created_at, expires_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(
+          accessHash,
+          row.family_id,
+          input.now,
+          input.now + input.accessTokenTtlSeconds,
+        );
+      this.#db
+        .prepare(
+          `INSERT INTO refresh_token_generations (
+             token_hash, family_id, generation, status, created_at, expires_at,
+             consumed_at, successor_generation, encrypted_retry_response_json,
+             retry_response_expires_at
+           ) VALUES (?, ?, ?, 'current', ?, ?, NULL, NULL, NULL, NULL)`,
+        )
+        .run(
+          refreshHash,
+          row.family_id,
+          successorGeneration,
+          input.now,
+          input.now + MCP_REFRESH_TTL_SECONDS,
+        );
+      this.#db
+        .prepare(
+          `UPDATE token_families SET last_used_at = ?
+           WHERE id = ? AND client_id = ? AND revoked_at IS NULL`,
+        )
+        .run(input.now, row.family_id, input.clientId);
+      return { kind: "issued", tokens };
+    }).immediate();
+  }
+
+  revokeFamilyByPresentedToken(clientId: string, token: string, now: number): void {
+    this.assertReady();
+    if (
+      typeof clientId !== "string" ||
+      typeof token !== "string" ||
+      !isOpaque(token) ||
+      !validStoreTime(now)
+    ) {
+      return;
+    }
+    const tokenHash = hashOpaque(token);
+    this.#db.transaction(() => {
+      this.#db
+        .prepare(
+          `UPDATE token_families
+           SET revoked_at = ?, revoke_reason = 'rfc7009'
+           WHERE client_id = ?
+             AND revoked_at IS NULL
+             AND id IN (
+               SELECT family_id FROM access_tokens WHERE token_hash = ?
+               UNION
+               SELECT family_id FROM refresh_token_generations WHERE token_hash = ?
+             )`,
+        )
+        .run(now, clientId, tokenHash, tokenHash);
     }).immediate();
   }
 
