@@ -433,21 +433,56 @@ test('a principal A failure never falls back to B or a default account', async (
   const b = await fixture.loginPrincipal({ zendeskUserId: '909', label: 'healthy-b' })
   fixture.fakeZendesk.failTicket('808', 808, 'FAILURE_A_UPSTREAM_SECRET')
 
-  const [failedA, healthyB] = await Promise.all([
+  const barrier = fixture.fakeZendesk.holdRequests(
+    ({ pathname }) =>
+      pathname === '/api/v2/tickets/808.json'
+      || pathname === '/api/v2/tickets/909.json',
+    2,
+  )
+  const requests = Promise.all([
     fixture.callMcp(a.access_token, toolCall(60, 808)),
     fixture.callMcp(b.access_token, toolCall(61, 909)),
   ])
+  await barrier.reached
+  try {
+    assert.equal(barrier.active, 2)
+    assert.equal(barrier.maxActive, 2)
+  } finally {
+    barrier.release()
+  }
+  const [failedA, healthyB] = await requests
+
   assert.equal(failedA.json.result.isError, true)
   assert.match(failedA.json.result.content[0].text, /temporarily_unavailable/)
   assert.doesNotMatch(failedA.json.result.content[0].text, /FAILURE_A_UPSTREAM_SECRET|Principal 909/)
-  assert.equal(toolResult(healthyB).subject, 'Principal 909 ticket')
+  assert.deepEqual(toolResult(healthyB), {
+    id: 909,
+    subject: 'Principal 909 ticket',
+    description: 'Visible only to 909',
+    status: null,
+    priority: null,
+    type: null,
+    created_at: null,
+    updated_at: null,
+    requester_id: null,
+    assignee_id: null,
+    organization_id: null,
+    tags: [],
+  })
 
   const relevant = fixture.fakeZendesk.requests.filter(
     ({ pathname }) => pathname === '/api/v2/tickets/808.json' || pathname === '/api/v2/tickets/909.json',
   )
-  assert.deepEqual(relevant.map(({ authorization }) => authorization).toSorted(), [
-    'Bearer upstream-access-808',
-    'Bearer upstream-access-909',
+  assert.deepEqual(relevant.map(({ pathname, authorization }) => ({ pathname, authorization }))
+    .toSorted((left, right) => left.pathname.localeCompare(right.pathname)), [
+    {
+      pathname: '/api/v2/tickets/808.json',
+      authorization: 'Bearer upstream-access-808',
+    },
+    {
+      pathname: '/api/v2/tickets/909.json',
+      authorization: 'Bearer upstream-access-909',
+    },
   ])
   assert.equal(relevant.some(({ authorization }) => !authorization?.startsWith('Bearer ')), false)
 })
