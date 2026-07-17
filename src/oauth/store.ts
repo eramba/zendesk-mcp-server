@@ -59,6 +59,26 @@ export type ZendeskGrant = {
   scopes: string[];
 };
 
+export type DisconnectResult =
+  | {
+      kind: "disconnected";
+      principalId: string;
+      revokedFamilies: number;
+      outboxId: string;
+    }
+  | { kind: "not_found" }
+  | { kind: "already_disconnected"; principalId: string };
+
+export type RevocationClaim = {
+  outboxId: string;
+  principalId: string;
+  capturedPrincipalEpoch: number;
+  credentialVersion: number;
+  grant: ZendeskGrant;
+  attemptCount: number;
+  retentionExpiresAt: number;
+};
+
 export type StageLoginGrantInput = {
   transactionId: string;
   subdomain: string;
@@ -158,6 +178,29 @@ export interface OAuthStore extends OAuthRegisteredClientsStore {
   consumeCodeAndIssueFamily(input: CodeExchangeInput): IssuedTokens;
   rotateRefreshToken(input: RefreshExchangeInput): RefreshExchangeResult;
   revokeFamilyByPresentedToken(clientId: string, token: string, now: number): void;
+  disconnectUser(
+    subdomain: string,
+    zendeskUserId: string,
+    now: number,
+  ): DisconnectResult;
+  claimDueRevocation(
+    owner: string,
+    now: number,
+    leaseExpiresAt: number,
+  ): RevocationClaim | undefined;
+  renewRevocationClaim(
+    outboxId: string,
+    owner: string,
+    leaseExpiresAt: number,
+  ): boolean;
+  rescheduleRevocation(
+    outboxId: string,
+    owner: string,
+    category: string,
+    nextAttemptAt: number,
+  ): boolean;
+  completeRevocation(outboxId: string, owner: string, now: number): boolean;
+  releaseClaims(owner: string, now: number): number;
   lookupAccessToken(token: string, now: number): StoredAuthInfo | undefined;
   discardStagedGrant(stageId: string, now: number): boolean;
   failLogin(transactionId: string, now: number): OAuthRedirectContext | undefined;

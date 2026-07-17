@@ -30,12 +30,14 @@ import type {
   CommitLoginInput,
   ConsentDecisionInput,
   ConsentDecisionResult,
+  DisconnectResult,
   LoginCommitResult,
   LoginStart,
   OAuthRedirectContext,
   OAuthStore,
   RefreshExchangeInput,
   RefreshExchangeResult,
+  RevocationClaim,
   RecoverySummary,
   IssuedTokens,
   StageLoginGrantInput,
@@ -151,6 +153,33 @@ type StagedGrantRow = {
 };
 type MaximumCredentialVersionRow = { version: number };
 type ClaimedOutboxRow = { present: number };
+type CredentialRow = {
+  principal_id: string;
+  credential_version: number;
+  principal_epoch: number;
+  encrypted_grant_json: string;
+  access_expires_at: number;
+  refresh_expires_at: number;
+  scopes: string;
+  updated_at: number;
+};
+type RevocationOutboxRow = {
+  id: string;
+  principal_id: string;
+  captured_principal_epoch: number;
+  credential_version: number;
+  encrypted_grant_json: string;
+  status: "pending" | "claimed";
+  attempt_count: number;
+  next_attempt_at: number;
+  claim_owner: string | null;
+  claim_expires_at: number | null;
+  retention_expires_at: number;
+  last_error_category: string | null;
+  created_at: number;
+  completed_at: number | null;
+  subdomain: string;
+};
 type AuthorizationCodeRow = {
   code_hash: string;
   client_id: string;
@@ -233,6 +262,12 @@ type LifecycleStore = Pick<
   | "consumeCodeAndIssueFamily"
   | "rotateRefreshToken"
   | "revokeFamilyByPresentedToken"
+  | "disconnectUser"
+  | "claimDueRevocation"
+  | "renewRevocationClaim"
+  | "rescheduleRevocation"
+  | "completeRevocation"
+  | "releaseClaims"
   | "lookupAccessToken"
   | "discardStagedGrant"
   | "failLogin"
@@ -380,6 +415,27 @@ function validStoreTime(now: number): boolean {
   return Number.isSafeInteger(now) && now >= 0;
 }
 
+function validSubdomain(subdomain: string): boolean {
+  return /^(?!-)[a-z0-9-]{1,63}(?<!-)$/.test(subdomain);
+}
+
+function validZendeskUserId(zendeskUserId: string): boolean {
+  return (
+    typeof zendeskUserId === "string" &&
+    zendeskUserId.length > 0 &&
+    zendeskUserId.length <= 128 &&
+    !/[\u0000-\u001f\u007f]/.test(zendeskUserId)
+  );
+}
+
+function validClaimOwner(owner: string): boolean {
+  return typeof owner === "string" && /^[\x20-\x7e]{1,200}$/.test(owner);
+}
+
+function validErrorCategory(category: string): boolean {
+  return typeof category === "string" && /^[\x20-\x7e]{1,100}$/.test(category);
+}
+
 function normalizeZendeskGrant(grant: ZendeskGrant, now: number): ZendeskGrant | undefined {
   if (
     !grant ||
@@ -428,6 +484,81 @@ function decryptStagedGrant(
   const normalized = normalizeZendeskGrant(grant, now);
   if (!normalized) throw invalidLoginCommit();
   return normalized;
+}
+
+function decryptCredentialGrant(
+  cipher: TokenCipher,
+  principal: PrincipalRow,
+  credential: CredentialRow,
+): ZendeskGrant {
+  const grant = JSON.parse(
+    cipher.decrypt(
+      JSON.parse(credential.encrypted_grant_json) as EncryptedValue,
+      {
+        kind: "zendesk_credential",
+        rowId: principal.id,
+        expiresAt: credential.refresh_expires_at,
+        subdomain: principal.subdomain,
+        principalId: principal.id,
+        credentialVersion: credential.credential_version,
+        principalEpoch: credential.principal_epoch,
+      },
+    ),
+  ) as Partial<ZendeskGrant>;
+  if (
+    typeof grant !== "object" ||
+    grant === null ||
+    typeof grant.accessToken !== "string" ||
+    grant.accessToken.length === 0 ||
+    typeof grant.refreshToken !== "string" ||
+    grant.refreshToken.length === 0 ||
+    !Number.isSafeInteger(grant.accessExpiresAt) ||
+    !Number.isSafeInteger(grant.refreshExpiresAt) ||
+    (grant.refreshExpiresAt ?? 0) <= (grant.accessExpiresAt ?? 0) ||
+    !Array.isArray(grant.scopes) ||
+    !grant.scopes.every((scope) => typeof scope === "string") ||
+    !sameSet(grant.scopes, ZENDESK_SCOPES)
+  ) {
+    throw new Error("invalid encrypted Zendesk credential");
+  }
+  return { ...(grant as ZendeskGrant), scopes: [...ZENDESK_SCOPES] };
+}
+
+function decryptRevocationGrant(
+  cipher: TokenCipher,
+  row: RevocationOutboxRow,
+): ZendeskGrant {
+  const grant = JSON.parse(
+    cipher.decrypt(
+      JSON.parse(row.encrypted_grant_json) as EncryptedValue,
+      {
+        kind: "disconnect_outbox",
+        rowId: row.id,
+        expiresAt: row.retention_expires_at,
+        subdomain: row.subdomain,
+        principalId: row.principal_id,
+        credentialVersion: row.credential_version,
+        principalEpoch: row.captured_principal_epoch,
+      },
+    ),
+  ) as Partial<ZendeskGrant>;
+  if (
+    typeof grant !== "object" ||
+    grant === null ||
+    typeof grant.accessToken !== "string" ||
+    grant.accessToken.length === 0 ||
+    typeof grant.refreshToken !== "string" ||
+    grant.refreshToken.length === 0 ||
+    !Number.isSafeInteger(grant.accessExpiresAt) ||
+    !Number.isSafeInteger(grant.refreshExpiresAt) ||
+    (grant.refreshExpiresAt ?? 0) <= (grant.accessExpiresAt ?? 0) ||
+    !Array.isArray(grant.scopes) ||
+    !grant.scopes.every((scope) => typeof scope === "string") ||
+    !sameSet(grant.scopes, ZENDESK_SCOPES)
+  ) {
+    throw new Error("invalid encrypted revocation grant");
+  }
+  return { ...(grant as ZendeskGrant), scopes: [...ZENDESK_SCOPES] };
 }
 
 function validateClientRegistration(client: ClientRegistration): {
@@ -575,7 +706,9 @@ function recoverRows(db: Database.Database, now: number): RecoverySummary {
       .prepare(
         `UPDATE revocation_outbox
          SET status = 'pending', claim_owner = NULL, claim_expires_at = NULL
-         WHERE status = 'claimed' AND claim_expires_at <= ?`,
+         WHERE status = 'claimed'
+           AND completed_at IS NULL
+           AND claim_expires_at <= ?`,
       )
       .run(now).changes;
     return { expiredLogins, discardedStages, reclaimedClaims };
@@ -1706,6 +1839,344 @@ class SqliteOAuthStore implements LifecycleStore {
         )
         .run(now, clientId, tokenHash, tokenHash);
     }).immediate();
+  }
+
+  disconnectUser(
+    subdomain: string,
+    zendeskUserId: string,
+    now: number,
+  ): DisconnectResult {
+    this.assertReady();
+    if (
+      typeof subdomain !== "string" ||
+      !validSubdomain(subdomain) ||
+      !validZendeskUserId(zendeskUserId) ||
+      !validStoreTime(now)
+    ) {
+      return { kind: "not_found" };
+    }
+
+    return this.#db.transaction((): DisconnectResult => {
+      const principal = this.#db
+        .prepare<[string, string], PrincipalRow>(
+          `SELECT * FROM principals
+           WHERE subdomain = ? AND zendesk_user_id = ?`,
+        )
+        .get(subdomain, zendeskUserId);
+      if (!principal) return { kind: "not_found" };
+      if (principal.status === "disconnected") {
+        return { kind: "already_disconnected", principalId: principal.id };
+      }
+
+      const credential = this.#db
+        .prepare<[string], CredentialRow>(
+          `SELECT * FROM zendesk_credentials WHERE principal_id = ?`,
+        )
+        .get(principal.id);
+      if (!credential) throw new Error("OAuth principal credential is unavailable");
+      const grant = decryptCredentialGrant(this.#cipher, principal, credential);
+      const capturedPrincipalEpoch = principal.lifecycle_epoch + 1;
+      if (!Number.isSafeInteger(capturedPrincipalEpoch)) {
+        throw new Error("OAuth principal lifecycle epoch overflow");
+      }
+      if (grant.refreshExpiresAt > Number.MAX_SAFE_INTEGER - 604_800) {
+        throw new Error("OAuth revocation retention expiry overflow");
+      }
+      const retentionExpiresAt = grant.refreshExpiresAt + 604_800;
+      const outboxId = this.#randomId();
+      if (!isOpaque(outboxId)) throw new Error("OAuth store random source is invalid");
+      const encryptedGrant = this.#cipher.encrypt(JSON.stringify(grant), {
+        kind: "disconnect_outbox",
+        rowId: outboxId,
+        expiresAt: retentionExpiresAt,
+        subdomain: principal.subdomain,
+        principalId: principal.id,
+        credentialVersion: credential.credential_version,
+        principalEpoch: capturedPrincipalEpoch,
+      });
+
+      const updated = this.#db
+        .prepare(
+          `UPDATE principals
+           SET status = 'disconnected', lifecycle_epoch = ?,
+               disconnected_at = ?, updated_at = ?
+           WHERE id = ? AND status <> 'disconnected' AND lifecycle_epoch = ?`,
+        )
+        .run(
+          capturedPrincipalEpoch,
+          now,
+          now,
+          principal.id,
+          principal.lifecycle_epoch,
+        ).changes;
+      if (updated !== 1) throw new Error("OAuth principal changed concurrently");
+
+      const revokedFamilies = this.#db
+        .prepare(
+          `UPDATE token_families
+           SET revoked_at = ?, revoke_reason = 'principal_disconnect'
+           WHERE principal_id = ? AND revoked_at IS NULL`,
+        )
+        .run(now, principal.id).changes;
+      this.#db
+        .prepare(
+          `UPDATE authorization_codes
+           SET consumed_at = ?
+           WHERE principal_id = ? AND consumed_at IS NULL`,
+        )
+        .run(now, principal.id);
+      const deletedCredential = this.#db
+        .prepare(
+          `DELETE FROM zendesk_credentials
+           WHERE principal_id = ?
+             AND credential_version = ?
+             AND principal_epoch = ?`,
+        )
+        .run(
+          principal.id,
+          credential.credential_version,
+          credential.principal_epoch,
+        ).changes;
+      if (deletedCredential !== 1) {
+        throw new Error("OAuth principal credential changed concurrently");
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO revocation_outbox (
+             id, principal_id, captured_principal_epoch, credential_version,
+             encrypted_grant_json, status, attempt_count, next_attempt_at,
+             claim_owner, claim_expires_at, retention_expires_at,
+             last_error_category, created_at, completed_at
+           ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, NULL, NULL, ?, NULL, ?, NULL)`,
+        )
+        .run(
+          outboxId,
+          principal.id,
+          capturedPrincipalEpoch,
+          credential.credential_version,
+          JSON.stringify(encryptedGrant),
+          now,
+          retentionExpiresAt,
+          now,
+        );
+
+      return {
+        kind: "disconnected",
+        principalId: principal.id,
+        revokedFamilies,
+        outboxId,
+      };
+    }).immediate();
+  }
+
+  claimDueRevocation(
+    owner: string,
+    now: number,
+    leaseExpiresAt: number,
+  ): RevocationClaim | undefined {
+    this.assertReady();
+    if (
+      !validClaimOwner(owner) ||
+      !validStoreTime(now) ||
+      !validStoreTime(leaseExpiresAt) ||
+      leaseExpiresAt <= now
+    ) {
+      return undefined;
+    }
+
+    return this.#db.transaction((): RevocationClaim | undefined => {
+      this.#db
+        .prepare(
+          `UPDATE revocation_outbox
+           SET status = 'pending', claim_owner = NULL, claim_expires_at = NULL
+           WHERE status = 'claimed'
+             AND completed_at IS NULL
+             AND claim_expires_at <= ?`,
+        )
+        .run(now);
+      const row = this.#db
+        .prepare<[number, number], RevocationOutboxRow>(
+          `SELECT revocation_outbox.*, principals.subdomain
+           FROM revocation_outbox
+           JOIN principals ON principals.id = revocation_outbox.principal_id
+           WHERE revocation_outbox.status = 'pending'
+             AND revocation_outbox.completed_at IS NULL
+             AND revocation_outbox.next_attempt_at <= ?
+             AND revocation_outbox.retention_expires_at > ?
+             AND principals.status = 'disconnected'
+             AND principals.lifecycle_epoch = revocation_outbox.captured_principal_epoch
+             AND NOT EXISTS (
+               SELECT 1 FROM zendesk_credentials
+               WHERE zendesk_credentials.principal_id = revocation_outbox.principal_id
+             )
+           ORDER BY revocation_outbox.next_attempt_at,
+                    revocation_outbox.created_at,
+                    revocation_outbox.id
+           LIMIT 1`,
+        )
+        .get(now, now);
+      if (!row || leaseExpiresAt > row.retention_expires_at) return undefined;
+      const attemptCount = row.attempt_count + 1;
+      if (!Number.isSafeInteger(attemptCount) || attemptCount < 1) {
+        throw new Error("OAuth revocation attempt count overflow");
+      }
+      const claimed = this.#db
+        .prepare(
+          `UPDATE revocation_outbox
+           SET status = 'claimed', attempt_count = ?, claim_owner = ?, claim_expires_at = ?
+           WHERE id = ?
+             AND status = 'pending'
+             AND completed_at IS NULL
+             AND next_attempt_at <= ?
+             AND retention_expires_at > ?
+             AND EXISTS (
+               SELECT 1 FROM principals
+               WHERE principals.id = revocation_outbox.principal_id
+                 AND principals.status = 'disconnected'
+                 AND principals.lifecycle_epoch = revocation_outbox.captured_principal_epoch
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM zendesk_credentials
+               WHERE zendesk_credentials.principal_id = revocation_outbox.principal_id
+             )`,
+        )
+        .run(
+          attemptCount,
+          owner,
+          leaseExpiresAt,
+          row.id,
+          now,
+          now,
+        ).changes;
+      if (claimed !== 1) return undefined;
+      const grant = decryptRevocationGrant(this.#cipher, row);
+      return {
+        outboxId: row.id,
+        principalId: row.principal_id,
+        capturedPrincipalEpoch: row.captured_principal_epoch,
+        credentialVersion: row.credential_version,
+        grant,
+        attemptCount,
+        retentionExpiresAt: row.retention_expires_at,
+      };
+    }).immediate();
+  }
+
+  renewRevocationClaim(
+    outboxId: string,
+    owner: string,
+    leaseExpiresAt: number,
+  ): boolean {
+    this.assertReady();
+    if (
+      typeof outboxId !== "string" ||
+      outboxId.length === 0 ||
+      !validClaimOwner(owner) ||
+      !validStoreTime(leaseExpiresAt)
+    ) {
+      return false;
+    }
+    return this.#db.transaction(() =>
+      this.#db
+        .prepare(
+          `UPDATE revocation_outbox
+           SET claim_expires_at = ?
+           WHERE id = ?
+             AND status = 'claimed'
+             AND completed_at IS NULL
+             AND claim_owner = ?
+             AND claim_expires_at < ?
+             AND retention_expires_at >= ?
+             AND EXISTS (
+               SELECT 1 FROM principals
+               WHERE principals.id = revocation_outbox.principal_id
+                 AND principals.status = 'disconnected'
+                 AND principals.lifecycle_epoch = revocation_outbox.captured_principal_epoch
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM zendesk_credentials
+               WHERE zendesk_credentials.principal_id = revocation_outbox.principal_id
+             )`,
+        )
+        .run(
+          leaseExpiresAt,
+          outboxId,
+          owner,
+          leaseExpiresAt,
+          leaseExpiresAt,
+        ).changes === 1,
+    ).immediate();
+  }
+
+  rescheduleRevocation(
+    outboxId: string,
+    owner: string,
+    category: string,
+    nextAttemptAt: number,
+  ): boolean {
+    this.assertReady();
+    if (
+      typeof outboxId !== "string" ||
+      outboxId.length === 0 ||
+      !validClaimOwner(owner) ||
+      !validErrorCategory(category) ||
+      !validStoreTime(nextAttemptAt)
+    ) {
+      return false;
+    }
+    return (
+      this.#db
+        .prepare(
+          `UPDATE revocation_outbox
+           SET status = 'pending', next_attempt_at = ?, claim_owner = NULL,
+               claim_expires_at = NULL, last_error_category = ?
+           WHERE id = ?
+             AND status = 'claimed'
+             AND completed_at IS NULL
+             AND claim_owner = ?
+             AND retention_expires_at > ?`,
+        )
+        .run(nextAttemptAt, category, outboxId, owner, nextAttemptAt).changes === 1
+    );
+  }
+
+  completeRevocation(outboxId: string, owner: string, now: number): boolean {
+    this.assertReady();
+    if (
+      typeof outboxId !== "string" ||
+      outboxId.length === 0 ||
+      !validClaimOwner(owner) ||
+      !validStoreTime(now)
+    ) {
+      return false;
+    }
+    return (
+      this.#db
+        .prepare(
+          `UPDATE revocation_outbox
+           SET completed_at = ?, claim_owner = NULL, claim_expires_at = NULL
+           WHERE id = ?
+             AND status = 'claimed'
+             AND completed_at IS NULL
+             AND claim_owner = ?`,
+        )
+        .run(now, outboxId, owner).changes === 1
+    );
+  }
+
+  releaseClaims(owner: string, now: number): number {
+    this.assertReady();
+    if (!validClaimOwner(owner) || !validStoreTime(now)) return 0;
+    return this.#db
+      .prepare(
+        `UPDATE revocation_outbox
+         SET status = 'pending', next_attempt_at = ?, claim_owner = NULL,
+             claim_expires_at = NULL
+         WHERE status = 'claimed'
+           AND completed_at IS NULL
+           AND claim_owner = ?`,
+      )
+      .run(now, owner).changes;
   }
 
   lookupAccessToken(token: string, now: number): StoredAuthInfo | undefined {
