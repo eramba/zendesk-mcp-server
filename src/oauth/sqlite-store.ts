@@ -13,17 +13,26 @@ import Database from "better-sqlite3";
 import { InvalidClientMetadataError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
 
-import { LOGIN_TTL_SECONDS, MCP_SCOPES, normalizeMcpScopes } from "./constants.js";
+import {
+  AUTHORIZATION_CODE_TTL_SECONDS,
+  LOGIN_TTL_SECONDS,
+  MCP_SCOPES,
+  normalizeMcpScopes,
+} from "./constants.js";
 import { SCHEMA_VERSION, SQLITE_MIGRATIONS } from "./sqlite-schema.js";
 import type {
   BeginLoginInput,
+  CommitLoginInput,
   ConsentDecisionInput,
   ConsentDecisionResult,
+  LoginCommitResult,
   LoginStart,
   OAuthRedirectContext,
   OAuthStore,
   RecoverySummary,
+  StageLoginGrantInput,
   StoreInspection,
+  ZendeskGrant,
   ZendeskCallbackContext,
 } from "./store.js";
 import {
@@ -69,6 +78,9 @@ export type SqliteOAuthStoreOptions = {
   randomId?: () => string;
   randomToken?: (bytes?: number) => string;
   busyTimeoutMs?: number;
+  testHooks?: {
+    beforeLoginWrites?: () => void;
+  };
 };
 
 type VersionRow = { version: number };
@@ -106,6 +118,31 @@ type LoginRow = {
   consented_at: number | null;
   completed_at: number | null;
 };
+type PrincipalRow = {
+  id: string;
+  subdomain: string;
+  zendesk_user_id: string;
+  status: "active" | "disconnected" | "reauthorization_required";
+  lifecycle_epoch: number;
+  disconnected_at: number | null;
+  created_at: number;
+  updated_at: number;
+};
+type StagedGrantRow = {
+  id: string;
+  login_transaction_id: string | null;
+  purpose: "login" | "refresh";
+  subdomain: string;
+  expected_principal_id: string | null;
+  expected_principal_epoch: number | null;
+  expected_credential_version: number | null;
+  encrypted_grant_json: string;
+  status: "staged" | "discard_only";
+  created_at: number;
+  expires_at: number;
+};
+type MaximumCredentialVersionRow = { version: number };
+type ClaimedOutboxRow = { present: number };
 
 type EncryptedLoginPayload = {
   originalState: string | undefined;
@@ -132,6 +169,9 @@ type LifecycleStore = Pick<
   | "beginLogin"
   | "decideConsent"
   | "claimZendeskCallback"
+  | "stageLoginGrant"
+  | "commitLogin"
+  | "discardStagedGrant"
   | "failLogin"
   | "isReady"
   | "assertReady"
@@ -152,6 +192,10 @@ function invalidClientMetadata(): InvalidClientMetadataError {
 
 function invalidLoginRequest(): Error {
   return new Error("invalid login request");
+}
+
+function invalidLoginCommit(): Error {
+  return new Error("invalid login commit");
 }
 
 function sameSet(actual: readonly string[] | undefined, expected: readonly string[]): boolean {
@@ -220,7 +264,7 @@ function loginCipherContext(row: LoginRow, stored: LoginAadFields) {
   };
 }
 
-function decryptLoginPayload(cipher: TokenCipher, row: LoginRow): EncryptedLoginPayload {
+function parseStoredLoginPayload(row: LoginRow): StoredLoginPayload {
   const stored = JSON.parse(row.encrypted_payload_json) as Partial<StoredLoginPayload>;
   if (
     typeof stored !== "object" ||
@@ -233,10 +277,15 @@ function decryptLoginPayload(cipher: TokenCipher, row: LoginRow): EncryptedLogin
   ) {
     throw new Error("invalid encrypted login payload");
   }
+  return stored as StoredLoginPayload;
+}
+
+function decryptLoginPayload(cipher: TokenCipher, row: LoginRow): EncryptedLoginPayload {
+  const stored = parseStoredLoginPayload(row);
 
   const serialized = cipher.decrypt(
-    stored.encrypted as EncryptedValue,
-    loginCipherContext(row, stored as StoredLoginPayload),
+    stored.encrypted,
+    loginCipherContext(row, stored),
   );
   const payload = JSON.parse(serialized) as Partial<EncryptedLoginPayload>;
   const originalStateValid =
@@ -258,6 +307,57 @@ function decryptLoginPayload(cipher: TokenCipher, row: LoginRow): EncryptedLogin
     throw new Error("invalid encrypted login payload");
   }
   return payload as EncryptedLoginPayload;
+}
+
+function validStoreTime(now: number): boolean {
+  return Number.isSafeInteger(now) && now >= 0;
+}
+
+function validZendeskGrant(grant: ZendeskGrant, now: number): boolean {
+  return Boolean(
+    grant &&
+      typeof grant === "object" &&
+      typeof grant.accessToken === "string" &&
+      grant.accessToken.length > 0 &&
+      typeof grant.refreshToken === "string" &&
+      grant.refreshToken.length > 0 &&
+      Number.isSafeInteger(grant.accessExpiresAt) &&
+      grant.accessExpiresAt > now &&
+      Number.isSafeInteger(grant.refreshExpiresAt) &&
+      grant.refreshExpiresAt > grant.accessExpiresAt &&
+      Array.isArray(grant.scopes) &&
+      grant.scopes.length > 0 &&
+      grant.scopes.every((scope) => typeof scope === "string" && scope.length > 0) &&
+      new Set(grant.scopes).size === grant.scopes.length,
+  );
+}
+
+function stagedGrantCipherContext(row: StagedGrantRow) {
+  return {
+    kind: "staged_grant" as const,
+    rowId: row.id,
+    expiresAt: row.expires_at,
+    purpose: row.purpose,
+    subdomain: row.subdomain,
+    expectedPrincipalId: row.expected_principal_id,
+    expectedCredentialVersion: row.expected_credential_version,
+    expectedPrincipalEpoch: row.expected_principal_epoch,
+  };
+}
+
+function decryptStagedGrant(
+  cipher: TokenCipher,
+  row: StagedGrantRow,
+  now: number,
+): ZendeskGrant {
+  const grant = JSON.parse(
+    cipher.decrypt(
+      JSON.parse(row.encrypted_grant_json) as EncryptedValue,
+      stagedGrantCipherContext(row),
+    ),
+  ) as ZendeskGrant;
+  if (!validZendeskGrant(grant, now)) throw invalidLoginCommit();
+  return grant;
 }
 
 function validateClientRegistration(client: ClientRegistration): {
@@ -411,7 +511,9 @@ class SqliteOAuthStore implements LifecycleStore {
   readonly #cipher: TokenCipher;
   readonly #mcpResource: string | undefined;
   readonly #now: () => number;
+  readonly #randomId: () => string;
   readonly #randomToken: (bytes?: number) => string;
+  readonly #testHooks: SqliteOAuthStoreOptions["testHooks"];
   #ready = false;
 
   constructor(
@@ -419,13 +521,17 @@ class SqliteOAuthStore implements LifecycleStore {
     cipher: TokenCipher,
     mcpResource: string | undefined,
     now: () => number,
+    randomId: () => string,
     randomToken: (bytes?: number) => string,
+    testHooks: SqliteOAuthStoreOptions["testHooks"],
   ) {
     this.#db = db;
     this.#cipher = cipher;
     this.#mcpResource = mcpResource;
     this.#now = now;
+    this.#randomId = randomId;
     this.#randomToken = randomToken;
+    this.#testHooks = testHooks;
   }
 
   markReady(): void {
@@ -744,6 +850,311 @@ class SqliteOAuthStore implements LifecycleStore {
     })();
   }
 
+  stageLoginGrant(input: StageLoginGrantInput): { stageId: string } {
+    this.assertReady();
+    if (
+      !validStoreTime(input.now) ||
+      typeof input.transactionId !== "string" ||
+      !/^(?!-)[a-z0-9-]{1,63}(?<!-)$/.test(input.subdomain) ||
+      !validZendeskGrant(input.grant, input.now)
+    ) {
+      throw invalidLoginCommit();
+    }
+
+    return this.#db.transaction(() => {
+      const login = this.#db
+        .prepare<[string, number], LoginRow>(
+          `SELECT * FROM login_transactions
+           WHERE id = ? AND status = 'callback_claimed' AND expires_at > ?`,
+        )
+        .get(input.transactionId, input.now);
+      if (!login) throw invalidLoginCommit();
+
+      let storedLogin: StoredLoginPayload;
+      try {
+        storedLogin = parseStoredLoginPayload(login);
+        decryptLoginPayload(this.#cipher, login);
+      } catch {
+        throw invalidLoginCommit();
+      }
+      if (storedLogin.subdomain !== input.subdomain) throw invalidLoginCommit();
+
+      const stageId = this.#randomId();
+      if (!isOpaque(stageId)) throw new Error("OAuth store random source is invalid");
+      const stage: StagedGrantRow = {
+        id: stageId,
+        login_transaction_id: login.id,
+        purpose: "login",
+        subdomain: input.subdomain,
+        expected_principal_id: null,
+        expected_principal_epoch: null,
+        expected_credential_version: null,
+        encrypted_grant_json: "",
+        status: "staged",
+        created_at: input.now,
+        expires_at: login.expires_at,
+      };
+      const encrypted = this.#cipher.encrypt(
+        JSON.stringify(input.grant),
+        stagedGrantCipherContext(stage),
+      );
+      this.#db
+        .prepare(
+          `INSERT INTO staged_grants (
+             id, login_transaction_id, purpose, subdomain,
+             expected_principal_id, expected_principal_epoch,
+             expected_credential_version, encrypted_grant_json,
+             status, created_at, expires_at
+           ) VALUES (?, ?, 'login', ?, NULL, NULL, NULL, ?, 'staged', ?, ?)`,
+        )
+        .run(
+          stage.id,
+          stage.login_transaction_id,
+          stage.subdomain,
+          JSON.stringify(encrypted),
+          stage.created_at,
+          stage.expires_at,
+        );
+      return { stageId };
+    })();
+  }
+
+  commitLogin(input: CommitLoginInput): LoginCommitResult {
+    this.assertReady();
+    if (
+      !validStoreTime(input.now) ||
+      input.now > Number.MAX_SAFE_INTEGER - AUTHORIZATION_CODE_TTL_SECONDS ||
+      typeof input.transactionId !== "string" ||
+      typeof input.stageId !== "string" ||
+      typeof input.zendeskUserId !== "string" ||
+      input.zendeskUserId.length === 0 ||
+      input.zendeskUserId.length > 128 ||
+      /[\u0000-\u001f\u007f]/.test(input.zendeskUserId)
+    ) {
+      throw invalidLoginCommit();
+    }
+
+    return this.#db.transaction((): LoginCommitResult => {
+      const login = this.#db
+        .prepare<[string, number], LoginRow>(
+          `SELECT * FROM login_transactions
+           WHERE id = ? AND status = 'callback_claimed' AND expires_at > ?`,
+        )
+        .get(input.transactionId, input.now);
+      const stage = this.#db
+        .prepare<[string, string, number], StagedGrantRow>(
+          `SELECT * FROM staged_grants
+           WHERE id = ?
+             AND login_transaction_id = ?
+             AND purpose = 'login'
+             AND status = 'staged'
+             AND expires_at > ?`,
+        )
+        .get(input.stageId, input.transactionId, input.now);
+      if (!login || !stage) throw invalidLoginCommit();
+
+      let payload: EncryptedLoginPayload;
+      let storedLogin: StoredLoginPayload;
+      let grant: ZendeskGrant;
+      try {
+        storedLogin = parseStoredLoginPayload(login);
+        payload = decryptLoginPayload(this.#cipher, login);
+        grant = decryptStagedGrant(this.#cipher, stage, input.now);
+      } catch {
+        throw invalidLoginCommit();
+      }
+      if (
+        storedLogin.subdomain !== stage.subdomain ||
+        stage.expected_principal_id !== null ||
+        stage.expected_principal_epoch !== null ||
+        stage.expected_credential_version !== null
+      ) {
+        throw invalidLoginCommit();
+      }
+
+      const existing = this.#db
+        .prepare<[string, string], PrincipalRow>(
+          `SELECT * FROM principals WHERE subdomain = ? AND zendesk_user_id = ?`,
+        )
+        .get(stage.subdomain, input.zendeskUserId);
+      const principalId = existing?.id ?? this.#randomId();
+      if (!isOpaque(principalId)) throw new Error("OAuth store random source is invalid");
+
+      let principalEpoch = existing?.lifecycle_epoch ?? 1;
+      if (existing?.status === "disconnected") {
+        if (
+          existing.disconnected_at === null ||
+          login.created_at <= existing.disconnected_at
+        ) {
+          throw invalidLoginCommit();
+        }
+        const claimed = this.#db
+          .prepare<[string, number], ClaimedOutboxRow>(
+            `SELECT 1 AS present FROM revocation_outbox
+             WHERE principal_id = ?
+               AND captured_principal_epoch = ?
+               AND status = 'claimed'
+               AND completed_at IS NULL
+             LIMIT 1`,
+          )
+          .get(existing.id, existing.lifecycle_epoch);
+        if (claimed) throw invalidLoginCommit();
+        principalEpoch += 1;
+      }
+
+      const maximumVersion = this.#db
+        .prepare<[string, string], MaximumCredentialVersionRow>(
+          `SELECT MAX(version) AS version FROM (
+             SELECT credential_version AS version
+             FROM zendesk_credentials WHERE principal_id = ?
+             UNION ALL
+             SELECT credential_version AS version
+             FROM revocation_outbox WHERE principal_id = ?
+           )`,
+        )
+        .get(principalId, principalId)?.version ?? 0;
+      const credentialVersion = maximumVersion + 1;
+      if (!Number.isSafeInteger(credentialVersion) || credentialVersion < 1) {
+        throw invalidLoginCommit();
+      }
+
+      if (!existing) {
+        this.#db
+          .prepare(
+            `INSERT INTO principals (
+               id, subdomain, zendesk_user_id, status, lifecycle_epoch,
+               disconnected_at, created_at, updated_at
+             ) VALUES (?, ?, ?, 'active', 1, NULL, ?, ?)`,
+          )
+          .run(principalId, stage.subdomain, input.zendeskUserId, input.now, input.now);
+      } else {
+        if (existing.status === "disconnected") {
+          this.#db
+            .prepare(
+              `DELETE FROM revocation_outbox
+               WHERE principal_id = ?
+                 AND captured_principal_epoch = ?
+                 AND status = 'pending'
+                 AND completed_at IS NULL`,
+            )
+            .run(existing.id, existing.lifecycle_epoch);
+        }
+        this.#db
+          .prepare(
+            `UPDATE principals
+             SET status = 'active', lifecycle_epoch = ?, disconnected_at = NULL, updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(principalEpoch, input.now, principalId);
+      }
+
+      this.#testHooks?.beforeLoginWrites?.();
+
+      const encryptedCredential = this.#cipher.encrypt(JSON.stringify(grant), {
+        kind: "zendesk_credential",
+        rowId: principalId,
+        expiresAt: grant.refreshExpiresAt,
+        subdomain: stage.subdomain,
+        principalId,
+        credentialVersion,
+        principalEpoch,
+      });
+      this.#db
+        .prepare(
+          `INSERT INTO zendesk_credentials (
+             principal_id, credential_version, principal_epoch, encrypted_grant_json,
+             access_expires_at, refresh_expires_at, scopes, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(principal_id) DO UPDATE SET
+             credential_version = excluded.credential_version,
+             principal_epoch = excluded.principal_epoch,
+             encrypted_grant_json = excluded.encrypted_grant_json,
+             access_expires_at = excluded.access_expires_at,
+             refresh_expires_at = excluded.refresh_expires_at,
+             scopes = excluded.scopes,
+             updated_at = excluded.updated_at`,
+        )
+        .run(
+          principalId,
+          credentialVersion,
+          principalEpoch,
+          JSON.stringify(encryptedCredential),
+          grant.accessExpiresAt,
+          grant.refreshExpiresAt,
+          grant.scopes.join(" "),
+          input.now,
+        );
+
+      const authorizationCode = this.#randomToken(32);
+      if (!isOpaque(authorizationCode)) {
+        throw new Error("OAuth store random source is invalid");
+      }
+      const codeHash = hashOpaque(authorizationCode);
+      if (
+        [
+          login.transaction_hash,
+          login.upstream_state_hash,
+          login.browser_nonce_hash,
+          login.consent_csrf_hash,
+        ].includes(codeHash)
+      ) {
+        throw new Error("OAuth store random source is invalid");
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO authorization_codes (
+             code_hash, client_id, redirect_uri, code_challenge, scopes, resource,
+             principal_id, principal_epoch, created_at, expires_at, consumed_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+        )
+        .run(
+          codeHash,
+          login.client_id,
+          payload.redirectUri,
+          payload.codeChallenge,
+          payload.scopes.join(" "),
+          payload.resource,
+          principalId,
+          principalEpoch,
+          input.now,
+          input.now + AUTHORIZATION_CODE_TTL_SECONDS,
+        );
+
+      const completed = this.#db
+        .prepare(
+          `UPDATE login_transactions
+           SET status = 'complete', completed_at = ?
+           WHERE id = ? AND status = 'callback_claimed' AND expires_at > ?`,
+        )
+        .run(input.now, login.id, input.now).changes;
+      const deletedStage = this.#db
+        .prepare(
+          `DELETE FROM staged_grants WHERE id = ? AND status = 'staged'`,
+        )
+        .run(stage.id).changes;
+      if (completed !== 1 || deletedStage !== 1) throw invalidLoginCommit();
+
+      return {
+        redirectUri: payload.redirectUri,
+        originalState: payload.originalState,
+        principalId,
+        principalEpoch,
+        authorizationCode,
+      };
+    })();
+  }
+
+  discardStagedGrant(stageId: string, now: number): boolean {
+    this.assertReady();
+    if (typeof stageId !== "string" || !validStoreTime(now)) return false;
+    return this.#db
+      .prepare(
+        `UPDATE staged_grants SET status = 'discard_only'
+         WHERE id = ? AND status = 'staged'`,
+      )
+      .run(stageId).changes === 1;
+  }
+
   failLogin(transactionId: string, now: number): OAuthRedirectContext | undefined {
     this.assertReady();
     if (!Number.isSafeInteger(now) || now < 0) return undefined;
@@ -896,7 +1307,9 @@ export function openSqliteOAuthStore(options: SqliteOAuthStoreOptions): OAuthSto
       options.cipher,
       mcpResource,
       options.now ?? (() => Math.floor(Date.now() / 1000)),
+      options.randomId ?? randomOpaque,
       options.randomToken ?? randomOpaque,
+      options.testHooks,
     );
     store.recoverDuringStartup(now);
     store.markReady();

@@ -51,6 +51,34 @@ export type OAuthRedirectContext = {
   originalState: string | undefined;
 };
 
+export type ZendeskGrant = {
+  accessToken: string;
+  refreshToken: string;
+  accessExpiresAt: number;
+  refreshExpiresAt: number;
+  scopes: string[];
+};
+
+export type StageLoginGrantInput = {
+  transactionId: string;
+  subdomain: string;
+  grant: ZendeskGrant;
+  now: number;
+};
+
+export type CommitLoginInput = {
+  transactionId: string;
+  stageId: string;
+  zendeskUserId: string;
+  now: number;
+};
+
+export type LoginCommitResult = OAuthRedirectContext & {
+  principalId: string;
+  principalEpoch: number;
+  authorizationCode: string;
+};
+
 export type ConsentDecisionResult =
   | { kind: "confirmed"; upstreamState: string }
   | ({ kind: "denied" } & OAuthRedirectContext)
@@ -77,6 +105,9 @@ export interface OAuthStore extends OAuthRegisteredClientsStore {
     upstreamState: string,
     now: number,
   ): ZendeskCallbackContext | undefined;
+  stageLoginGrant(input: StageLoginGrantInput): { stageId: string };
+  commitLogin(input: CommitLoginInput): LoginCommitResult;
+  discardStagedGrant(stageId: string, now: number): boolean;
   failLogin(transactionId: string, now: number): OAuthRedirectContext | undefined;
   isReady(): boolean;
   assertReady(): void;
