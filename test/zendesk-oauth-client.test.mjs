@@ -94,6 +94,7 @@ test('exchanges a code once at the fixed token endpoint and returns integer epoc
     },
     form: undefined,
     authorizationScheme: undefined,
+    redirect: 'error',
   }])
   assert.deepEqual(grant, {
     accessToken: 'access-token-rotated',
@@ -104,6 +105,8 @@ test('exchanges a code once at the fixed token endpoint and returns integer epoc
   })
   assert.equal(Number.isInteger(grant.accessExpiresAt), true)
   assert.equal(Number.isInteger(grant.refreshExpiresAt), true)
+  assert.equal(Number.isSafeInteger(grant.accessExpiresAt), true)
+  assert.equal(Number.isSafeInteger(grant.refreshExpiresAt), true)
   fake.assertDrained()
 })
 
@@ -132,6 +135,7 @@ test('refreshes once with the renewable policy and parses both rotated tokens', 
     },
     form: undefined,
     authorizationScheme: undefined,
+    redirect: 'error',
   })
   assert.equal(grant.accessToken, 'new-access-token')
   assert.equal(grant.refreshToken, 'new-refresh-token')
@@ -154,6 +158,34 @@ test('rejects missing refresh token, wrong type/scopes, fractional expiries, and
     await assert.rejects(
       client.exchangeAuthorizationCode('code'),
       (error) => error instanceof ZendeskUpstreamError && error.category === 'invalid_response',
+    )
+    assert.equal(fake.requests.length, 1)
+  }
+})
+
+test('rejects unsafe clocks, TTLs, epoch overflow, and refresh expiry not after access expiry', async () => {
+  const cases = [
+    { now: NOW, body: tokenResponse({ expires_in: Number.MAX_SAFE_INTEGER + 1 }) },
+    { now: NOW, body: tokenResponse({ refresh_token_expires_in: Number.MAX_SAFE_INTEGER + 1 }) },
+    { now: Number.NaN, body: tokenResponse() },
+    { now: NOW + 0.5, body: tokenResponse() },
+    { now: Number.MAX_SAFE_INTEGER - 1_000, body: tokenResponse() },
+    { now: NOW, body: tokenResponse({ refresh_token_expires_in: ACCESS_TTL }) },
+    { now: NOW, body: tokenResponse({ refresh_token_expires_in: ACCESS_TTL - 1 }) },
+  ]
+
+  for (const { now, body } of cases) {
+    const { client, fake } = fixture({ now: () => now })
+    fake.queueResponse({ body })
+    await assert.rejects(
+      client.exchangeAuthorizationCode('code-sentinel'),
+      (error) => {
+        assert.ok(error instanceof ZendeskUpstreamError)
+        assert.equal(error.category, 'invalid_response')
+        assert.equal(error.status, 200)
+        assert.equal(error.retryable, false)
+        return true
+      },
     )
     assert.equal(fake.requests.length, 1)
   }
@@ -196,29 +228,38 @@ test('uses fixed users/me and current-token revoke endpoints with Bearer authori
   assert.deepEqual(await client.getCurrentUser('identity-token-sentinel'), { zendeskUserId: '424242' })
   await client.revokeCurrentToken('revoke-token-sentinel')
 
-  assert.deepEqual(fake.requests.map(({ method, url, pathname, authorizationScheme }) => ({
+  assert.deepEqual(fake.requests.map(({ method, url, pathname, authorizationScheme, redirect }) => ({
     method,
     url,
     pathname,
     authorizationScheme,
+    redirect,
   })), [
     {
       method: 'GET',
       url: `${ORIGIN}/api/v2/users/me.json`,
       pathname: '/api/v2/users/me.json',
       authorizationScheme: 'Bearer',
+      redirect: 'error',
     },
     {
       method: 'DELETE',
       url: `${ORIGIN}/api/v2/oauth/tokens/current.json`,
       pathname: '/api/v2/oauth/tokens/current.json',
       authorizationScheme: 'Bearer',
+      redirect: 'error',
     },
   ])
 })
 
-test('rejects invalid current-user responses as sanitized invalid responses', async () => {
-  for (const body of [{}, { user: null }, { user: { id: 1.5 } }, { user: { id: '' } }]) {
+test('rejects invalid or unsafe current-user IDs as sanitized invalid responses', async () => {
+  for (const body of [
+    {},
+    { user: null },
+    { user: { id: 1.5 } },
+    { user: { id: '' } },
+    { user: { id: Number.MAX_SAFE_INTEGER + 1 } },
+  ]) {
     const { client, fake } = fixture()
     fake.queueResponse({ body })
     await assert.rejects(
@@ -226,6 +267,29 @@ test('rejects invalid current-user responses as sanitized invalid responses', as
       (error) => error instanceof ZendeskUpstreamError && error.category === 'invalid_response',
     )
   }
+})
+
+test('does not follow redirect responses or make an off-origin fetch', async () => {
+  const { client, fake } = fixture()
+  fake.queueResponse({
+    status: 302,
+    headers: { location: 'https://off-origin.example.test/stolen' },
+  })
+
+  await assert.rejects(
+    client.exchangeAuthorizationCode('redirect-code-sentinel'),
+    (error) => error instanceof ZendeskUpstreamError && error.category === 'invalid_request',
+  )
+  assert.equal(fake.requests.length, 1)
+  assert.deepEqual({
+    method: fake.requests[0].method,
+    url: fake.requests[0].url,
+    redirect: fake.requests[0].redirect,
+  }, {
+    method: 'POST',
+    url: `${ORIGIN}/oauth/tokens`,
+    redirect: 'error',
+  })
 })
 
 test('aborts hung requests on timeout, per-call abort, and shutdown without retrying', async () => {

@@ -46,8 +46,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isPositiveInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value > 0;
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
 
 function hasApprovedScopes(scopes: readonly string[]): boolean {
@@ -71,8 +71,8 @@ function parseTokenResponse(value: unknown): TokenResponse | undefined {
     || typeof tokenType !== "string"
     || tokenType.toLowerCase() !== "bearer"
     || scope !== APPROVED_SCOPE
-    || !isPositiveInteger(expiresIn)
-    || !isPositiveInteger(refreshTokenExpiresIn)
+    || !isPositiveSafeInteger(expiresIn)
+    || !isPositiveSafeInteger(refreshTokenExpiresIn)
   ) {
     return undefined;
   }
@@ -202,7 +202,7 @@ export class ZendeskOAuthClient implements ZendeskOAuthGateway {
       headers: { authorization: `Bearer ${accessToken}` },
     }, signal, true);
     const body = response.body;
-    if (!isRecord(body) || !isRecord(body.user) || !isPositiveInteger(body.user.id)) {
+    if (!isRecord(body) || !isRecord(body.user) || !isPositiveSafeInteger(body.user.id)) {
       throw upstreamError("invalid_response", response.status, false);
     }
     return { zendeskUserId: String(body.user.id) };
@@ -223,12 +223,24 @@ export class ZendeskOAuthClient implements ZendeskOAuthGateway {
     }, signal, true);
     const parsed = parseTokenResponse(response.body);
     if (!parsed) throw upstreamError("invalid_response", response.status, false);
-    const now = Math.floor(this.#now());
+    const now = this.#now();
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw upstreamError("invalid_response", response.status, false);
+    }
+    const accessExpiresAt = now + parsed.expires_in;
+    const refreshExpiresAt = now + parsed.refresh_token_expires_in;
+    if (
+      !Number.isSafeInteger(accessExpiresAt)
+      || !Number.isSafeInteger(refreshExpiresAt)
+      || refreshExpiresAt <= accessExpiresAt
+    ) {
+      throw upstreamError("invalid_response", response.status, false);
+    }
     return {
       accessToken: parsed.access_token,
       refreshToken: parsed.refresh_token,
-      accessExpiresAt: now + parsed.expires_in,
-      refreshExpiresAt: now + parsed.refresh_token_expires_in,
+      accessExpiresAt,
+      refreshExpiresAt,
       scopes: [...ZENDESK_SCOPES],
     };
   }

@@ -37,6 +37,7 @@ export function createFakeZendesk() {
         ? Object.fromEntries(new URLSearchParams(body))
         : undefined,
       authorizationScheme: parseAuthorizationScheme(headers.get('authorization')),
+      redirect: init.redirect,
     }
     requests.push(request)
 
