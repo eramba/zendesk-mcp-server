@@ -7,7 +7,7 @@ import test from 'node:test'
 import Database from 'better-sqlite3'
 
 import { openSqliteOAuthStore } from '../dist/oauth/sqlite-store.js'
-import { TokenCipher, hashOpaque } from '../dist/oauth/token-cipher.js'
+import { TokenCipher, hashOpaque, randomOpaque } from '../dist/oauth/token-cipher.js'
 
 const NOW = 1_700_000_000
 const ACCESS_TTL = 3_600
@@ -27,15 +27,28 @@ const VALID_CLIENT = {
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), 'zendesk-oauth-access-'))
   const path = join(directory, 'oauth.sqlite')
+  const cipher = new TokenCipher(Buffer.alloc(32, 31))
   const store = openSqliteOAuthStore({
     path,
-    cipher: new TokenCipher(Buffer.alloc(32, 31)),
+    cipher,
     mcpResourceUrl: new URL(RESOURCE),
     now: () => NOW,
   })
   t.after(() => store.close())
   const client = store.registerClient(VALID_CLIENT)
-  return { directory, path, store, client }
+  return { directory, path, cipher, store, client }
+}
+
+function openIssuanceStore(t, path, cipher, options = {}) {
+  const store = openSqliteOAuthStore({
+    path,
+    cipher,
+    mcpResourceUrl: new URL(RESOURCE),
+    now: () => NOW,
+    ...options,
+  })
+  t.after(() => store.close())
+  return store
 }
 
 function query(path, sql, ...parameters) {
@@ -112,6 +125,14 @@ function exchangeInput(clientId, authorizationCode, overrides = {}) {
     now: NOW,
     accessTokenTtlSeconds: ACCESS_TTL,
     ...overrides,
+  }
+}
+
+function issuanceCounts(path) {
+  return {
+    families: query(path, 'SELECT COUNT(*) AS count FROM token_families')[0].count,
+    access: query(path, 'SELECT COUNT(*) AS count FROM access_tokens')[0].count,
+    refresh: query(path, 'SELECT COUNT(*) AS count FROM refresh_token_generations')[0].count,
   }
 }
 
@@ -262,4 +283,103 @@ test('access-token TTL must be a positive safe integer that cannot overflow epoc
   }
   assert.equal(query(path, 'SELECT consumed_at FROM authorization_codes')[0].consumed_at, null)
   assert.equal(query(path, 'SELECT COUNT(*) AS count FROM token_families')[0].count, 0)
+})
+
+test('a post-consumption issuance failure rolls back the code and every partial token row', async (t) => {
+  const { path, store, client } = await fixture(t)
+  const committed = commitAuthorizationCode(store, client.client_id, 'trigger-rollback')
+  const before = issuanceCounts(path)
+  execute(path, (db) => db.exec(`
+    CREATE TRIGGER abort_refresh_generation
+    BEFORE INSERT ON refresh_token_generations
+    BEGIN
+      SELECT RAISE(ABORT, 'injected refresh insert failure');
+    END;
+  `))
+
+  assert.throws(
+    () => store.consumeCodeAndIssueFamily(exchangeInput(client.client_id, committed.authorizationCode)),
+    /injected refresh insert failure/i,
+  )
+
+  assert.equal(
+    query(path, 'SELECT consumed_at FROM authorization_codes WHERE code_hash = ?', hashOpaque(committed.authorizationCode))[0].consumed_at,
+    null,
+  )
+  assert.deepEqual(issuanceCounts(path), before)
+})
+
+test('invalid and colliding injected random values never consume the code or leave partial rows', async (t) => {
+  for (const testCase of [
+    { label: 'malformed token', randomToken: () => 'too-short' },
+    { label: 'access equals refresh', value: randomOpaque() },
+    { label: 'token equals authorization code', authorizationCollision: true },
+  ]) {
+    await t.test(testCase.label, async (t) => {
+      const { path, cipher, store, client } = await fixture(t)
+      const committed = commitAuthorizationCode(store, client.client_id, `random-${testCase.label}`)
+      const randomToken = testCase.authorizationCollision
+        ? () => committed.authorizationCode
+        : testCase.randomToken ?? (() => testCase.value)
+      const issuanceStore = openIssuanceStore(t, path, cipher, { randomToken })
+
+      assert.throws(
+        () => issuanceStore.consumeCodeAndIssueFamily(exchangeInput(client.client_id, committed.authorizationCode)),
+        /random source is invalid/i,
+      )
+      assert.equal(
+        query(path, 'SELECT consumed_at FROM authorization_codes WHERE code_hash = ?', hashOpaque(committed.authorizationCode))[0].consumed_at,
+        null,
+      )
+      assert.deepEqual(issuanceCounts(path), { families: 0, access: 0, refresh: 0 })
+    })
+  }
+
+  await t.test('access hash already exists', async (t) => {
+    const { path, cipher, store, client } = await fixture(t)
+    const firstCode = commitAuthorizationCode(store, client.client_id, 'existing-token-first')
+    const firstTokens = store.consumeCodeAndIssueFamily(exchangeInput(client.client_id, firstCode.authorizationCode))
+    const secondCode = commitAuthorizationCode(store, client.client_id, 'existing-token-second', NOW + 1)
+    const generated = [firstTokens.access_token, randomOpaque()]
+    const issuanceStore = openIssuanceStore(t, path, cipher, {
+      randomToken: () => generated.shift(),
+    })
+
+    assert.throws(
+      () => issuanceStore.consumeCodeAndIssueFamily(exchangeInput(client.client_id, secondCode.authorizationCode, { now: NOW + 1 })),
+      /unique constraint failed/i,
+    )
+    assert.equal(
+      query(path, 'SELECT consumed_at FROM authorization_codes WHERE code_hash = ?', hashOpaque(secondCode.authorizationCode))[0].consumed_at,
+      null,
+    )
+    assert.deepEqual(issuanceCounts(path), { families: 1, access: 1, refresh: 1 })
+    assert.deepEqual(store.lookupAccessToken(firstTokens.access_token, NOW + 1), {
+      clientId: client.client_id,
+      principalId: firstCode.principalId,
+      scopes: MCP_SCOPES,
+      resource: RESOURCE,
+      expiresAt: NOW + ACCESS_TTL,
+    })
+  })
+})
+
+test('access lookup fails closed when the owning client scope is noncanonical or the client row is missing', async (t) => {
+  const { path, store, client } = await fixture(t)
+  const committed = commitAuthorizationCode(store, client.client_id, 'client-join')
+  const tokens = store.consumeCodeAndIssueFamily(exchangeInput(client.client_id, committed.authorizationCode))
+
+  execute(path, (db) => {
+    db.pragma('ignore_check_constraints = ON')
+    db.prepare("UPDATE oauth_clients SET scope = 'zendesk:read' WHERE client_id = ?").run(client.client_id)
+  })
+  assert.equal(store.lookupAccessToken(tokens.access_token, NOW), undefined)
+
+  execute(path, (db) => {
+    db.pragma('ignore_check_constraints = ON')
+    db.prepare('UPDATE oauth_clients SET scope = ? WHERE client_id = ?').run(MCP_SCOPES.join(' '), client.client_id)
+    db.pragma('foreign_keys = OFF')
+    db.prepare('DELETE FROM oauth_clients WHERE client_id = ?').run(client.client_id)
+  })
+  assert.equal(store.lookupAccessToken(tokens.access_token, NOW), undefined)
 })
