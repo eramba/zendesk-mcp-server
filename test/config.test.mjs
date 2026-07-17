@@ -119,6 +119,14 @@ test('readHttpOAuthConfig reports every missing key without values', () => {
   )
 })
 
+test('readHttpOAuthConfig canonicalizes mixed-case Zendesk subdomains', () => {
+  assert.equal(
+    readHttpOAuthConfig({ ...HTTP_OAUTH_ENV, ZENDESK_SUBDOMAIN: 'Example' })
+      .zendeskSubdomain,
+    'example',
+  )
+})
+
 test('readHttpOAuthConfig rejects unsafe origins, subdomains, keys, and ranges', () => {
   const cases = [
     ['PUBLIC_BASE_URL', 'http://dev-server.tail22145b.ts.net', /HTTPS origin/],

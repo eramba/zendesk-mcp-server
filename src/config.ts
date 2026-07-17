@@ -148,7 +148,7 @@ export function readHttpOAuthConfig(
   }
 
   const zendeskSubdomain = env.ZENDESK_SUBDOMAIN as string;
-  if (!/^(?!-)[a-z0-9-]{1,63}(?<!-)$/.test(zendeskSubdomain)) {
+  if (!/^(?!-)[a-z0-9-]{1,63}(?<!-)$/i.test(zendeskSubdomain)) {
     throw new Error("ZENDESK_SUBDOMAIN must be one DNS label");
   }
 
