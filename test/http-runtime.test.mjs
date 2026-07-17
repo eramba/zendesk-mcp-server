@@ -23,6 +23,10 @@ async function runtimeModule() {
   return import('../dist/http-runtime.js')
 }
 
+async function lifecycleModule() {
+  return import('../dist/http-lifecycle.js')
+}
+
 function fixture(overrides = {}) {
   const events = []
   let ready = true
@@ -257,10 +261,152 @@ test('starts the worker only after local readiness and shuts down once in bounde
   ])
 })
 
+test('forced connection close still waits for the listener close callback before store teardown', async () => {
+  const [
+    { closeHttpListener },
+    { attachHttpListener, createHttpRuntime },
+  ] = await Promise.all([lifecycleModule(), runtimeModule()])
+  const f = fixture()
+  const runtime = createHttpRuntime(CONFIG, f.dependencies)
+  f.events.length = 0
+  let closeCallback
+  const listener = {
+    close(callback) {
+      f.events.push('listener close requested')
+      closeCallback = callback
+    },
+    closeAllConnections() {
+      f.events.push('force close connections')
+    },
+  }
+  runtime.startWorker()
+  attachHttpListener(runtime, () => closeHttpListener(listener, {
+    graceMs: 0,
+    onGraceExpired() {
+      f.events.push('grace expired')
+    },
+  }))
+
+  let shutdownSettled = false
+  const shutdown = runtime.shutdown('SIGTERM').finally(() => {
+    shutdownSettled = true
+  })
+  await new Promise((resolve) => setTimeout(resolve, 5))
+
+  assert.equal(shutdownSettled, false)
+  assert.deepEqual(f.events, [
+    'readiness',
+    'worker start',
+    'stop claims',
+    'abort/drain worker',
+    'listener close requested',
+    'grace expired',
+    'force close connections',
+  ])
+
+  f.events.push('listener close callback')
+  closeCallback()
+  await shutdown
+  assert.deepEqual(f.events, [
+    'readiness',
+    'worker start',
+    'stop claims',
+    'abort/drain worker',
+    'listener close requested',
+    'grace expired',
+    'force close connections',
+    'listener close callback',
+    'release claims:runtime-worker-owner:1700000000',
+    'store close',
+  ])
+})
+
+test('asynchronous listen errors enter the same one-shot runtime shutdown as signals', async () => {
+  const [
+    { startHttpLifecycle },
+    { createHttpRuntime },
+  ] = await Promise.all([lifecycleModule(), runtimeModule()])
+  const f = fixture()
+  const runtime = createHttpRuntime(CONFIG, f.dependencies)
+  f.events.length = 0
+  let resolveStoreClosed
+  const storeClosed = new Promise((resolve) => {
+    resolveStoreClosed = resolve
+  })
+  const closeStore = f.store.close
+  f.store.close = () => {
+    closeStore.call(f.store)
+    resolveStoreClosed()
+  }
+  let errorHandler
+  const signalHandlers = new Map()
+  const logs = []
+  const processState = {
+    exitCode: undefined,
+    once(signal, handler) {
+      signalHandlers.set(signal, handler)
+    },
+  }
+  const listener = {
+    on(event, handler) {
+      assert.equal(event, 'error')
+      errorHandler = handler
+    },
+    close(callback) {
+      f.events.push('listener close')
+      callback()
+    },
+    closeAllConnections() {
+      assert.fail('immediate listener close must not reach the grace timer')
+    },
+  }
+
+  startHttpLifecycle(runtime, listener, {
+    process: processState,
+    logError(...values) {
+      logs.push(values.join(' '))
+    },
+  })
+  assert.equal(typeof errorHandler, 'function')
+  assert.deepEqual([...signalHandlers.keys()], ['SIGINT', 'SIGTERM'])
+
+  const error = Object.assign(new Error('address already in use'), { code: 'EADDRINUSE' })
+  errorHandler(error)
+  await storeClosed
+
+  assert.equal(processState.exitCode, 1)
+  assert.deepEqual(logs, ['HTTP listener error: address already in use'])
+  const errorShutdownEvents = [
+    'readiness',
+    'worker start',
+    'stop claims',
+    'abort/drain worker',
+    'listener close',
+    'release claims:runtime-worker-owner:1700000000',
+    'store close',
+  ]
+  assert.deepEqual(f.events, errorShutdownEvents)
+
+  signalHandlers.get('SIGINT')()
+  signalHandlers.get('SIGTERM')()
+  await Promise.resolve()
+  assert.deepEqual(f.events, errorShutdownEvents)
+})
+
 test('HTTP entrypoint has no shared bearer, Basic credentials, or global ZendeskClient', async () => {
   const source = await readFile(new URL('../src/http.ts', import.meta.url), 'utf8')
   assert.doesNotMatch(source, /readHttpConfig|readZendeskConfig|MCP_BEARER_TOKEN/)
   assert.doesNotMatch(source, /from ["']\.\/zendesk-client\.js["']|new ZendeskClient\s*\(/)
+})
+
+test('HTTP entrypoint does not finish grace close before the listener callback', async () => {
+  const source = await readFile(new URL('../src/http.ts', import.meta.url), 'utf8')
+  assert.doesNotMatch(source, /closeAllConnections\(\);\s*finish\(\)/s)
+})
+
+test('HTTP entrypoint routes listen errors through the shared shutdown lifecycle', async () => {
+  const source = await readFile(new URL('../src/http.ts', import.meta.url), 'utf8')
+  assert.match(source, /startHttpLifecycle\(runtime, listener\)/)
 })
 
 test('HTTP runtime has no global credential-bound ZendeskClient', async () => {
