@@ -1652,7 +1652,7 @@ class SqliteOAuthStore implements LifecycleStore {
         .run(input.now, principal.id);
       this.#db
         .prepare(
-          `UPDATE staged_grants SET status = 'discard_only'
+          `DELETE FROM staged_grants
            WHERE expected_principal_id = ? AND status = 'staged'`,
         )
         .run(principal.id);

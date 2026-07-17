@@ -1,8 +1,14 @@
 import { randomUUID } from "node:crypto";
 
-import { ZendeskClient } from "../zendesk-client.js";
+import {
+  ZendeskClient,
+  type OAuthUnauthorizedResult,
+} from "../zendesk-client.js";
 import { REFRESH_SKEW_SECONDS } from "./constants.js";
-import { ReauthorizationRequiredError } from "./errors.js";
+import {
+  ReauthorizationRequiredError,
+  ZendeskUpstreamError,
+} from "./errors.js";
 import type {
   CredentialSnapshot,
   OAuthStore,
@@ -66,11 +72,14 @@ export class ZendeskClientResolver implements ZendeskClientResolverLike {
     return this.#client(current);
   }
 
-  async #refresh(snapshot: CredentialSnapshot): Promise<CredentialSnapshot> {
+  async #refresh(
+    snapshot: CredentialSnapshot,
+    signal?: AbortSignal,
+  ): Promise<CredentialSnapshot> {
     const existing = this.#refreshes.get(snapshot.principalId);
     if (existing) return existing;
 
-    const pending = this.#refreshSnapshot(snapshot);
+    const pending = this.#refreshSnapshot(snapshot, signal);
     this.#refreshes.set(snapshot.principalId, pending);
     try {
       return await pending;
@@ -81,8 +90,11 @@ export class ZendeskClientResolver implements ZendeskClientResolverLike {
     }
   }
 
-  async #refreshSnapshot(snapshot: CredentialSnapshot): Promise<CredentialSnapshot> {
-    const grant = await this.#zendesk.refreshCredential(snapshot.grant.refreshToken);
+  async #refreshSnapshot(
+    snapshot: CredentialSnapshot,
+    signal?: AbortSignal,
+  ): Promise<CredentialSnapshot> {
+    const grant = await this.#zendesk.refreshCredential(snapshot.grant.refreshToken, signal);
     const now = this.#now();
     if (!Number.isSafeInteger(now) || now < 0) {
       throw new Error("resolver clock is invalid");
@@ -95,7 +107,7 @@ export class ZendeskClientResolver implements ZendeskClientResolverLike {
       now,
     });
     try {
-      const identity = await this.#zendesk.getCurrentUser(grant.accessToken);
+      const identity = await this.#zendesk.getCurrentUser(grant.accessToken, signal);
       if (identity.zendeskUserId !== snapshot.zendeskUserId) {
         throw new Error("Zendesk identity changed during refresh");
       }
@@ -110,6 +122,78 @@ export class ZendeskClientResolver implements ZendeskClientResolverLike {
     }
   }
 
+  async #onUnauthorized(
+    principalId: string,
+    input: {
+      principalEpoch: number;
+      credentialVersion: number;
+      terminal: boolean;
+      signal: AbortSignal;
+    },
+  ): Promise<OAuthUnauthorizedResult> {
+    if (input.terminal) {
+      return this.#terminalFailure(
+        principalId,
+        input.principalEpoch,
+        input.credentialVersion,
+      );
+    }
+
+    const current = this.#store.loadCredential(principalId);
+    if (!current) {
+      return { kind: "stale_failure", correlationId: randomUUID() };
+    }
+    if (
+      current.principalEpoch !== input.principalEpoch ||
+      current.credentialVersion !== input.credentialVersion
+    ) {
+      return this.#retry(current);
+    }
+
+    try {
+      return this.#retry(await this.#refresh(current, input.signal));
+    } catch (error) {
+      if (error instanceof ZendeskUpstreamError && error.category === "invalid_grant") {
+        return this.#terminalFailure(
+          principalId,
+          current.principalEpoch,
+          current.credentialVersion,
+        );
+      }
+      if (error instanceof ReauthorizationRequiredError) {
+        return { kind: "stale_failure", correlationId: randomUUID() };
+      }
+      throw error;
+    }
+  }
+
+  #terminalFailure(
+    principalId: string,
+    expectedPrincipalEpoch: number,
+    expectedCredentialVersion: number,
+  ): OAuthUnauthorizedResult {
+    const correlationId = randomUUID();
+    const changed = this.#store.markReauthorizationRequiredIfCurrent({
+      principalId,
+      expectedPrincipalEpoch,
+      expectedCredentialVersion,
+      now: this.#now(),
+    });
+    if (changed) return { kind: "reauthorization_required", correlationId };
+
+    this.#store.loadCredential(principalId);
+    return { kind: "stale_failure", correlationId };
+  }
+
+  #retry(snapshot: CredentialSnapshot): OAuthUnauthorizedResult {
+    return {
+      kind: "retry",
+      accessToken: snapshot.grant.accessToken,
+      principalEpoch: snapshot.principalEpoch,
+      credentialVersion: snapshot.credentialVersion,
+    };
+  }
+
   #client(snapshot: CredentialSnapshot): ZendeskClient {
     return new ZendeskClient({
       subdomain: this.#subdomain,
@@ -118,10 +202,7 @@ export class ZendeskClientResolver implements ZendeskClientResolverLike {
         accessToken: snapshot.grant.accessToken,
         principalEpoch: snapshot.principalEpoch,
         credentialVersion: snapshot.credentialVersion,
-        onUnauthorized: async () => ({
-          kind: "stale_failure",
-          correlationId: randomUUID(),
-        }),
+        onUnauthorized: (input) => this.#onUnauthorized(snapshot.principalId, input),
       },
       timeoutMs: this.#timeoutMs,
       fetch: this.#fetch,
