@@ -67,11 +67,43 @@ test('documents safe backup, restore, cutover, rollback, retirement, and orphan-
   )
   assert.match(dockerfile, /^USER node$/m)
   assert.doesNotMatch(verification, /--user(?:=|\s+)root/)
+  assert.match(seed, /set -euo pipefail/)
+  assert.match(seed, /RESTORE_DRILL_NONCE="\$\(openssl rand -hex 16\)"/)
+  assert.match(
+    seed,
+    /\[\[ "\$RESTORE_DRILL_NONCE" =~ \^\[0-9a-f\]\{32\}\$ \]\]/,
+  )
+  assert.match(
+    seed,
+    /RESTORE_DRILL_VOLUME="zendesk-oauth-restore-drill-\$\{RESTORE_DRILL_NONCE\}"/,
+  )
+  assert.match(
+    seed,
+    /\[\[ "\$RESTORE_DRILL_VOLUME" =~ \^zendesk-oauth-restore-drill-\[0-9a-f\]\{32\}\$ \]\]/,
+  )
+  assert.match(seed, /RESTORE_DRILL_CREATED=false/)
+  assert.match(seed, /cleanup_restore_drill\(\)/)
+  assert.match(seed, /\[\[ "\$RESTORE_DRILL_CREATED" == true \]\] \|\| return 0/)
+  assert.match(seed, /docker volume inspect[\s\S]+"\$RESTORE_DRILL_VOLUME"/)
+  assert.match(seed, /\[\[ "\$owned_nonce" == "\$RESTORE_DRILL_NONCE" \]\] \|\| return 1/)
+  assert.match(seed, /docker volume rm "\$RESTORE_DRILL_VOLUME"/)
+  assert.match(seed, /trap cleanup_restore_drill EXIT/)
+  assert.match(
+    seed,
+    /docker volume create --label "zendesk\.oauth\.restore-drill=\$RESTORE_DRILL_NONCE" "\$RESTORE_DRILL_VOLUME"/,
+  )
+  assert.match(seed, /RESTORE_DRILL_CREATED=true/)
+  assert.match(seed, /source="\$RESTORE_DRILL_VOLUME",target=\/data/)
+  assert.match(verification, /source="\$RESTORE_DRILL_VOLUME",target=\/data/)
   assert.match(restore, /--env ZENDESK_SUBDOMAIN/)
   assert.match(restore, /--env OAUTH_ENCRYPTION_KEY/)
   assert.match(restore, /--env OAUTH_DB_PATH=\/data\/oauth\.sqlite/)
   assert.match(restore, /scripts\/oauth-admin\.mjs sessions --zendesk-user-id <known-id>/)
-  assert.match(restore, /docker volume rm zendesk-oauth-restore-drill/)
+  assert.match(restore, /cleanup_restore_drill\n\s*trap - EXIT/)
+  assert.doesNotMatch(
+    restore,
+    /docker volume (?:create|rm) zendesk-oauth-restore-drill(?:\s|$)/,
+  )
   assert.doesNotMatch(restore, /npm (?:run )?start|docker compose up|start the same application image/i)
   assert.match(readme, /maintenance window/i)
   assert.match(readme, /inventory/i)

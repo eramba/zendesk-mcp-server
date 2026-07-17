@@ -163,15 +163,38 @@ Keep the OAuth encryption key in separate custody from both the live volume and 
 Use this restore procedure:
 
 1. Place the completed consistent backup in a protected restore-input directory as a protected root-owned backup with mode `0600`. If recovery uses a separately captured SQLite snapshot instead, checkpoint that snapshot before copying it; never copy the live `oauth.sqlite`, `-wal`, and `-shm` files independently.
-2. Resolve the exact already-built application image ID, create a disposable volume, and seed only that volume without network access or the normal entrypoint. Override the image user to root for this copy step only so it can read the protected root-owned input; hand the restored database back to the runtime user before the helper exits:
+2. In one Bash shell, resolve the exact already-built application image ID and generate a collision-resistant disposable-volume name locally. The name is non-empty and regex-validated before use. An owner nonce label plus the guarded exit trap ensures cleanup can remove only the volume created by this procedure; a pre-existing collision with a different or missing label is never removed. Override the image user to root for the copy step only so it can read the protected root-owned input, then hand the restored database back to the runtime user before the helper exits:
 
    ```bash
+   set -euo pipefail
    RESTORE_IMAGE="$(docker compose images --quiet zendesk-mcp)"
    test -n "$RESTORE_IMAGE"
-   docker volume create zendesk-oauth-restore-drill
+
+   RESTORE_DRILL_NONCE="$(openssl rand -hex 16)"
+   [[ "$RESTORE_DRILL_NONCE" =~ ^[0-9a-f]{32}$ ]] || exit 1
+   RESTORE_DRILL_VOLUME="zendesk-oauth-restore-drill-${RESTORE_DRILL_NONCE}"
+   [[ "$RESTORE_DRILL_VOLUME" =~ ^zendesk-oauth-restore-drill-[0-9a-f]{32}$ ]] || exit 1
+   readonly RESTORE_DRILL_NONCE RESTORE_DRILL_VOLUME
+   RESTORE_DRILL_CREATED=false
+
+   cleanup_restore_drill() {
+     [[ "$RESTORE_DRILL_CREATED" == true ]] || return 0
+     local owned_nonce
+     owned_nonce="$(docker volume inspect --format '{{ index .Labels "zendesk.oauth.restore-drill" }}' "$RESTORE_DRILL_VOLUME")"
+     [[ "$owned_nonce" == "$RESTORE_DRILL_NONCE" ]] || return 1
+     docker volume rm "$RESTORE_DRILL_VOLUME"
+     RESTORE_DRILL_CREATED=false
+   }
+   trap cleanup_restore_drill EXIT
+
+   docker volume create --label "zendesk.oauth.restore-drill=$RESTORE_DRILL_NONCE" "$RESTORE_DRILL_VOLUME" >/dev/null
+   owned_nonce="$(docker volume inspect --format '{{ index .Labels "zendesk.oauth.restore-drill" }}' "$RESTORE_DRILL_VOLUME")"
+   [[ "$owned_nonce" == "$RESTORE_DRILL_NONCE" ]] || exit 1
+   RESTORE_DRILL_CREATED=true
+
    docker run --rm --network none --user root \
      --mount type=bind,source="$PWD/restore-input",target=/restore-input,readonly \
-     --mount type=volume,source=zendesk-oauth-restore-drill,target=/data \
+     --mount type=volume,source="$RESTORE_DRILL_VOLUME",target=/data \
      --entrypoint sh "$RESTORE_IMAGE" \
      -c 'cp /restore-input/<new-name>.sqlite /data/oauth.sqlite && chown node:node /data/oauth.sqlite && chmod 0600 /data/oauth.sqlite'
    ```
@@ -180,7 +203,7 @@ Use this restore procedure:
 
    ```bash
    docker run --rm --network none \
-     --mount type=volume,source=zendesk-oauth-restore-drill,target=/data \
+     --mount type=volume,source="$RESTORE_DRILL_VOLUME",target=/data \
      --entrypoint node \
      --env ZENDESK_SUBDOMAIN \
      --env OAUTH_ENCRYPTION_KEY \
@@ -190,15 +213,16 @@ Use this restore procedure:
    ```
 
    This invokes only the read-only `sessions` administration command. It does not start the HTTP entrypoint or revocation worker, and `--network none` makes an upstream mutation impossible. A missing or wrong key or subdomain must fail closed.
-4. Remove the drill volume after recording only the non-secret session result:
+4. In the same Bash shell, explicitly invoke the guarded cleanup after recording only the non-secret session result, then disable the exit trap. The trap runs the same guarded cleanup automatically if an earlier command fails:
 
    ```bash
-   docker volume rm zendesk-oauth-restore-drill
+   cleanup_restore_drill
+   trap - EXIT
    ```
 
 5. For disaster recovery, keep the original volume untouched until the disposable-volume drill passes, then switch the deployment to a restored replacement volume during a maintenance window.
 
-Acceptance criteria: only the seed helper runs as root; it produces `/data/oauth.sqlite` owned by `node:node` with mode `0600`; the consistent-backup or checkpointed-snapshot restore then opens as the image's default non-root `node` user only with the matching separately held key and subdomain, reports the expected non-secret sessions from the exact image, starts no HTTP process or worker, has no network, removes the disposable volume, and does not modify the source backup or live volume.
+Acceptance criteria: only the seed helper runs as root; it produces `/data/oauth.sqlite` owned by `node:node` with mode `0600`; every drill starts from a newly generated, validated, owner-labeled volume without stale database or WAL state; the consistent-backup or checkpointed-snapshot restore then opens as the image's default non-root `node` user only with the matching separately held key and subdomain, reports the expected non-secret sessions from the exact image, starts no HTTP process or worker, has no network, removes only the disposable volume created by this procedure, and does not modify the source backup or live volume.
 
 ## Maintenance-window cutover and rollback
 
