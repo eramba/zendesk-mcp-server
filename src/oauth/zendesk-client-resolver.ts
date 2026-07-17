@@ -29,6 +29,12 @@ export type ZendeskClientResolverOptions = {
   fetch?: typeof globalThis.fetch;
 };
 
+type RefreshFlight = {
+  principalEpoch: number;
+  credentialVersion: number;
+  pending: Promise<CredentialSnapshot>;
+};
+
 export class ZendeskClientResolver implements ZendeskClientResolverLike {
   readonly #store: OAuthStore;
   readonly #zendesk: ZendeskOAuthGateway;
@@ -37,7 +43,7 @@ export class ZendeskClientResolver implements ZendeskClientResolverLike {
   readonly #refreshSkewSeconds: number;
   readonly #timeoutMs: number | undefined;
   readonly #fetch: typeof globalThis.fetch | undefined;
-  readonly #refreshes = new Map<string, Promise<CredentialSnapshot>>();
+  readonly #refreshes = new Map<string, RefreshFlight>();
 
   constructor(options: ZendeskClientResolverOptions) {
     const refreshSkewSeconds = options.refreshSkewSeconds ?? REFRESH_SKEW_SECONDS;
@@ -77,14 +83,25 @@ export class ZendeskClientResolver implements ZendeskClientResolverLike {
     signal?: AbortSignal,
   ): Promise<CredentialSnapshot> {
     const existing = this.#refreshes.get(snapshot.principalId);
-    if (existing) return existing;
+    if (
+      existing &&
+      existing.principalEpoch === snapshot.principalEpoch &&
+      existing.credentialVersion === snapshot.credentialVersion
+    ) {
+      return existing.pending;
+    }
 
     const pending = this.#refreshSnapshot(snapshot, signal);
-    this.#refreshes.set(snapshot.principalId, pending);
+    const flight: RefreshFlight = {
+      principalEpoch: snapshot.principalEpoch,
+      credentialVersion: snapshot.credentialVersion,
+      pending,
+    };
+    this.#refreshes.set(snapshot.principalId, flight);
     try {
       return await pending;
     } finally {
-      if (this.#refreshes.get(snapshot.principalId) === pending) {
+      if (this.#refreshes.get(snapshot.principalId) === flight) {
         this.#refreshes.delete(snapshot.principalId);
       }
     }
@@ -99,13 +116,21 @@ export class ZendeskClientResolver implements ZendeskClientResolverLike {
     if (!Number.isSafeInteger(now) || now < 0) {
       throw new Error("resolver clock is invalid");
     }
-    const { stageId } = this.#store.stageRefreshGrant({
-      principalId: snapshot.principalId,
-      expectedPrincipalEpoch: snapshot.principalEpoch,
-      expectedCredentialVersion: snapshot.credentialVersion,
-      grant,
-      now,
-    });
+    let stageId: string;
+    try {
+      ({ stageId } = this.#store.stageRefreshGrant({
+        principalId: snapshot.principalId,
+        expectedPrincipalEpoch: snapshot.principalEpoch,
+        expectedCredentialVersion: snapshot.credentialVersion,
+        grant,
+        now,
+      }));
+    } catch (error) {
+      const current = this.#store.loadCredential(snapshot.principalId);
+      if (current && !this.#sameCredential(current, snapshot)) return current;
+      if (!current) throw new ReauthorizationRequiredError(randomUUID());
+      throw error;
+    }
     try {
       const identity = await this.#zendesk.getCurrentUser(grant.accessToken, signal);
       if (identity.zendeskUserId !== snapshot.zendeskUserId) {
@@ -192,6 +217,11 @@ export class ZendeskClientResolver implements ZendeskClientResolverLike {
       principalEpoch: snapshot.principalEpoch,
       credentialVersion: snapshot.credentialVersion,
     };
+  }
+
+  #sameCredential(left: CredentialSnapshot, right: CredentialSnapshot): boolean {
+    return left.principalEpoch === right.principalEpoch &&
+      left.credentialVersion === right.credentialVersion;
   }
 
   #client(snapshot: CredentialSnapshot): ZendeskClient {

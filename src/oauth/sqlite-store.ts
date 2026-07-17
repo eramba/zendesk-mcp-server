@@ -1438,8 +1438,23 @@ class SqliteOAuthStore implements LifecycleStore {
 
     return this.#db.transaction(() => {
       const principal = this.#db
-        .prepare<[string], PrincipalRow>("SELECT * FROM principals WHERE id = ?")
-        .get(input.principalId);
+        .prepare<[string, number, number, number], PrincipalRow>(
+          `SELECT principals.*
+           FROM principals
+           JOIN zendesk_credentials
+             ON zendesk_credentials.principal_id = principals.id
+           WHERE principals.id = ?
+             AND principals.status = 'active'
+             AND principals.lifecycle_epoch = ?
+             AND zendesk_credentials.principal_epoch = ?
+             AND zendesk_credentials.credential_version = ?`,
+        )
+        .get(
+          input.principalId,
+          input.expectedPrincipalEpoch,
+          input.expectedPrincipalEpoch,
+          input.expectedCredentialVersion,
+        );
       if (!principal) throw new Error("invalid refresh stage");
       const stageId = this.#randomId();
       if (!isOpaque(stageId)) throw new Error("OAuth store random source is invalid");
@@ -1480,7 +1495,7 @@ class SqliteOAuthStore implements LifecycleStore {
           stage.expires_at,
         );
       return { stageId };
-    })();
+    }).immediate();
   }
 
   installStagedRefresh(stageId: string, now: number): InstallRefreshResult {

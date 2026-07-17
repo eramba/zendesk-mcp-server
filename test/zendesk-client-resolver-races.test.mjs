@@ -164,6 +164,16 @@ function resolver(options) {
   })
 }
 
+function wrapStore(store, overrides = {}) {
+  return new Proxy(store, {
+    get(target, property) {
+      if (Object.hasOwn(overrides, property)) return overrides[property]
+      const value = Reflect.get(target, property)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+  })
+}
+
 function rows(path, sql, ...params) {
   const db = new Database(path, { readonly: true })
   try {
@@ -386,6 +396,117 @@ test('invalid_grant racing a newer login loses the guard without revoking the wi
   ), [{ revoked_at: null, revoke_reason: null }])
 })
 
+test('a v2 401 never joins a pending v1 invalid_grant flight or invalidates the v2 winner', async (t) => {
+  const f = await fixture(t)
+  const initial = grant('cross-version-v1', NOW + REFRESH_SKEW_SECONDS + 10)
+  const v2 = grant('cross-version-v2')
+  const v3 = grant('cross-version-v3')
+  const first = installPrincipal(f.store, f.client.client_id, '454', initial, 'cross-version-v1')
+  const oldEntered = deferred()
+  const oldRelease = deferred()
+  const newEntered = deferred()
+  const newRelease = deferred()
+  const guardedVersions = []
+  const refreshTokens = []
+  const authorizations = []
+  const trackedStore = wrapStore(f.store, {
+    markReauthorizationRequiredIfCurrent(input) {
+      guardedVersions.push(input.expectedCredentialVersion)
+      return f.store.markReauthorizationRequiredIfCurrent(input)
+    },
+  })
+  const clientResolver = resolver({
+    store: trackedStore,
+    now: () => f.clock.value,
+    zendesk: gateway({
+      async refreshCredential(refreshToken) {
+        refreshTokens.push(refreshToken)
+        if (refreshToken === initial.refreshToken) {
+          oldEntered.resolve()
+          await oldRelease.promise
+          throw new ZendeskUpstreamError('invalid_grant', 400, false, 'old-v1-invalid-grant')
+        }
+        assert.equal(refreshToken, v2.refreshToken)
+        newEntered.resolve()
+        await newRelease.promise
+        return v3
+      },
+      async getCurrentUser(accessToken) {
+        assert.equal(accessToken, v3.accessToken)
+        return { zendeskUserId: '454' }
+      },
+    }),
+    fetch: async (_input, init) => {
+      const header = authorization(init)
+      authorizations.push(header)
+      return header === `Bearer ${v3.accessToken}` ? ticketResponse(454) : unauthorizedResponse()
+    },
+  })
+
+  const oldClient = await clientResolver.resolve(first.principalId)
+  f.clock.value = NOW + 11
+  const oldProactive = clientResolver.resolve(first.principalId)
+  await oldEntered.promise
+  const oldRequest = oldClient.getTicket(42)
+  await new Promise((resolvePromise) => setImmediate(resolvePromise))
+
+  const winner = installPrincipal(
+    f.store,
+    f.client.client_id,
+    '454',
+    v2,
+    'cross-version-v2',
+    NOW + 1,
+  )
+  issueFamily(f.store, f.client.client_id, winner.authorizationCode, NOW + 1)
+  const winnerClient = await clientResolver.resolve(first.principalId)
+  const winnerRequest = winnerClient.getTicket(454)
+  await new Promise((resolvePromise) => setImmediate(resolvePromise))
+  const startedIndependentV2Flight = refreshTokens.includes(v2.refreshToken)
+
+  oldRelease.resolve()
+  newRelease.resolve()
+  const [oldProactiveOutcome, oldRequestOutcome, winnerOutcome] = await Promise.all([
+    oldProactive.then(
+      (value) => ({ status: 'fulfilled', value }),
+      (reason) => ({ status: 'rejected', reason }),
+    ),
+    oldRequest.then(
+      (value) => ({ status: 'fulfilled', value }),
+      (reason) => ({ status: 'rejected', reason }),
+    ),
+    winnerRequest.then(
+      (value) => ({ status: 'fulfilled', value }),
+      (reason) => ({ status: 'rejected', reason }),
+    ),
+  ])
+
+  assert.equal(startedIndependentV2Flight, true)
+  assert.equal(oldProactiveOutcome.status, 'rejected')
+  assert.equal(oldProactiveOutcome.reason.category, 'invalid_grant')
+  assert.equal(oldRequestOutcome.status, 'rejected')
+  assert.equal(oldRequestOutcome.reason.category, 'unauthorized')
+  assert.equal(winnerOutcome.status, 'fulfilled')
+  assert.equal(winnerOutcome.value.id, 454)
+  assert.deepEqual(guardedVersions, [1])
+  assert.deepEqual(f.store.loadCredential(first.principalId).grant, v3)
+  assert.deepEqual(rows(
+    f.path,
+    'SELECT status, lifecycle_epoch FROM principals WHERE id = ?',
+    first.principalId,
+  ), [{ status: 'active', lifecycle_epoch: 1 }])
+  assert.deepEqual(rows(
+    f.path,
+    'SELECT revoked_at, revoke_reason FROM token_families WHERE principal_id = ?',
+    first.principalId,
+  ), [{ revoked_at: null, revoke_reason: null }])
+  assert.deepEqual(authorizations, [
+    `Bearer ${initial.accessToken}`,
+    `Bearer ${v2.accessToken}`,
+    `Bearer ${v3.accessToken}`,
+  ])
+})
+
 test('refresh versus two concurrent logins adopts the last winner with zero upstream cleanup', async (t) => {
   const f = await fixture(t)
   const initial = grant('login-race-old')
@@ -454,6 +575,116 @@ test('refresh versus two concurrent logins adopts the last winner with zero upst
   assert.deepEqual(cleanupCalls, [])
   assert.deepEqual(rows(f.path, 'SELECT * FROM staged_grants'), [])
 })
+
+test('a refresh response arriving after login adopts the winner before staging or users/me', async (t) => {
+  const f = await fixture(t)
+  const initial = grant('post-login-stage-v1', NOW + REFRESH_SKEW_SECONDS)
+  const refreshLoser = grant('post-login-stage-loser')
+  const loginWinner = grant('post-login-stage-v2')
+  const first = installPrincipal(f.store, f.client.client_id, '555', initial, 'post-login-stage-v1')
+  const entered = deferred()
+  const release = deferred()
+  let identityCalls = 0
+  const authorizations = []
+  const clientResolver = resolver({
+    store: f.store,
+    now: () => f.clock.value,
+    zendesk: gateway({
+      async refreshCredential() {
+        entered.resolve()
+        await release.promise
+        return refreshLoser
+      },
+      async getCurrentUser() {
+        identityCalls += 1
+        return { zendeskUserId: '555' }
+      },
+    }),
+    fetch: async (_input, init) => {
+      authorizations.push(authorization(init))
+      return ticketResponse(555)
+    },
+  })
+
+  const pending = clientResolver.resolve(first.principalId)
+  await entered.promise
+  installPrincipal(
+    f.store,
+    f.client.client_id,
+    '555',
+    loginWinner,
+    'post-login-stage-v2',
+    NOW + 1,
+  )
+  release.resolve()
+
+  const client = await pending
+  assert.equal((await client.getTicket(555)).id, 555)
+  assert.equal(identityCalls, 0)
+  assert.deepEqual(f.store.loadCredential(first.principalId).grant, loginWinner)
+  assert.deepEqual(rows(f.path, 'SELECT * FROM staged_grants'), [])
+  assert.deepEqual(authorizations, [`Bearer ${loginWinner.accessToken}`])
+})
+
+for (const transition of ['reauthorization', 'disconnect']) {
+  test(`a refresh response after ${transition} cannot persist a stage before failed identity`, async (t) => {
+    const f = await fixture(t)
+    const zendeskUserId = transition === 'reauthorization' ? '565' : '566'
+    const initial = grant(`${transition}-late-stage-v1`, NOW + REFRESH_SKEW_SECONDS)
+    const refreshLoser = grant(`${transition}-late-stage-loser`)
+    const first = installPrincipal(
+      f.store,
+      f.client.client_id,
+      zendeskUserId,
+      initial,
+      `${transition}-late-stage-v1`,
+    )
+    const entered = deferred()
+    const release = deferred()
+    let identityCalls = 0
+    const clientResolver = resolver({
+      store: f.store,
+      now: () => f.clock.value,
+      zendesk: gateway({
+        async refreshCredential() {
+          entered.resolve()
+          await release.promise
+          return refreshLoser
+        },
+        async getCurrentUser() {
+          identityCalls += 1
+          throw new Error('identity path must not run after lifecycle transition')
+        },
+      }),
+      fetch: async () => ticketResponse(),
+    })
+
+    const pending = clientResolver.resolve(first.principalId)
+    await entered.promise
+    if (transition === 'reauthorization') {
+      const current = f.store.loadCredential(first.principalId)
+      assert.equal(f.store.markReauthorizationRequiredIfCurrent({
+        principalId: first.principalId,
+        expectedPrincipalEpoch: current.principalEpoch,
+        expectedCredentialVersion: current.credentialVersion,
+        now: NOW + 1,
+      }), true)
+    } else {
+      assert.equal(f.store.disconnectUser('example', zendeskUserId, NOW + 1).kind, 'disconnected')
+    }
+    release.resolve()
+
+    const outcome = await pending.then(
+      (value) => ({ status: 'fulfilled', value }),
+      (reason) => ({ status: 'rejected', reason }),
+    )
+    assert.deepEqual(rows(f.path, 'SELECT * FROM staged_grants'), [])
+    assert.equal(identityCalls, 0)
+    assert.equal(outcome.status, 'rejected')
+    assert.ok(outcome.reason instanceof ReauthorizationRequiredError)
+    assert.equal(f.store.loadCredential(first.principalId), undefined)
+  })
+}
 
 test('disconnect winning against refresh prevents installation and cannot resurrect credentials', async (t) => {
   const f = await fixture(t)
