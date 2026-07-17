@@ -463,7 +463,7 @@ test('real forced listener close does not tear down the store before an aborted 
 
 test('operation drain timeout fails safely without releasing claims or closing the live store', async () => {
   const { attachHttpListener, createHttpRuntime } = await runtimeModule()
-  const f = fixture({ operationDrainTimeoutMs: 0 })
+  const f = fixture({ shutdownTimeoutMs: 0 })
   const runtime = createHttpRuntime(CONFIG, f.dependencies)
   f.events.length = 0
   let keepOperationPending
@@ -488,6 +488,98 @@ test('operation drain timeout fails safely without releasing claims or closing t
     assert.equal(f.ready, true)
   } finally {
     keepOperationPending()
+  }
+})
+
+test('one absolute shutdown deadline gives worker, listener, and drain only the remaining budget', async () => {
+  const { attachHttpListener, createHttpRuntime } = await runtimeModule()
+  let monotonicNow = 0
+  const listenerBudgets = []
+  const drainBudgets = []
+  const f = fixture({
+    shutdownTimeoutMs: 10_000,
+    monotonicNow: () => monotonicNow,
+    createWorker() {
+      return {
+        start() {},
+        async stop() {
+          f.events.push('stop claims')
+          monotonicNow += 2_000
+          f.events.push('abort/drain worker')
+        },
+      }
+    },
+  })
+  const runtime = createHttpRuntime(CONFIG, f.dependencies)
+  f.events.length = 0
+  f.appOptions.operationTracker.drain = async (remainingMs) => {
+    drainBudgets.push(remainingMs)
+  }
+  attachHttpListener(runtime, async (remainingMs) => {
+    listenerBudgets.push(remainingMs)
+    monotonicNow += 5_000
+    f.events.push('listener close')
+  })
+
+  await Promise.all([runtime.shutdown('SIGTERM'), runtime.shutdown('SIGINT')])
+
+  assert.deepEqual(listenerBudgets, [8_000])
+  assert.deepEqual(drainBudgets, [3_000])
+  assert.equal(monotonicNow, 7_000)
+  assert.deepEqual(f.events, [
+    'stop claims',
+    'abort/drain worker',
+    'listener close',
+    'release claims:runtime-worker-owner:1700000000',
+    'store close',
+  ])
+})
+
+test('listener exhausting the absolute deadline gives live operations zero budget and never closes the store', async () => {
+  const { attachHttpListener, createHttpRuntime } = await runtimeModule()
+  let monotonicNow = 0
+  const listenerBudgets = []
+  const drainBudgets = []
+  const f = fixture({
+    shutdownTimeoutMs: 10_000,
+    monotonicNow: () => monotonicNow,
+  })
+  const runtime = createHttpRuntime(CONFIG, f.dependencies)
+  f.events.length = 0
+  let resolveOperation
+  const pendingOperation = new Promise((resolve) => {
+    resolveOperation = resolve
+  })
+  void f.appOptions.operationTracker.track(async () => pendingOperation)
+  const originalDrain = f.appOptions.operationTracker.drain.bind(
+    f.appOptions.operationTracker,
+  )
+  f.appOptions.operationTracker.drain = async (remainingMs) => {
+    drainBudgets.push(remainingMs)
+    return originalDrain(remainingMs)
+  }
+  attachHttpListener(runtime, async (remainingMs) => {
+    listenerBudgets.push(remainingMs)
+    monotonicNow = 10_000
+    f.events.push('listener close')
+  })
+
+  try {
+    await assert.rejects(
+      runtime.shutdown('SIGTERM'),
+      { message: 'HTTP operations did not drain before shutdown deadline' },
+    )
+    assert.deepEqual(listenerBudgets, [10_000])
+    assert.deepEqual(drainBudgets, [0])
+    assert.equal(monotonicNow, 10_000)
+    assert.deepEqual(f.events, [
+      'stop claims',
+      'abort/drain worker',
+      'listener close',
+    ])
+    assert.equal(f.ready, true)
+  } finally {
+    resolveOperation()
   }
 })
 

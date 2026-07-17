@@ -60,7 +60,8 @@ export function startHttpLifecycle(
   const processControl = options.process ?? process;
   const logError = options.logError ?? console.error;
 
-  attachHttpListener(runtime, () => closeHttpListener(listener, {
+  attachHttpListener(runtime, (remainingMs) => closeHttpListener(listener, {
+    graceMs: remainingMs,
     onGraceExpired() {
       logError("HTTP shutdown grace period expired");
       processControl.exitCode = 1;

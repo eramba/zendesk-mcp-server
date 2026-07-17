@@ -63,7 +63,8 @@ type RuntimeDependencies = {
     options: ConstructorParameters<typeof ZendeskRevocationWorker>[0],
   ): RevocationWorkerLike;
   createApp(options: HttpAppOptions): Express;
-  operationDrainTimeoutMs?: number;
+  shutdownTimeoutMs?: number;
+  monotonicNow?(): number;
 };
 
 const defaultDependencies: RuntimeDependencies = {
@@ -79,10 +80,11 @@ const defaultDependencies: RuntimeDependencies = {
   createResolver: (options) => new ZendeskClientResolver(options),
   createWorker: (options) => new ZendeskRevocationWorker(options),
   createApp: createHttpApp,
-  operationDrainTimeoutMs: DEFAULT_HTTP_SHUTDOWN_TIMEOUT_MS,
+  shutdownTimeoutMs: DEFAULT_HTTP_SHUTDOWN_TIMEOUT_MS,
+  monotonicNow: () => Number(process.hrtime.bigint() / 1_000_000n),
 };
 
-type ListenerCloser = () => Promise<void>;
+type ListenerCloser = (remainingMs: number) => Promise<void>;
 
 const listenerClosers = new WeakMap<HttpRuntime, ListenerCloser>();
 
@@ -183,28 +185,74 @@ export function createHttpRuntime(
     let shutdownPromise: Promise<void> | undefined;
     let runtime: HttpRuntime;
 
-    const stop = async (): Promise<void> => {
+    const shutdownTimeoutMs =
+      dependencies.shutdownTimeoutMs ?? DEFAULT_HTTP_SHUTDOWN_TIMEOUT_MS;
+    if (!Number.isSafeInteger(shutdownTimeoutMs) || shutdownTimeoutMs < 0) {
+      throw new Error("HTTP shutdown timeout must be a non-negative integer");
+    }
+    const monotonicNow = dependencies.monotonicNow ??
+      (() => Number(process.hrtime.bigint() / 1_000_000n));
+
+    const remainingUntil = (deadlineMs: number): number => {
+      const currentMs = monotonicNow();
+      if (!Number.isSafeInteger(currentMs) || currentMs < 0) {
+        throw new Error("HTTP shutdown clock returned an invalid time");
+      }
+      return Math.max(0, deadlineMs - currentMs);
+    };
+
+    const waitForPhase = async (
+      phase: Promise<void>,
+      deadlineMs: number,
+      timeoutMessage: string,
+    ): Promise<void> => {
+      const remainingMs = remainingUntil(deadlineMs);
+      let timeout: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          phase,
+          new Promise<never>((_resolve, reject) => {
+            timeout = setTimeout(() => reject(new Error(timeoutMessage)), remainingMs);
+          }),
+        ]);
+      } finally {
+        if (timeout) clearTimeout(timeout);
+      }
+    };
+
+    const stop = async (deadlineMs: number): Promise<void> => {
       const failures: unknown[] = [];
+      let safeToCloseStore = true;
       let stopping: Promise<void> | undefined;
       try {
         stopping = worker.stop();
       } catch (error) {
         failures.push(error);
+        safeToCloseStore = false;
       }
       shutdownController.abort();
       if (stopping) {
         try {
-          await stopping;
+          await waitForPhase(
+            stopping,
+            deadlineMs,
+            "HTTP worker did not stop before shutdown deadline",
+          );
         } catch (error) {
           failures.push(error);
+          safeToCloseStore = false;
         }
       }
 
       const closeListener = listenerClosers.get(runtime);
-      let safeToCloseStore = true;
       if (closeListener) {
         try {
-          await closeListener();
+          const closing = closeListener(remainingUntil(deadlineMs));
+          await waitForPhase(
+            closing,
+            deadlineMs,
+            "HTTP listener did not close before shutdown deadline",
+          );
         } catch (error) {
           failures.push(error);
           safeToCloseStore = false;
@@ -212,9 +260,7 @@ export function createHttpRuntime(
       }
 
       try {
-        await operationTracker.drain(
-          dependencies.operationDrainTimeoutMs ?? DEFAULT_HTTP_SHUTDOWN_TIMEOUT_MS,
-        );
+        await operationTracker.drain(remainingUntil(deadlineMs));
       } catch (error) {
         failures.push(error);
         safeToCloseStore = false;
@@ -246,7 +292,16 @@ export function createHttpRuntime(
         worker.start();
       },
       shutdown(_signal) {
-        shutdownPromise ??= stop();
+        shutdownPromise ??= (async () => {
+          const startedAtMs = monotonicNow();
+          if (!Number.isSafeInteger(startedAtMs) || startedAtMs < 0) {
+            throw new Error("HTTP shutdown clock returned an invalid time");
+          }
+          if (startedAtMs > Number.MAX_SAFE_INTEGER - shutdownTimeoutMs) {
+            throw new Error("HTTP shutdown deadline is outside the safe range");
+          }
+          await stop(startedAtMs + shutdownTimeoutMs);
+        })();
         return shutdownPromise;
       },
     };
