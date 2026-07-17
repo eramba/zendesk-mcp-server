@@ -16,6 +16,8 @@ import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/share
 import {
   AUTHORIZATION_CODE_TTL_SECONDS,
   LOGIN_TTL_SECONDS,
+  MCP_REFRESH_TTL_SECONDS,
+  MCP_SCOPE,
   MCP_SCOPES,
   ZENDESK_SCOPES,
   normalizeMcpScopes,
@@ -23,6 +25,7 @@ import {
 import { SCHEMA_VERSION, SQLITE_MIGRATIONS } from "./sqlite-schema.js";
 import type {
   BeginLoginInput,
+  CodeExchangeInput,
   CommitLoginInput,
   ConsentDecisionInput,
   ConsentDecisionResult,
@@ -31,7 +34,9 @@ import type {
   OAuthRedirectContext,
   OAuthStore,
   RecoverySummary,
+  IssuedTokens,
   StageLoginGrantInput,
+  StoredAuthInfo,
   StoreInspection,
   ZendeskGrant,
   ZendeskCallbackContext,
@@ -55,7 +60,6 @@ const KEY_CHECK_CONTEXT = {
 const STARTUP_ERROR = "OAuth store failed to initialize";
 const INVALID_KEY_ERROR = "OAuth store encryption key is invalid";
 const NEWER_SCHEMA_ERROR = "OAuth store has newer schema version";
-const MCP_SCOPE = "zendesk:read zendesk:write";
 const SUPPORTED_GRANT_TYPES = ["authorization_code", "refresh_token"] as const;
 const SUPPORTED_RESPONSE_TYPES = ["code"] as const;
 const UNSUPPORTED_CLIENT_FIELDS = [
@@ -144,6 +148,30 @@ type StagedGrantRow = {
 };
 type MaximumCredentialVersionRow = { version: number };
 type ClaimedOutboxRow = { present: number };
+type AuthorizationCodeRow = {
+  code_hash: string;
+  client_id: string;
+  redirect_uri: string;
+  code_challenge: string;
+  scopes: string;
+  resource: string;
+  principal_id: string;
+  principal_epoch: number;
+  created_at: number;
+  expires_at: number;
+  consumed_at: number | null;
+};
+type AccessTokenRow = {
+  client_id: string;
+  principal_id: string;
+  principal_epoch: number;
+  scopes: string;
+  resource: string;
+  expires_at: number;
+  principal_status: PrincipalRow["status"];
+  lifecycle_epoch: number;
+  client_scope: string;
+};
 
 type EncryptedLoginPayload = {
   originalState: string | undefined;
@@ -172,6 +200,9 @@ type LifecycleStore = Pick<
   | "claimZendeskCallback"
   | "stageLoginGrant"
   | "commitLogin"
+  | "challengeForAuthorizationCode"
+  | "consumeCodeAndIssueFamily"
+  | "lookupAccessToken"
   | "discardStagedGrant"
   | "failLogin"
   | "isReady"
@@ -197,6 +228,10 @@ function invalidLoginRequest(): Error {
 
 function invalidLoginCommit(): Error {
   return new Error("invalid login commit");
+}
+
+function invalidAuthorizationCode(): Error {
+  return new Error("invalid authorization code");
 }
 
 function sameSet(actual: readonly string[] | undefined, expected: readonly string[]): boolean {
@@ -1147,6 +1182,219 @@ class SqliteOAuthStore implements LifecycleStore {
         authorizationCode,
       };
     }).immediate();
+  }
+
+  challengeForAuthorizationCode(
+    clientId: string,
+    code: string,
+    now: number,
+  ): string | undefined {
+    this.assertReady();
+    if (
+      typeof clientId !== "string" ||
+      !isOpaque(code) ||
+      !validStoreTime(now) ||
+      this.#mcpResource === undefined
+    ) {
+      return undefined;
+    }
+
+    return this.#db
+      .prepare<[string, string, number, string, string], { code_challenge: string }>(
+        `SELECT authorization_codes.code_challenge
+         FROM authorization_codes
+         JOIN principals
+           ON principals.id = authorization_codes.principal_id
+          AND principals.lifecycle_epoch = authorization_codes.principal_epoch
+         WHERE authorization_codes.code_hash = ?
+           AND authorization_codes.client_id = ?
+           AND authorization_codes.consumed_at IS NULL
+           AND authorization_codes.expires_at > ?
+           AND authorization_codes.scopes = ?
+           AND authorization_codes.resource = ?
+           AND principals.status = 'active'`,
+      )
+      .get(hashOpaque(code), clientId, now, MCP_SCOPE, this.#mcpResource)?.code_challenge;
+  }
+
+  consumeCodeAndIssueFamily(input: CodeExchangeInput): IssuedTokens {
+    this.assertReady();
+    if (
+      typeof input !== "object" ||
+      input === null ||
+      typeof input.clientId !== "string" ||
+      !isOpaque(input.authorizationCode) ||
+      typeof input.redirectUri !== "string" ||
+      typeof input.resource !== "string" ||
+      !validStoreTime(input.now) ||
+      !Number.isSafeInteger(input.accessTokenTtlSeconds) ||
+      input.accessTokenTtlSeconds <= 0 ||
+      input.now > Number.MAX_SAFE_INTEGER - input.accessTokenTtlSeconds ||
+      input.now > Number.MAX_SAFE_INTEGER - MCP_REFRESH_TTL_SECONDS ||
+      this.#mcpResource === undefined ||
+      input.resource !== this.#mcpResource
+    ) {
+      throw invalidAuthorizationCode();
+    }
+
+    return this.#db.transaction((): IssuedTokens => {
+      const codeHash = hashOpaque(input.authorizationCode);
+      const code = this.#db
+        .prepare<
+          [string, string, string, string, number, string],
+          AuthorizationCodeRow
+        >(
+          `SELECT authorization_codes.*
+           FROM authorization_codes
+           JOIN principals
+             ON principals.id = authorization_codes.principal_id
+            AND principals.lifecycle_epoch = authorization_codes.principal_epoch
+           WHERE authorization_codes.code_hash = ?
+             AND authorization_codes.client_id = ?
+             AND authorization_codes.redirect_uri = ?
+             AND authorization_codes.resource = ?
+             AND authorization_codes.expires_at > ?
+             AND authorization_codes.consumed_at IS NULL
+             AND authorization_codes.scopes = ?
+             AND principals.status = 'active'`,
+        )
+        .get(
+          codeHash,
+          input.clientId,
+          input.redirectUri,
+          input.resource,
+          input.now,
+          MCP_SCOPE,
+        );
+      if (!code) throw invalidAuthorizationCode();
+
+      const familyId = this.#randomId();
+      const accessToken = this.#randomToken(32);
+      const refreshToken = this.#randomToken(32);
+      const opaqueValues = [familyId, accessToken, refreshToken];
+      if (
+        opaqueValues.some((value) => !isOpaque(value)) ||
+        new Set([...opaqueValues, input.authorizationCode]).size !== 4
+      ) {
+        throw new Error("OAuth store random source is invalid");
+      }
+
+      const consumed = this.#db
+        .prepare(
+          `UPDATE authorization_codes
+           SET consumed_at = ?
+           WHERE code_hash = ?
+             AND consumed_at IS NULL
+             AND expires_at > ?`,
+        )
+        .run(input.now, codeHash, input.now).changes;
+      if (consumed !== 1) throw invalidAuthorizationCode();
+
+      this.#db
+        .prepare(
+          `INSERT INTO token_families (
+             id, client_id, principal_id, principal_epoch, scopes, resource,
+             created_at, last_used_at, revoked_at, revoke_reason
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
+        )
+        .run(
+          familyId,
+          code.client_id,
+          code.principal_id,
+          code.principal_epoch,
+          MCP_SCOPE,
+          code.resource,
+          input.now,
+          input.now,
+        );
+      this.#db
+        .prepare(
+          `INSERT INTO access_tokens (token_hash, family_id, created_at, expires_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(
+          hashOpaque(accessToken),
+          familyId,
+          input.now,
+          input.now + input.accessTokenTtlSeconds,
+        );
+      this.#db
+        .prepare(
+          `INSERT INTO refresh_token_generations (
+             token_hash, family_id, generation, status, created_at, expires_at,
+             consumed_at, successor_generation, encrypted_retry_response_json,
+             retry_response_expires_at
+           ) VALUES (?, ?, 1, 'current', ?, ?, NULL, NULL, NULL, NULL)`,
+        )
+        .run(
+          hashOpaque(refreshToken),
+          familyId,
+          input.now,
+          input.now + MCP_REFRESH_TTL_SECONDS,
+        );
+
+      return {
+        access_token: accessToken,
+        token_type: "Bearer",
+        expires_in: input.accessTokenTtlSeconds,
+        refresh_token: refreshToken,
+        scope: MCP_SCOPE,
+      };
+    }).immediate();
+  }
+
+  lookupAccessToken(token: string, now: number): StoredAuthInfo | undefined {
+    this.assertReady();
+    if (
+      !isOpaque(token) ||
+      !validStoreTime(now) ||
+      this.#mcpResource === undefined
+    ) {
+      return undefined;
+    }
+
+    const row = this.#db
+      .prepare<[string, number], AccessTokenRow>(
+        `SELECT token_families.client_id,
+                token_families.principal_id,
+                token_families.principal_epoch,
+                token_families.scopes,
+                token_families.resource,
+                access_tokens.expires_at,
+                principals.status AS principal_status,
+                principals.lifecycle_epoch,
+                oauth_clients.scope AS client_scope
+         FROM access_tokens
+         JOIN token_families ON token_families.id = access_tokens.family_id
+         JOIN principals ON principals.id = token_families.principal_id
+         JOIN oauth_clients ON oauth_clients.client_id = token_families.client_id
+         WHERE access_tokens.token_hash = ?
+           AND access_tokens.expires_at > ?
+           AND token_families.revoked_at IS NULL
+           AND principals.status = 'active'
+           AND principals.lifecycle_epoch = token_families.principal_epoch`,
+      )
+      .get(hashOpaque(token), now);
+    if (
+      !row ||
+      row.principal_status !== "active" ||
+      row.lifecycle_epoch !== row.principal_epoch ||
+      row.scopes !== MCP_SCOPE ||
+      row.client_scope !== MCP_SCOPE ||
+      row.resource !== this.#mcpResource ||
+      !Number.isSafeInteger(row.expires_at) ||
+      row.expires_at <= now
+    ) {
+      return undefined;
+    }
+
+    return {
+      clientId: row.client_id,
+      principalId: row.principal_id,
+      scopes: [...MCP_SCOPES],
+      resource: row.resource,
+      expiresAt: row.expires_at,
+    };
   }
 
   discardStagedGrant(stageId: string, now: number): boolean {

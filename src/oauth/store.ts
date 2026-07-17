@@ -79,6 +79,31 @@ export type LoginCommitResult = OAuthRedirectContext & {
   authorizationCode: string;
 };
 
+export type IssuedTokens = {
+  access_token: string;
+  token_type: "Bearer";
+  expires_in: number;
+  refresh_token: string;
+  scope: string;
+};
+
+export type CodeExchangeInput = {
+  clientId: string;
+  authorizationCode: string;
+  redirectUri: string;
+  resource: string;
+  now: number;
+  accessTokenTtlSeconds: number;
+};
+
+export type StoredAuthInfo = {
+  clientId: string;
+  principalId: string;
+  scopes: string[];
+  resource: string;
+  expiresAt: number;
+};
+
 export type ConsentDecisionResult =
   | { kind: "confirmed"; upstreamState: string }
   | ({ kind: "denied" } & OAuthRedirectContext)
@@ -107,6 +132,13 @@ export interface OAuthStore extends OAuthRegisteredClientsStore {
   ): ZendeskCallbackContext | undefined;
   stageLoginGrant(input: StageLoginGrantInput): { stageId: string };
   commitLogin(input: CommitLoginInput): LoginCommitResult;
+  challengeForAuthorizationCode(
+    clientId: string,
+    code: string,
+    now: number,
+  ): string | undefined;
+  consumeCodeAndIssueFamily(input: CodeExchangeInput): IssuedTokens;
+  lookupAccessToken(token: string, now: number): StoredAuthInfo | undefined;
   discardStagedGrant(stageId: string, now: number): boolean;
   failLogin(transactionId: string, now: number): OAuthRedirectContext | undefined;
   isReady(): boolean;
