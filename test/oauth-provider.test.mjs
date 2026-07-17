@@ -283,6 +283,51 @@ test('refresh inherits an omitted resource, rejects a supplied mismatch, and map
   )
 })
 
+test('refresh resource mismatch revokes only the token family owned by the requesting client', async (t) => {
+  const { store, client, provider } = await fixture(t)
+  const otherClient = store.registerClient({ ...VALID_CLIENT, client_name: 'Other client' })
+  const original = await issueFamily(store, provider, client, 'resource-owner')
+
+  await assert.rejects(
+    provider.exchangeRefreshToken(
+      otherClient,
+      original.tokens.refresh_token,
+      undefined,
+      new URL(OTHER_RESOURCE),
+    ),
+    InvalidTargetError,
+  )
+  const afterCrossClientAttempt = await provider.exchangeRefreshToken(
+    client,
+    original.tokens.refresh_token,
+    undefined,
+    new URL(RESOURCE),
+  )
+
+  await assert.rejects(
+    provider.exchangeRefreshToken(
+      client,
+      afterCrossClientAttempt.refresh_token,
+      undefined,
+      new URL(OTHER_RESOURCE),
+    ),
+    InvalidTargetError,
+  )
+  await assert.rejects(
+    provider.exchangeRefreshToken(
+      client,
+      afterCrossClientAttempt.refresh_token,
+      undefined,
+      new URL(RESOURCE),
+    ),
+    InvalidGrantError,
+  )
+  await assert.rejects(
+    provider.verifyAccessToken(afterCrossClientAttempt.access_token),
+    InvalidTokenError,
+  )
+})
+
 test('every invalid refresh-store outcome maps to invalid_grant', async (t) => {
   await t.test('unknown or replayed token', async (t) => {
     const { client, provider } = await fixture(t, { keyByte: 62 })

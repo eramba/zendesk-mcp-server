@@ -138,9 +138,7 @@ export class ZendeskBrokerOAuthProvider implements OAuthServerProvider {
     scopes?: string[],
     resource?: URL,
   ): Promise<OAuthTokens> {
-    if (resource !== undefined && resource.href !== this.#resource) {
-      throw new providerErrors.missingOrWrongResource("resource is invalid");
-    }
+    const resourceMismatch = resource !== undefined && resource.href !== this.#resource;
 
     const result = this.#store.rotateRefreshToken({
       clientId: client.client_id,
@@ -152,6 +150,9 @@ export class ZendeskBrokerOAuthProvider implements OAuthServerProvider {
       accessTokenTtlSeconds: this.#accessTokenTtlSeconds,
     });
     if (result.kind === "invalid_grant") {
+      if (resourceMismatch) {
+        throw new providerErrors.missingOrWrongResource("resource is invalid");
+      }
       throw new providerErrors.wrongOrReusedCode("refresh token is invalid");
     }
     return { ...result.tokens };
