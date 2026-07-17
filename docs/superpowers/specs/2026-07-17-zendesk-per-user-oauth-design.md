@@ -1,7 +1,7 @@
 # Zendesk Per-User OAuth Design
 
 **Date:** 2026-07-17
-**Status:** Internally reviewed; pending user approval
+**Status:** Approved by user on 2026-07-17
 **Scope:** Per-user Zendesk identity for the existing stateless Streamable HTTP transport
 
 ## Summary
@@ -110,7 +110,7 @@ The server generates an opaque client ID and returns no client secret. SDK 1.26 
 
 ### `package.json`
 
-Add pinned `better-sqlite3@12.11.1` and `express@5.2.1` as direct runtime dependencies, with `@types/better-sqlite3` remaining development-only, and update the lockfile. The local OAuth router imports Express APIs directly and must not rely on the MCP SDK's transitive dependency.
+Add pinned `better-sqlite3@12.11.1`, `express@5.2.1`, and `express-rate-limit@8.2.1` as direct runtime dependencies, with `@types/better-sqlite3` remaining development-only, and update the lockfile. The local OAuth router imports Express and its callback limiter directly and must not rely on MCP SDK transitive dependencies.
 
 ### `src/config.ts`
 
@@ -286,7 +286,7 @@ The authentication change also owns every current shared-bearer surface:
 - split the ambiguous combined environment sample into `.env.stdio.example` for API-token stdio and `.env.http.example` for Compose OAuth; never put a real secret or generated encryption key in either template;
 - update `README.md` requirements, local/Compose startup, full-origin Tailscale Serve, URL-only Codex configuration, browser login, backup/restore, cutover/rollback, local-only Codex logout, and operator revocation procedures;
 - change `scripts/smoke-http.mjs` from a shared-bearer client into a non-secret discovery/readiness smoke for health, unauthenticated challenge, and OAuth metadata; authenticated live acceptance runs through a logged-in Codex client rather than copied token material;
-- implement the three confirmed operator commands through one non-model-visible `scripts/oauth-admin.mjs` entrypoint; and
+- implement the three confirmed session/operator commands plus a create-only consistent-backup command through one non-model-visible `scripts/oauth-admin.mjs` entrypoint; and
 - replace the shared-bearer assumptions in configuration, HTTP, deployment, and smoke tests with the fake OAuth provider and persistent-store contract.
 
 ## Authorization Flow
@@ -351,6 +351,7 @@ If any step after token exchange fails or the process crashes, the staged encryp
 ### Zendesk tokens
 
 - Store and honor the upstream `expires_in` and refresh-token expiration semantics returned by Zendesk.
+- Request `expires_in=1800` and `refresh_token_expires_in=2592000` explicitly on initial authorization-code exchange and refresh. This guarantees a renewable grant for legacy local Zendesk OAuth clients created before 2026-04-30, which otherwise may issue a non-expiring access token without a refresh token.
 - Refresh before expiry using a bounded clock skew.
 - If Zendesk rotates the refresh token, replace the stored value immediately.
 - A current-epoch/version upstream `invalid_grant`, explicit revocation, or unrecoverable `401` marks the principal `reauthorization_required`; stale failures cannot.
@@ -366,9 +367,10 @@ There is no admin web UI or model-visible disconnect tool. Guaranteed server-sid
 npm run oauth:sessions -- --zendesk-user-id <id>
 npm run oauth:revoke-family -- --family-id <id> --confirm
 npm run oauth:disconnect-user -- --zendesk-user-id <id> --confirm
+npm run oauth:backup -- --destination /data/backups/<new-name>.sqlite
 ```
 
-The read-only sessions command prints only opaque family ID, escaped registered client name, loopback redirect, creation/last-use/expiry timestamps, and status. Each mutating command first prints its non-secret target and refuses to continue without `--confirm`.
+The read-only sessions command prints only opaque family ID, escaped registered client name, loopback redirect, creation/last-use/expiry timestamps, and status. Each mutating command first prints its non-secret target and refuses to continue without `--confirm`. The backup command accepts only a new absolute path under `/data/backups/`, uses SQLite's consistent backup API, and never prints the encryption key or database contents.
 
 Family revocation atomically revokes that family only. Principal disconnect atomically increments the lifecycle epoch, marks the principal disconnected with `disconnected_at`, invalidates pending codes, revokes all its MCP families, and moves the encrypted Zendesk credential into a fail-closed `revocation_pending` outbox record. Refresh compare-and-swap requires the old epoch and active status, so no in-flight refresh can resurrect credentials after that commit. Requests can never resolve a tombstoned credential.
 
@@ -385,24 +387,21 @@ Advertise and issue both MCP scopes for this release:
 
 Authorization requests must select exactly both scopes. This all-tools release does not issue read-only MCP tokens because `/mcp` requires both scopes and a read-only token would be valid-looking but unusable. Per-tool scope enforcement can be introduced later together with a deliberate read-only product mode.
 
-Request only the upstream Zendesk scopes required by current behavior:
+Request only the narrowest upstream Zendesk scope set proven to support every current behavior:
 
-- `tickets:read`
+- `read`
 - `tickets:write`
-- `users:read`
-- `organizations:read`
-- `hc:read`
 
-These cover the existing ticket reads/writes, comments, audits, searches, user/organization searches, ticket fields, and Help Center resource. Zendesk continues enforcing each user's role and object-level permissions.
+The global `read` scope is required because Zendesk's ticket-audit endpoints explicitly do not accept the resource-specific `tickets:read` scope. It subsumes the resource-specific read scopes for the current ticket, user, organization, and Help Center calls. This broadens the upstream token's potential GET surface, but Zendesk continues enforcing each user's role and object-level permissions, and the MCP server exposes only its existing tools and resource. `tickets:write` remains resource-specific for the current ticket and comment mutations.
 
 | Current behavior | Zendesk endpoints represented | Required upstream scope |
 | --- | --- | --- |
-| `get_ticket`, `get_tickets`, `search_tickets`, `list_ticket_fields`, `get_ticket_audits`, `get_ticket_comments` | ticket, field, audit, and comment GETs | `tickets:read` |
+| `get_ticket`, `get_tickets`, `search_tickets`, `list_ticket_fields`, `get_ticket_audits`, `get_ticket_comments` | ticket, field, audit, and comment GETs | `read` |
 | `create_ticket`, `update_ticket`, `create_ticket_comment` | ticket POST/PUT and comment write | `tickets:write` |
-| `search_users` and the `users/me` identity check | user GET/search | `users:read` |
-| `search_organizations` | organization GET/search | `organizations:read` |
-| general `search` | ticket, user, and organization search results | `tickets:read`, `users:read`, `organizations:read` |
-| knowledge-base resource | Help Center article GETs | `hc:read` |
+| `search_users` and the `users/me` identity check | user GET/search | `read` |
+| `search_organizations` | organization GET/search | `read` |
+| general `search` | ticket, user, and organization search results | `read` |
+| knowledge-base resource | Help Center article GETs | `read` |
 
 Because Zendesk returns a token even for an invalid scope string and only fails later with `403`, fake-server tests are not sufficient. Pre-cutover live probes must exercise each read scope family, and the controlled test-ticket acceptance must exercise `tickets:write`.
 
@@ -618,6 +617,7 @@ The controlled private comment and disposable-principal token revocation are the
 - **Unsafe redirects or token confusion:** Exact redirect matching, PKCE, one-time state/codes, and resource/audience validation are mandatory.
 - **Tailnet-only callback:** The browser performing login must be connected to Tailscale; deployment smoke verifies the complete redirect path before cutover.
 - **Zendesk permission differences:** Zendesk remains authoritative; the MCP server reports a sanitized permission error and never elevates a user.
+- **Global upstream read scope:** Ticket audits force the broad `read` scope rather than resource-specific read scopes. Keep writes restricted to `tickets:write`, expose no new MCP read tools in this release, and retain the live endpoint-family probes plus per-user Zendesk role enforcement.
 - **Native SQLite dependency:** Pin and smoke-test `better-sqlite3` in the Node 22 Alpine image, compile only in the build stage when no matching prebuild is available, and verify backup/restore.
 - **Local-only Codex logout:** Document it accurately and use RFC 7009 or confirmed operator commands when server-side invalidation is required.
 
@@ -628,6 +628,7 @@ The controlled private comment and disposable-principal token revocation are the
 - [Open Codex MCP refresh issue #17265](https://github.com/openai/codex/issues/17265)
 - [Zendesk authorization-code OAuth guide](https://developer.zendesk.com/documentation/api-basics/authentication/api-tokens-to-oauth/)
 - [Zendesk OAuth token scopes](https://developer.zendesk.com/api-reference/ticketing/oauth/oauth_tokens/)
+- [Zendesk Ticket Audits scope requirement](https://developer.zendesk.com/api-reference/ticketing/tickets/ticket_audits/)
 - [Zendesk API-token retirement timeline](https://developer.zendesk.com/documentation/api-basics/authentication/oauth-migration/)
 - [Node SQLite runtime status](https://nodejs.org/download/release/latest-v24.x/docs/api/sqlite.html)
 - [better-sqlite3 documentation](https://github.com/WiseLibs/better-sqlite3)
