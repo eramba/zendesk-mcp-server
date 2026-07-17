@@ -98,13 +98,8 @@ export class ZendeskCallbackController {
       return;
     }
 
-    let callback: ZendeskCallbackContext | undefined;
-    try {
-      callback = this.#store.claimZendeskCallback(upstreamState, this.#now());
-    } catch {
-      renderUntrustedError(res);
-      return;
-    }
+    const callback: ZendeskCallbackContext | undefined =
+      this.#store.claimZendeskCallback(upstreamState, this.#now());
     if (callback === undefined) {
       renderUntrustedError(res);
       return;

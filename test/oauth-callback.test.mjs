@@ -101,6 +101,7 @@ async function fixture(t, options = {}) {
   const failLoginCalls = []
   const identityCalls = []
   let activeResponse
+  let lastResponse
 
   const store = openSqliteOAuthStore({
     path,
@@ -171,6 +172,7 @@ async function fixture(t, options = {}) {
 
   async function invoke(query, responseOptions = {}) {
     const res = response(events, responseOptions)
+    lastResponse = res
     activeResponse = res
     await controller.handle(callbackRequest(query), res)
     activeResponse = undefined
@@ -189,6 +191,7 @@ async function fixture(t, options = {}) {
     gateway,
     identityCalls,
     invoke,
+    get lastResponse() { return lastResponse },
     path,
     store,
   }
@@ -368,6 +371,29 @@ test('unknown, expired, replayed, missing, and non-scalar state return only gene
   assert.deepEqual(f.cleanupCalls, [])
 })
 
+test('a thrown state-claim infrastructure failure propagates without writing a response', async (t) => {
+  const infrastructureFailure = new Error('sqlite-readiness-cipher-failure-sentinel')
+  const f = await fixture(t, {
+    storeOverrides: {
+      claimZendeskCallback: () => { throw infrastructureFailure },
+    },
+  })
+
+  await assert.rejects(
+    f.invoke({ state: 'opaque-state-sentinel', code: 'code-must-not-be-read' }),
+    (error) => error === infrastructureFailure,
+  )
+
+  assert.equal(f.lastResponse.statusCode, 200)
+  assert.equal(f.lastResponse.body, undefined)
+  assert.equal(f.lastResponse.location, undefined)
+  assert.equal(f.lastResponse.headers.size, 0)
+  assert.deepEqual(f.events, [])
+  assert.deepEqual(f.exchangeCalls, [])
+  assert.deepEqual(f.identityCalls, [])
+  assert.deepEqual(f.cleanupCalls, [])
+})
+
 test('exchange failures redirect stably without staging or cleanup', async (t) => {
   const cases = [
     ['invalid exchange', new ZendeskUpstreamError('invalid_response', 200, false, randomOpaque()), 'server_error'],
@@ -386,7 +412,7 @@ test('exchange failures redirect stably without staging or cleanup', async (t) =
   }
 })
 
-test('a crash after successful exchange but before staging issues no code and performs no cleanup', async (t) => {
+test('a pre-stage exception after successful exchange issues no code and performs no cleanup', async (t) => {
   let issuedGrant
   const f = await fixture(t, {
     exchange: async (code, now) => {
