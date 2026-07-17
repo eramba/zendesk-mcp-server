@@ -23,13 +23,14 @@ const VALID_CLIENT = {
   scope: SCOPES.join(' '),
 }
 
-async function fixture(t) {
+async function fixture(t, storeOptions = { mcpResourceUrl: new URL(RESOURCE) }) {
   const directory = await mkdtemp(join(tmpdir(), 'zendesk-oauth-login-'))
   const path = join(directory, 'oauth.sqlite')
   const store = openSqliteOAuthStore({
     path,
     cipher: new TokenCipher(Buffer.alloc(32, 21)),
     now: () => NOW,
+    ...storeOptions,
   })
   t.after(() => store.close())
   const client = store.registerClient(VALID_CLIENT)
@@ -55,12 +56,31 @@ function assertOpaque(value) {
 }
 
 function countOccurrences(bytes, value) {
-  return bytes.toString('latin1').split(value).length - 1
+  const needle = Buffer.from(value, 'utf8')
+  let count = 0
+  let offset = 0
+  while (offset <= bytes.length - needle.length) {
+    const found = bytes.indexOf(needle, offset)
+    if (found === -1) break
+    count += 1
+    offset = found + needle.length
+  }
+  return count
 }
 
 function assertContainsNone(value, secrets) {
   for (const secret of secrets) {
     assert.equal(value.includes(secret), false, `plaintext value leaked: ${secret}`)
+  }
+}
+
+function assertBytesContainNone(bytes, secrets) {
+  for (const secret of secrets) {
+    assert.equal(
+      bytes.includes(Buffer.from(secret, 'utf8')),
+      false,
+      `plaintext UTF-8 value leaked: ${secret}`,
+    )
   }
 }
 
@@ -130,8 +150,8 @@ test('login confirmation and Zendesk callback state are one-time and encrypted',
     countOccurrences(before, REDIRECT_URI),
     'beginLogin must not add another plaintext copy of the registered redirect',
   )
-  assertContainsNone(
-    afterBegin.toString('latin1'),
+  assertBytesContainNone(
+    afterBegin,
     [started.transactionToken, started.consentCsrf, started.browserNonce, originalState, CODE_CHALLENGE],
   )
 
@@ -152,7 +172,7 @@ test('login confirmation and Zendesk callback state are one-time and encrypted',
   const upstreamPendingRow = loginRows(path)[0]
   assertContainsNone(JSON.stringify(upstreamPendingRow), [...rawLoginValues, decision.upstreamState])
   const afterConfirm = await backupBytes(store, directory, 'after-confirm.sqlite')
-  assertContainsNone(afterConfirm.toString('latin1'), [
+  assertBytesContainNone(afterConfirm, [
     started.transactionToken,
     started.consentCsrf,
     started.browserNonce,
@@ -242,11 +262,24 @@ test('beginLogin validates the persisted client, exact redirect, scopes, and can
     { ...valid, scopes: ['zendesk:read'] },
     { ...valid, scopes: [...SCOPES, 'zendesk:write'] },
     { ...valid, resource: 'https://dev-server.tail22145b.ts.net:443/mcp' },
+    { ...valid, resource: 'https://other.example.test/mcp' },
+    { ...valid, resource: 'https://dev-server.tail22145b.ts.net/other' },
+    { ...valid, resource: 'https://dev-server.tail22145b.ts.net/mcp?audience=other' },
   ]
 
   for (const input of invalid) {
     assert.throws(() => store.beginLogin(input), /invalid login request/i)
   }
+  assert.equal(loginRows(path).length, 0)
+})
+
+test('beginLogin fails closed when the store has no configured MCP resource', async (t) => {
+  const { path, store, client } = await fixture(t, {})
+
+  assert.throws(
+    () => store.beginLogin(loginInput(client.client_id, 'missing-audience-state')),
+    /invalid login request/i,
+  )
   assert.equal(loginRows(path).length, 0)
 })
 

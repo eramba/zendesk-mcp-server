@@ -64,6 +64,7 @@ const UNSUPPORTED_CLIENT_FIELDS = [
 export type SqliteOAuthStoreOptions = {
   path: string;
   cipher: TokenCipher;
+  mcpResourceUrl?: URL;
   now?: () => number;
   randomId?: () => string;
   randomToken?: (bytes?: number) => string;
@@ -181,18 +182,22 @@ function normalizeRedirectUri(value: string): string {
   }
 }
 
-function isCanonicalResource(value: string): boolean {
+function canonicalMcpResource(value: URL | undefined): string | undefined {
+  if (value === undefined) return undefined;
   try {
-    const url = new URL(value);
-    return (
+    const url = new URL(value.href);
+    if (!(
       url.protocol === "https:" &&
       url.username === "" &&
       url.password === "" &&
       url.hash === "" &&
-      url.href === value
-    );
+      url.href === value.href
+    )) {
+      throw new Error("invalid MCP resource URL");
+    }
+    return url.href;
   } catch {
-    return false;
+    throw new Error("OAuth store MCP resource URL is invalid");
   }
 }
 
@@ -404,6 +409,7 @@ function recoverRows(db: Database.Database, now: number): RecoverySummary {
 class SqliteOAuthStore implements LifecycleStore {
   readonly #db: Database.Database;
   readonly #cipher: TokenCipher;
+  readonly #mcpResource: string | undefined;
   readonly #now: () => number;
   readonly #randomToken: (bytes?: number) => string;
   #ready = false;
@@ -411,11 +417,13 @@ class SqliteOAuthStore implements LifecycleStore {
   constructor(
     db: Database.Database,
     cipher: TokenCipher,
+    mcpResource: string | undefined,
     now: () => number,
     randomToken: (bytes?: number) => string,
   ) {
     this.#db = db;
     this.#cipher = cipher;
+    this.#mcpResource = mcpResource;
     this.#now = now;
     this.#randomToken = randomToken;
   }
@@ -526,7 +534,8 @@ class SqliteOAuthStore implements LifecycleStore {
     }
     if (
       input.scopes.length !== scopes.length ||
-      !isCanonicalResource(input.resource) ||
+      this.#mcpResource === undefined ||
+      input.resource !== this.#mcpResource ||
       typeof input.codeChallenge !== "string" ||
       input.codeChallenge.length === 0 ||
       !/^(?!-)[a-z0-9-]{1,63}(?<!-)$/.test(input.subdomain) ||
@@ -854,6 +863,7 @@ function valueFreeStartupError(error: unknown): Error {
 export function openSqliteOAuthStore(options: SqliteOAuthStoreOptions): OAuthStore {
   if (!isAbsolute(options.path)) throw new Error("OAuth store path must be absolute");
 
+  const mcpResource = canonicalMcpResource(options.mcpResourceUrl);
   const busyTimeoutMs = options.busyTimeoutMs ?? 5000;
   if (!Number.isSafeInteger(busyTimeoutMs) || busyTimeoutMs < 0 || busyTimeoutMs > 60_000) {
     throw new Error("OAuth store busy timeout is invalid");
@@ -884,6 +894,7 @@ export function openSqliteOAuthStore(options: SqliteOAuthStoreOptions): OAuthSto
     const store = new SqliteOAuthStore(
       db,
       options.cipher,
+      mcpResource,
       options.now ?? (() => Math.floor(Date.now() / 1000)),
       options.randomToken ?? randomOpaque,
     );
