@@ -13,9 +13,26 @@ import Database from "better-sqlite3";
 import { InvalidClientMetadataError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
 
+import { LOGIN_TTL_SECONDS, MCP_SCOPES, normalizeMcpScopes } from "./constants.js";
 import { SCHEMA_VERSION, SQLITE_MIGRATIONS } from "./sqlite-schema.js";
-import type { OAuthStore, RecoverySummary, StoreInspection } from "./store.js";
-import { randomOpaque, TokenCipher, type EncryptedValue } from "./token-cipher.js";
+import type {
+  BeginLoginInput,
+  ConsentDecisionInput,
+  ConsentDecisionResult,
+  LoginStart,
+  OAuthRedirectContext,
+  OAuthStore,
+  RecoverySummary,
+  StoreInspection,
+  ZendeskCallbackContext,
+} from "./store.js";
+import {
+  digestBinding,
+  hashOpaque,
+  randomOpaque,
+  TokenCipher,
+  type EncryptedValue,
+} from "./token-cipher.js";
 
 const KEY_CHECK_METADATA = "encryption_key_check";
 const KEY_CHECK_SENTINEL = "oauth-key-check-sentinel";
@@ -67,11 +84,54 @@ type ClientRow = {
 };
 type RedirectRow = { redirect_uri: string };
 type EffectivePragmas = StoreInspection["pragmas"] & { busyTimeout: number };
+type LoginStatus =
+  | "consent_pending"
+  | "upstream_pending"
+  | "callback_claimed"
+  | "complete"
+  | "failed"
+  | "denied";
+type LoginRow = {
+  id: string;
+  transaction_hash: string;
+  upstream_state_hash: string | null;
+  client_id: string;
+  browser_nonce_hash: string;
+  consent_csrf_hash: string;
+  encrypted_payload_json: string;
+  status: LoginStatus;
+  created_at: number;
+  expires_at: number;
+  consented_at: number | null;
+  completed_at: number | null;
+};
+
+type EncryptedLoginPayload = {
+  originalState: string | undefined;
+  redirectUri: string;
+  codeChallenge: string;
+  scopes: string[];
+  resource: string;
+};
+
+type LoginAadFields = {
+  subdomain: string;
+  redirectDigest: string;
+  resourceDigest: string;
+};
+
+type StoredLoginPayload = LoginAadFields & {
+  encrypted: EncryptedValue;
+};
 
 type LifecycleStore = Pick<
   OAuthStore,
   | "getClient"
   | "registerClient"
+  | "beginLogin"
+  | "decideConsent"
+  | "claimZendeskCallback"
+  | "failLogin"
   | "isReady"
   | "assertReady"
   | "recover"
@@ -87,6 +147,10 @@ type ClientRegistration = Omit<
 
 function invalidClientMetadata(): InvalidClientMetadataError {
   return new InvalidClientMetadataError("invalid_client_metadata");
+}
+
+function invalidLoginRequest(): Error {
+  return new Error("invalid login request");
 }
 
 function sameSet(actual: readonly string[] | undefined, expected: readonly string[]): boolean {
@@ -115,6 +179,80 @@ function normalizeRedirectUri(value: string): string {
     if (error instanceof InvalidClientMetadataError) throw error;
     throw invalidClientMetadata();
   }
+}
+
+function isCanonicalResource(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      url.username === "" &&
+      url.password === "" &&
+      url.hash === "" &&
+      url.href === value
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isOpaque(value: string): boolean {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) return false;
+  const decoded = Buffer.from(value, "base64url");
+  return decoded.length >= 32 && decoded.toString("base64url") === value;
+}
+
+function loginCipherContext(row: LoginRow, stored: LoginAadFields) {
+  return {
+    kind: "login" as const,
+    rowId: row.id,
+    expiresAt: row.expires_at,
+    subdomain: stored.subdomain,
+    clientId: row.client_id,
+    browserNonceHash: row.browser_nonce_hash,
+    redirectDigest: stored.redirectDigest,
+    resourceDigest: stored.resourceDigest,
+  };
+}
+
+function decryptLoginPayload(cipher: TokenCipher, row: LoginRow): EncryptedLoginPayload {
+  const stored = JSON.parse(row.encrypted_payload_json) as Partial<StoredLoginPayload>;
+  if (
+    typeof stored !== "object" ||
+    stored === null ||
+    typeof stored.subdomain !== "string" ||
+    typeof stored.redirectDigest !== "string" ||
+    typeof stored.resourceDigest !== "string" ||
+    typeof stored.encrypted !== "object" ||
+    stored.encrypted === null
+  ) {
+    throw new Error("invalid encrypted login payload");
+  }
+
+  const serialized = cipher.decrypt(
+    stored.encrypted as EncryptedValue,
+    loginCipherContext(row, stored as StoredLoginPayload),
+  );
+  const payload = JSON.parse(serialized) as Partial<EncryptedLoginPayload>;
+  const originalStateValid =
+    payload.originalState === undefined || typeof payload.originalState === "string";
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !originalStateValid ||
+    typeof payload.redirectUri !== "string" ||
+    typeof payload.codeChallenge !== "string" ||
+    !Array.isArray(payload.scopes) ||
+    payload.scopes.length !== MCP_SCOPES.length ||
+    !payload.scopes.every((scope) => typeof scope === "string") ||
+    !sameSet(payload.scopes, MCP_SCOPES) ||
+    typeof payload.resource !== "string" ||
+    digestBinding(payload.redirectUri) !== stored.redirectDigest ||
+    digestBinding(payload.resource) !== stored.resourceDigest
+  ) {
+    throw new Error("invalid encrypted login payload");
+  }
+  return payload as EncryptedLoginPayload;
 }
 
 function validateClientRegistration(client: ClientRegistration): {
@@ -265,12 +403,19 @@ function recoverRows(db: Database.Database, now: number): RecoverySummary {
 
 class SqliteOAuthStore implements LifecycleStore {
   readonly #db: Database.Database;
+  readonly #cipher: TokenCipher;
   readonly #now: () => number;
   readonly #randomToken: (bytes?: number) => string;
   #ready = false;
 
-  constructor(db: Database.Database, now: () => number, randomToken: (bytes?: number) => string) {
+  constructor(
+    db: Database.Database,
+    cipher: TokenCipher,
+    now: () => number,
+    randomToken: (bytes?: number) => string,
+  ) {
     this.#db = db;
+    this.#cipher = cipher;
     this.#now = now;
     this.#randomToken = randomToken;
   }
@@ -369,6 +514,256 @@ class SqliteOAuthStore implements LifecycleStore {
     })();
 
     return registered;
+  }
+
+  beginLogin(input: BeginLoginInput): LoginStart {
+    this.assertReady();
+    let scopes: string[];
+    try {
+      scopes = normalizeMcpScopes(input.scopes);
+    } catch {
+      throw invalidLoginRequest();
+    }
+    if (
+      input.scopes.length !== scopes.length ||
+      !isCanonicalResource(input.resource) ||
+      typeof input.codeChallenge !== "string" ||
+      input.codeChallenge.length === 0 ||
+      !/^(?!-)[a-z0-9-]{1,63}(?<!-)$/.test(input.subdomain) ||
+      (input.originalState !== undefined && typeof input.originalState !== "string") ||
+      !Number.isSafeInteger(input.now) ||
+      input.now < 0 ||
+      input.now > Number.MAX_SAFE_INTEGER - LOGIN_TTL_SECONDS
+    ) {
+      throw invalidLoginRequest();
+    }
+
+    return this.#db.transaction(() => {
+      const registeredRedirect = this.#db
+        .prepare<[string, string], { present: number }>(
+          `SELECT 1 AS present
+           FROM oauth_client_redirect_uris
+           WHERE client_id = ? AND redirect_uri = ?`,
+        )
+        .get(input.clientId, input.redirectUri);
+      if (!registeredRedirect) throw invalidLoginRequest();
+
+      const id = this.#randomToken(32);
+      const transactionToken = this.#randomToken(32);
+      const consentCsrf = this.#randomToken(32);
+      const browserNonce = this.#randomToken(32);
+      const opaqueValues = [id, transactionToken, consentCsrf, browserNonce];
+      if (
+        opaqueValues.some((value) => !isOpaque(value)) ||
+        new Set(opaqueValues).size !== opaqueValues.length
+      ) {
+        throw new Error("OAuth store random source is invalid");
+      }
+
+      const expiresAt = input.now + LOGIN_TTL_SECONDS;
+      const browserNonceHash = hashOpaque(browserNonce);
+      const stored: LoginAadFields = {
+        subdomain: input.subdomain,
+        redirectDigest: digestBinding(input.redirectUri),
+        resourceDigest: digestBinding(input.resource),
+      };
+      const payload: EncryptedLoginPayload = {
+        originalState: input.originalState,
+        redirectUri: input.redirectUri,
+        codeChallenge: input.codeChallenge,
+        scopes,
+        resource: input.resource,
+      };
+      const encrypted = this.#cipher.encrypt(
+        JSON.stringify(payload),
+        loginCipherContext(
+          {
+            id,
+            transaction_hash: hashOpaque(transactionToken),
+            upstream_state_hash: null,
+            client_id: input.clientId,
+            browser_nonce_hash: browserNonceHash,
+            consent_csrf_hash: hashOpaque(consentCsrf),
+            encrypted_payload_json: "",
+            status: "consent_pending",
+            created_at: input.now,
+            expires_at: expiresAt,
+            consented_at: null,
+            completed_at: null,
+          },
+          stored,
+        ),
+      );
+
+      this.#db
+        .prepare(
+          `INSERT INTO login_transactions (
+             id, transaction_hash, upstream_state_hash, client_id,
+             browser_nonce_hash, consent_csrf_hash, encrypted_payload_json,
+             status, created_at, expires_at, consented_at, completed_at
+           ) VALUES (?, ?, NULL, ?, ?, ?, ?, 'consent_pending', ?, ?, NULL, NULL)`,
+        )
+        .run(
+          id,
+          hashOpaque(transactionToken),
+          input.clientId,
+          browserNonceHash,
+          hashOpaque(consentCsrf),
+          JSON.stringify({ ...stored, encrypted } satisfies StoredLoginPayload),
+          input.now,
+          expiresAt,
+        );
+
+      return { transactionToken, consentCsrf, browserNonce, expiresAt };
+    })();
+  }
+
+  decideConsent(input: ConsentDecisionInput): ConsentDecisionResult {
+    this.assertReady();
+    if (
+      (input.decision !== "confirm" && input.decision !== "deny") ||
+      !Number.isSafeInteger(input.now) ||
+      input.now < 0
+    ) {
+      return { kind: "invalid" };
+    }
+
+    return this.#db.transaction((): ConsentDecisionResult => {
+      const transactionHash = hashOpaque(input.transactionToken);
+      const csrfHash = hashOpaque(input.consentCsrf);
+      const browserNonceHash = hashOpaque(input.browserNonce);
+      const row = this.#db
+        .prepare<[string, string, string, number], LoginRow>(
+          `SELECT * FROM login_transactions
+           WHERE transaction_hash = ?
+             AND consent_csrf_hash = ?
+             AND browser_nonce_hash = ?
+             AND status = 'consent_pending'
+             AND expires_at > ?`,
+        )
+        .get(transactionHash, csrfHash, browserNonceHash, input.now);
+      if (!row) return { kind: "invalid" };
+
+      let payload: EncryptedLoginPayload;
+      try {
+        payload = decryptLoginPayload(this.#cipher, row);
+      } catch {
+        return { kind: "invalid" };
+      }
+
+      if (input.decision === "deny") {
+        const consumed = this.#db
+          .prepare(
+            `UPDATE login_transactions
+             SET status = 'denied', consented_at = ?, completed_at = ?
+             WHERE id = ? AND status = 'consent_pending' AND expires_at > ?`,
+          )
+          .run(input.now, input.now, row.id, input.now).changes;
+        if (consumed !== 1) return { kind: "invalid" };
+        return {
+          kind: "denied",
+          redirectUri: payload.redirectUri,
+          originalState: payload.originalState,
+        };
+      }
+
+      const upstreamState = this.#randomToken(32);
+      if (!isOpaque(upstreamState)) throw new Error("OAuth store random source is invalid");
+      const upstreamStateHash = hashOpaque(upstreamState);
+      if (
+        [row.transaction_hash, row.consent_csrf_hash, row.browser_nonce_hash].includes(
+          upstreamStateHash,
+        )
+      ) {
+        throw new Error("OAuth store random source is invalid");
+      }
+      const consumed = this.#db
+        .prepare(
+          `UPDATE login_transactions
+           SET status = 'upstream_pending', upstream_state_hash = ?, consented_at = ?
+           WHERE id = ? AND status = 'consent_pending' AND expires_at > ?`,
+        )
+        .run(upstreamStateHash, input.now, row.id, input.now).changes;
+      if (consumed !== 1) return { kind: "invalid" };
+      return { kind: "confirmed", upstreamState };
+    })();
+  }
+
+  claimZendeskCallback(
+    upstreamState: string,
+    now: number,
+  ): ZendeskCallbackContext | undefined {
+    this.assertReady();
+    if (!Number.isSafeInteger(now) || now < 0) return undefined;
+
+    return this.#db.transaction(() => {
+      const row = this.#db
+        .prepare<[string, number], LoginRow>(
+          `SELECT * FROM login_transactions
+           WHERE upstream_state_hash = ?
+             AND status = 'upstream_pending'
+             AND expires_at > ?`,
+        )
+        .get(hashOpaque(upstreamState), now);
+      if (!row) return undefined;
+
+      let payload: EncryptedLoginPayload;
+      try {
+        payload = decryptLoginPayload(this.#cipher, row);
+      } catch {
+        return undefined;
+      }
+      const claimed = this.#db
+        .prepare(
+          `UPDATE login_transactions
+           SET status = 'callback_claimed'
+           WHERE id = ? AND status = 'upstream_pending' AND expires_at > ?`,
+        )
+        .run(row.id, now).changes;
+      if (claimed !== 1) return undefined;
+
+      return {
+        transactionId: row.id,
+        clientId: row.client_id,
+        redirectUri: payload.redirectUri,
+        originalState: payload.originalState,
+        codeChallenge: payload.codeChallenge,
+        scopes: payload.scopes,
+        resource: payload.resource,
+        createdAt: row.created_at,
+      };
+    })();
+  }
+
+  failLogin(transactionId: string, now: number): OAuthRedirectContext | undefined {
+    this.assertReady();
+    if (!Number.isSafeInteger(now) || now < 0) return undefined;
+
+    return this.#db.transaction(() => {
+      const row = this.#db
+        .prepare<[string, number], LoginRow>(
+          `SELECT * FROM login_transactions
+           WHERE id = ? AND status = 'callback_claimed' AND expires_at > ?`,
+        )
+        .get(transactionId, now);
+      if (!row) return undefined;
+
+      let payload: EncryptedLoginPayload;
+      try {
+        payload = decryptLoginPayload(this.#cipher, row);
+      } catch {
+        return undefined;
+      }
+      const failed = this.#db
+        .prepare(
+          `UPDATE login_transactions
+           SET status = 'failed', completed_at = ?
+           WHERE id = ? AND status = 'callback_claimed' AND expires_at > ?`,
+        )
+        .run(now, row.id, now).changes;
+      if (failed !== 1) return undefined;
+      return { redirectUri: payload.redirectUri, originalState: payload.originalState };
+    })();
   }
 
   recover(now: number): RecoverySummary {
@@ -488,6 +883,7 @@ export function openSqliteOAuthStore(options: SqliteOAuthStoreOptions): OAuthSto
 
     const store = new SqliteOAuthStore(
       db,
+      options.cipher,
       options.now ?? (() => Math.floor(Date.now() / 1000)),
       options.randomToken ?? randomOpaque,
     );
