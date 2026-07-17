@@ -333,6 +333,7 @@ test('forced connection close still waits for the listener close callback before
     await Promise.allSettled([shutdown])
   }
 
+  await shutdown
   assert.deepEqual(f.events, [
     'readiness',
     'worker start',
