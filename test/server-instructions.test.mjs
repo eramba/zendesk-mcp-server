@@ -8,7 +8,10 @@ import { buildZendeskServer } from '../dist/server.js'
 import { ZendeskClient } from '../dist/zendesk-client.js'
 
 test('publishes safe Zendesk attachment retrieval instructions during MCP initialization', async () => {
-  const zendesk = new ZendeskClient('example', 'agent@example.test', 'test-token')
+  const zendesk = new ZendeskClient({
+    subdomain: 'example',
+    auth: { kind: 'api_token', email: 'agent@example.test', apiToken: 'test-token' },
+  })
   const server = buildZendeskServer(zendesk)
   const client = new Client({ name: 'test-client', version: '1.0.0' })
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()

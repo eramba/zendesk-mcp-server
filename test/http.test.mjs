@@ -17,7 +17,10 @@ function makeApp(overrides = {}) {
     host: '127.0.0.1',
     allowedHosts: ['127.0.0.1', 'localhost'],
     bearerToken: BEARER_TOKEN,
-    client: new ZendeskClient('example', 'agent@example.test', 'zendesk-token'),
+    client: new ZendeskClient({
+      subdomain: 'example',
+      auth: { kind: 'api_token', email: 'agent@example.test', apiToken: 'zendesk-token' },
+    }),
     ...overrides,
   })
 }

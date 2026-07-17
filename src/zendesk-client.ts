@@ -1,3 +1,10 @@
+import { randomUUID } from "node:crypto";
+
+import {
+  ReauthorizationRequiredError,
+  ZendeskUpstreamError,
+  type ZendeskErrorCategory,
+} from "./oauth/errors.js";
 import type {
   TicketAuditListResult,
   TicketFieldListResult,
@@ -110,12 +117,124 @@ type TicketAuditPayload = {
   events?: TicketAuditEventPayload[];
 };
 
-type ZendeskApiError = {
-  error?: string;
-  description?: string;
-  details?: unknown;
-  title?: string;
+export type BasicZendeskAuth = {
+  kind: "api_token";
+  email: string;
+  apiToken: string;
 };
+
+export type OAuthUnauthorizedResult =
+  | {
+      kind: "retry";
+      accessToken: string;
+      principalEpoch: number;
+      credentialVersion: number;
+    }
+  | { kind: "reauthorization_required"; correlationId: string }
+  | { kind: "stale_failure"; correlationId: string };
+
+export type OAuthZendeskAuth = {
+  kind: "oauth";
+  accessToken: string;
+  principalEpoch: number;
+  credentialVersion: number;
+  onUnauthorized: (input: {
+    principalEpoch: number;
+    credentialVersion: number;
+    terminal: boolean;
+    signal: AbortSignal;
+  }) => Promise<OAuthUnauthorizedResult>;
+};
+
+export type ZendeskClientOptions = {
+  subdomain: string;
+  auth: BasicZendeskAuth | OAuthZendeskAuth;
+  timeoutMs?: number;
+  fetch?: typeof globalThis.fetch;
+};
+
+const DEFAULT_TIMEOUT_MS = 15_000;
+const MAX_ERROR_BODY_BYTES = 8 * 1024;
+
+function upstreamError(
+  category: ZendeskErrorCategory,
+  status: number | undefined,
+  retryable: boolean,
+  correlationId: string = randomUUID(),
+): ZendeskUpstreamError {
+  return new ZendeskUpstreamError(category, status, retryable, correlationId);
+}
+
+function classifyStatus(status: number): { category: ZendeskErrorCategory; retryable: boolean } {
+  if (status === 401) return { category: "unauthorized", retryable: false };
+  if (status === 403) return { category: "forbidden", retryable: false };
+  if (status === 429) return { category: "rate_limited", retryable: true };
+  if (status >= 500) return { category: "temporarily_unavailable", retryable: true };
+  return { category: "invalid_request", retryable: false };
+}
+
+function createRequestSignal(
+  timeoutMs: number,
+  outerSignals: readonly (AbortSignal | null | undefined)[],
+): { signal: AbortSignal; dispose: () => void } {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const activeSignals = outerSignals.filter(
+    (signal): signal is AbortSignal => signal !== undefined && signal !== null,
+  );
+  for (const signal of activeSignals) {
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+  }
+  const timer = setTimeout(abort, timeoutMs);
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      clearTimeout(timer);
+      for (const signal of activeSignals) signal.removeEventListener("abort", abort);
+    },
+  };
+}
+
+function awaitWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new DOMException("Aborted", "AbortError"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function consumeBoundedBody(response: Response, signal: AbortSignal): Promise<void> {
+  const reader = response.body?.getReader();
+  if (!reader) return;
+  let bytesRead = 0;
+  let complete = false;
+  try {
+    while (bytesRead < MAX_ERROR_BODY_BYTES) {
+      const result = await awaitWithAbort(reader.read(), signal);
+      if (result.done) {
+        complete = true;
+        break;
+      }
+      bytesRead += result.value.byteLength;
+    }
+  } finally {
+    if (!complete) {
+      await awaitWithAbort(reader.cancel(), signal).catch(() => undefined);
+    }
+    reader.releaseLock();
+  }
+}
 
 function normalizeTicket(ticket: TicketPayload): ZendeskTicket {
   return {
@@ -229,56 +348,130 @@ function normalizeTicketAudit(audit: TicketAuditPayload): ZendeskTicketAudit {
 
 export class ZendeskClient {
   private readonly baseUrl: string;
-  private readonly authHeader: string;
+  private auth: BasicZendeskAuth | OAuthZendeskAuth;
+  private readonly timeoutMs: number;
+  private readonly fetch: typeof globalThis.fetch;
 
-  constructor(subdomain: string, email: string, token: string) {
-    this.baseUrl = `https://${subdomain}.zendesk.com/api/v2`;
-    this.authHeader =
-      "Basic " + Buffer.from(`${email}/token:${token}`).toString("base64");
+  constructor(options: ZendeskClientOptions) {
+    const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+      throw new Error("timeoutMs must be a positive integer");
+    }
+    this.baseUrl = `https://${options.subdomain}.zendesk.com/api/v2`;
+    this.auth = { ...options.auth };
+    this.timeoutMs = timeoutMs;
+    this.fetch = options.fetch ?? globalThis.fetch;
   }
 
-  private async request<T>(path: string, init?: RequestInit): Promise<T> {
-    const response = await fetch(`${this.baseUrl}${path}`, {
+  private authorization(auth: BasicZendeskAuth | OAuthZendeskAuth): string {
+    if (auth.kind === "oauth") return `Bearer ${auth.accessToken}`;
+    return "Basic " + Buffer.from(`${auth.email}/token:${auth.apiToken}`).toString("base64");
+  }
+
+  private async fetchOnce(
+    path: string,
+    init: RequestInit | undefined,
+    auth: BasicZendeskAuth | OAuthZendeskAuth,
+    signal: AbortSignal,
+  ): Promise<Response> {
+    const headers = new Headers(init?.headers);
+    headers.set("Authorization", this.authorization(auth));
+    if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    if (!headers.has("Accept")) headers.set("Accept", "application/json");
+    return awaitWithAbort(this.fetch(`${this.baseUrl}${path}`, {
       ...init,
-      headers: {
-        Authorization: this.authHeader,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        ...(init?.headers ?? {}),
-      },
-    });
+      headers,
+      signal,
+    }), signal);
+  }
 
-    if (!response.ok) {
-      const bodyText = await response.text();
-      let parsedError: ZendeskApiError | undefined;
+  private unauthorizedResult(
+    result: OAuthUnauthorizedResult,
+    status: number,
+  ): never {
+    if (result.kind === "reauthorization_required") {
+      throw new ReauthorizationRequiredError(result.correlationId);
+    }
+    if (result.kind === "stale_failure") {
+      throw upstreamError("unauthorized", status, false, result.correlationId);
+    }
+    throw upstreamError("unauthorized", status, false);
+  }
 
-      try {
-        parsedError = JSON.parse(bodyText) as ZendeskApiError;
-      } catch {
-        parsedError = undefined;
+  private async request<T>(
+    path: string,
+    init?: RequestInit,
+    outerSignal?: AbortSignal,
+  ): Promise<T> {
+    const { signal, dispose } = createRequestSignal(
+      this.timeoutMs,
+      [init?.signal, outerSignal],
+    );
+    try {
+      let requestAuth = this.auth;
+      let response = await this.fetchOnce(path, init, requestAuth, signal);
+
+      if (response.status === 401 && requestAuth.kind === "oauth") {
+        await consumeBoundedBody(response, signal);
+        const firstResult = await awaitWithAbort(requestAuth.onUnauthorized({
+          principalEpoch: requestAuth.principalEpoch,
+          credentialVersion: requestAuth.credentialVersion,
+          terminal: false,
+          signal,
+        }), signal);
+        if (firstResult.kind !== "retry") this.unauthorizedResult(firstResult, response.status);
+
+        requestAuth = {
+          ...requestAuth,
+          accessToken: firstResult.accessToken,
+          principalEpoch: firstResult.principalEpoch,
+          credentialVersion: firstResult.credentialVersion,
+        };
+        this.auth = requestAuth;
+        response = await this.fetchOnce(path, init, requestAuth, signal);
+        if (response.status === 401) {
+          await consumeBoundedBody(response, signal);
+          const terminalResult = await awaitWithAbort(requestAuth.onUnauthorized({
+            principalEpoch: requestAuth.principalEpoch,
+            credentialVersion: requestAuth.credentialVersion,
+            terminal: true,
+            signal,
+          }), signal);
+          this.unauthorizedResult(terminalResult, response.status);
+        }
       }
 
-      const detail = parsedError
-        ? [
-            parsedError.title,
-            parsedError.error,
-            parsedError.description,
-            parsedError.details ? JSON.stringify(parsedError.details) : undefined,
-          ]
-            .filter(Boolean)
-            .join(" | ")
-        : bodyText;
+      if (!response.ok) {
+        await consumeBoundedBody(response, signal);
+        if (signal.aborted) throw upstreamError("aborted", undefined, false);
+        const classification = classifyStatus(response.status);
+        throw upstreamError(classification.category, response.status, classification.retryable);
+      }
 
-      throw new Error(
-        `Zendesk API error ${response.status} ${response.statusText}${detail ? `: ${detail}` : ""}`,
-      );
+      try {
+        return (await awaitWithAbort(response.json(), signal)) as T;
+      } catch (error) {
+        if (signal.aborted) throw upstreamError("aborted", undefined, false);
+        if (error instanceof ZendeskUpstreamError) throw error;
+        throw upstreamError("invalid_response", response.status, false);
+      }
+    } catch (error) {
+      if (error instanceof ZendeskUpstreamError || error instanceof ReauthorizationRequiredError) {
+        throw error;
+      }
+      if (signal.aborted) throw upstreamError("aborted", undefined, false);
+      throw upstreamError("temporarily_unavailable", undefined, true);
+    } finally {
+      dispose();
     }
-
-    return (await response.json()) as T;
   }
 
-  async getTicket(ticketId: number): Promise<ZendeskTicket> {
-    const data = await this.request<{ ticket: TicketPayload }>(`/tickets/${ticketId}.json`);
+  async getTicket(ticketId: number, signal?: AbortSignal): Promise<ZendeskTicket> {
+    const data = await this.request<{ ticket: TicketPayload }>(
+      `/tickets/${ticketId}.json`,
+      undefined,
+      signal,
+    );
     return normalizeTicket(data.ticket);
   }
 
