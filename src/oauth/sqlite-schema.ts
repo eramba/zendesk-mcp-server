@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 export const SQLITE_MIGRATIONS = [
   {
@@ -155,6 +155,24 @@ CREATE INDEX refresh_generations_family_idx ON refresh_token_generations(family_
 CREATE INDEX revocation_outbox_due_idx ON revocation_outbox(status, next_attempt_at, claim_expires_at);
 CREATE INDEX token_families_principal_idx ON token_families(principal_id, revoked_at);
 CREATE INDEX staged_grants_recovery_idx ON staged_grants(status, expires_at);
+`,
+  },
+  {
+    version: 2,
+    sql: `
+ALTER TABLE token_families ADD COLUMN redirect_uri TEXT;
+
+UPDATE token_families
+SET redirect_uri = (
+  SELECT oauth_client_redirect_uris.redirect_uri
+  FROM oauth_client_redirect_uris
+  WHERE oauth_client_redirect_uris.client_id = token_families.client_id
+)
+WHERE (
+  SELECT COUNT(*)
+  FROM oauth_client_redirect_uris
+  WHERE oauth_client_redirect_uris.client_id = token_families.client_id
+) = 1;
 `,
   },
 ] as const;

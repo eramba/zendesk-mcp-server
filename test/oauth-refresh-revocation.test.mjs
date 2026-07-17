@@ -283,6 +283,27 @@ test('an exact R1 retry inside 60 seconds returns the encrypted cached response'
   assert.equal(familyRows(path)[0].revoked_at, null)
 })
 
+test('issued and idempotent refreshes preserve the exact family redirect binding', async (t) => {
+  const { path, store } = await fixture(t)
+  const client = store.registerClient({
+    ...VALID_CLIENT,
+    client_name: 'Multiple redirects',
+    redirect_uris: ['http://127.0.0.1:43122/a', REDIRECT_URI],
+  })
+  const r1 = issueFamily(store, client.client_id, 'redirect-binding').tokens
+  assert.equal(query(path, 'SELECT redirect_uri FROM token_families')[0].redirect_uri, REDIRECT_URI)
+
+  const issued = store.rotateRefreshToken(refreshInput(client.client_id, r1.refresh_token))
+  assert.equal(issued.kind, 'issued')
+  assert.equal(query(path, 'SELECT redirect_uri FROM token_families')[0].redirect_uri, REDIRECT_URI)
+
+  const retry = store.rotateRefreshToken(refreshInput(client.client_id, r1.refresh_token, {
+    now: NOW + 30,
+  }))
+  assert.deepEqual(retry, { kind: 'idempotent', tokens: issued.tokens })
+  assert.equal(query(path, 'SELECT redirect_uri FROM token_families')[0].redirect_uri, REDIRECT_URI)
+})
+
 test('R1 at the retry deadline is replay, clears only retry ciphertext, and revokes its family', async (t) => {
   const { path, store, client } = await fixture(t)
   const r1 = issueFamily(store, client.client_id, 'after-window').tokens

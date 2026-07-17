@@ -11,15 +11,15 @@ import { openSqliteOAuthStore } from '../dist/oauth/sqlite-store.js'
 import { TokenCipher } from '../dist/oauth/token-cipher.js'
 
 const REDIRECT_URI = 'http://127.0.0.1:43123/callback'
+const MIN_REDIRECT_URI = 'http://127.0.0.1:43122/a'
 const RESOURCE = 'https://dev-server.tail22145b.ts.net/mcp'
 const CODE_CHALLENGE = 'C'.repeat(43)
 const MCP_SCOPES = ['zendesk:read', 'zendesk:write']
 const SUBDOMAIN = 'example'
 const DATABASE_PATH_SENTINEL = 'DATABASE_PATH_SENTINEL'
 const EMAIL_SENTINEL = 'operator-email-sentinel@example.test'
-const CIPHERTEXT_SENTINEL = 'CIPHERTEXT_SENTINEL'
 const VALID_CLIENT = {
-  redirect_uris: [REDIRECT_URI],
+  redirect_uris: [REDIRECT_URI, MIN_REDIRECT_URI],
   token_endpoint_auth_method: 'none',
   grant_types: ['authorization_code', 'refresh_token'],
   response_types: ['code'],
@@ -126,7 +126,15 @@ async function fixture(t) {
      ORDER BY token_families.created_at`,
   )
   const [firstFamily, secondFamily, otherFamily] = families
-  const unsafeClientName = `Codex\u001b[31m${CIPHERTEXT_SENTINEL}\nClient`
+  const storedCiphertextValues = query(
+    path,
+    'SELECT encrypted_grant_json AS envelope FROM zendesk_credentials ORDER BY principal_id',
+  ).flatMap(({ envelope }) => {
+    const encrypted = JSON.parse(envelope)
+    return [envelope, encrypted.nonce, encrypted.ciphertext, encrypted.tag]
+  })
+  assert.equal(storedCiphertextValues.length > 0, true)
+  const unsafeClientName = 'Codex\u001b[31mUnsafe\nClient'
   execute(path, 'UPDATE oauth_clients SET client_name = ? WHERE client_id = ?', unsafeClientName, client.client_id)
 
   const env = {
@@ -150,6 +158,7 @@ async function fixture(t) {
     firstFamily,
     secondFamily,
     otherFamily,
+    storedCiphertextValues,
   }
 }
 
@@ -182,13 +191,14 @@ function assertNoSensitiveOutput(result, fixtureValue) {
     fixtureValue.env.ZENDESK_OAUTH_CLIENT_SECRET,
     EMAIL_SENTINEL,
     fixtureValue.path,
+    ...fixtureValue.storedCiphertextValues,
   ]
   for (const secret of forbidden) {
     assert.equal(result.output.includes(secret), false, secret)
   }
 }
 
-test('sessions prints only safe session summaries and escapes stored terminal controls', async (t) => {
+test('sessions prints the exact non-minimum issuing redirect and no stored ciphertext', async (t) => {
   const seeded = await fixture(t)
   const result = await invoke(['sessions', '--zendesk-user-id', '123'], seeded.env)
 
@@ -210,7 +220,7 @@ test('sessions prints only safe session summaries and escapes stored terminal co
       'redirectUri',
       'status',
     ])
-    assert.equal(session.clientName, `Codex?[31m${CIPHERTEXT_SENTINEL}?Client`)
+    assert.equal(session.clientName, 'Codex?[31mUnsafe?Client')
     assert.equal(session.redirectUri, REDIRECT_URI)
     assert.equal(Number.isSafeInteger(session.createdAt), true)
     assert.equal(Number.isSafeInteger(session.lastUsedAt), true)

@@ -1804,8 +1804,8 @@ class SqliteOAuthStore implements LifecycleStore {
         .prepare(
           `INSERT INTO token_families (
              id, client_id, principal_id, principal_epoch, scopes, resource,
-             created_at, last_used_at, revoked_at, revoke_reason
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
+             redirect_uri, created_at, last_used_at, revoked_at, revoke_reason
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
         )
         .run(
           familyId,
@@ -1814,6 +1814,7 @@ class SqliteOAuthStore implements LifecycleStore {
           code.principal_epoch,
           MCP_SCOPE,
           code.resource,
+          code.redirect_uri,
           input.now,
           input.now,
         );
@@ -2184,7 +2185,7 @@ class SqliteOAuthStore implements LifecycleStore {
     type SessionRow = {
       family_id: string;
       client_name: string | null;
-      redirect_uri: string;
+      redirect_uri: string | null;
       created_at: number;
       last_used_at: number;
       expires_at: number;
@@ -2194,7 +2195,7 @@ class SqliteOAuthStore implements LifecycleStore {
       .prepare<[string, string], SessionRow>(
         `SELECT token_families.id AS family_id,
                 oauth_clients.client_name,
-                MIN(oauth_client_redirect_uris.redirect_uri) AS redirect_uri,
+                token_families.redirect_uri,
                 token_families.created_at,
                 token_families.last_used_at,
                 MAX(refresh_token_generations.expires_at) AS expires_at,
@@ -2202,31 +2203,35 @@ class SqliteOAuthStore implements LifecycleStore {
          FROM token_families
          JOIN principals ON principals.id = token_families.principal_id
          JOIN oauth_clients ON oauth_clients.client_id = token_families.client_id
-         JOIN oauth_client_redirect_uris
-           ON oauth_client_redirect_uris.client_id = token_families.client_id
          JOIN refresh_token_generations
            ON refresh_token_generations.family_id = token_families.id
          WHERE principals.subdomain = ? AND principals.zendesk_user_id = ?
          GROUP BY token_families.id, oauth_clients.client_name,
+                  token_families.redirect_uri,
                   token_families.created_at, token_families.last_used_at,
                   token_families.revoked_at
          ORDER BY token_families.created_at, token_families.id`,
       )
       .all(subdomain, zendeskUserId)
-      .map((row) => ({
-        familyId: row.family_id,
-        clientName: row.client_name,
-        redirectUri: row.redirect_uri,
-        createdAt: row.created_at,
-        lastUsedAt: row.last_used_at,
-        expiresAt: row.expires_at,
-        status:
-          row.revoked_at !== null
-            ? "revoked" as const
-            : row.expires_at <= now
-              ? "expired" as const
-              : "active" as const,
-      }));
+      .map((row) => {
+        if (row.redirect_uri === null) {
+          throw new Error("OAuth session redirect is unavailable");
+        }
+        return {
+          familyId: row.family_id,
+          clientName: row.client_name,
+          redirectUri: row.redirect_uri,
+          createdAt: row.created_at,
+          lastUsedAt: row.last_used_at,
+          expiresAt: row.expires_at,
+          status:
+            row.revoked_at !== null
+              ? "revoked" as const
+              : row.expires_at <= now
+                ? "expired" as const
+                : "active" as const,
+        };
+      });
   }
 
   revokeFamilyById(familyId: string, now: number): RevokeFamilyResult {

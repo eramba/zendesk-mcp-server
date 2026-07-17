@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
+import Database from 'better-sqlite3'
+
+import { SQLITE_MIGRATIONS } from '../dist/oauth/sqlite-schema.js'
 import { openSqliteOAuthStore } from '../dist/oauth/sqlite-store.js'
 import { TokenCipher } from '../dist/oauth/token-cipher.js'
 
@@ -26,7 +29,7 @@ test('new store migrates once with durable SQLite pragmas and restrictive modes'
     trustedSchema: 0,
     secureDelete: 1,
   })
-  assert.equal(store.inspectForTest().schemaVersion, 1)
+  assert.equal(store.inspectForTest().schemaVersion, 2)
   assert.equal((await stat(directory)).mode & 0o777, 0o700)
   assert.equal((await stat(path)).mode & 0o777, 0o600)
 })
@@ -38,8 +41,84 @@ test('migration and key check are idempotent across restart', async (t) => {
   openSqliteOAuthStore({ path, cipher: new TokenCipher(key) }).close()
   const reopened = openSqliteOAuthStore({ path, cipher: new TokenCipher(key) })
   t.after(() => reopened.close())
-  assert.equal(reopened.inspectForTest().schemaVersion, 1)
-  assert.equal(reopened.inspectForTest().migrationCount, 1)
+  assert.equal(reopened.inspectForTest().schemaVersion, 2)
+  assert.equal(reopened.inspectForTest().migrationCount, 2)
+})
+
+test('version 2 migration backfills only unambiguous legacy family redirects', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'zendesk-oauth-v1-migration-'))
+  const path = join(directory, 'oauth.sqlite')
+  const key = Buffer.alloc(32, 16)
+  const cipher = new TokenCipher(key)
+  const db = new Database(path)
+  db.exec(SQLITE_MIGRATIONS[0].sql)
+  db.prepare('INSERT INTO store_metadata (key, value) VALUES (?, ?)').run(
+    'encryption_key_check',
+    JSON.stringify(cipher.encrypt('oauth-key-check-sentinel', {
+      kind: 'key_check',
+      rowId: 'store-key-check',
+      expiresAt: 253402300799,
+    })),
+  )
+  db.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)').run(1_700_000_000)
+  const insertClient = db.prepare(`
+    INSERT INTO oauth_clients (
+      client_id, client_id_issued_at, token_endpoint_auth_method,
+      grant_types_json, response_types_json, scope, client_name,
+      metadata_json, created_at
+    ) VALUES (?, ?, 'none', '["authorization_code","refresh_token"]', '["code"]',
+              'zendesk:read zendesk:write', ?, '{}', ?)
+  `)
+  const insertRedirect = db.prepare(
+    'INSERT INTO oauth_client_redirect_uris (client_id, redirect_uri) VALUES (?, ?)',
+  )
+  const insertPrincipal = db.prepare(`
+    INSERT INTO principals (
+      id, subdomain, zendesk_user_id, status, lifecycle_epoch,
+      disconnected_at, created_at, updated_at
+    ) VALUES (?, 'example', ?, 'active', 1, NULL, ?, ?)
+  `)
+  const insertFamily = db.prepare(`
+    INSERT INTO token_families (
+      id, client_id, principal_id, principal_epoch, scopes, resource,
+      created_at, last_used_at, revoked_at, revoke_reason
+    ) VALUES (?, ?, ?, 1, 'zendesk:read zendesk:write',
+              'https://example.test/mcp', ?, ?, NULL, NULL)
+  `)
+  const insertRefresh = db.prepare(`
+    INSERT INTO refresh_token_generations (
+      token_hash, family_id, generation, status, created_at, expires_at,
+      consumed_at, successor_generation, encrypted_retry_response_json,
+      retry_response_expires_at
+    ) VALUES (?, ?, 1, 'current', ?, ?, NULL, NULL, NULL, NULL)
+  `)
+
+  insertClient.run('single-client', 1_700_000_000, 'Single redirect', 1_700_000_000)
+  insertRedirect.run('single-client', 'http://127.0.0.1:43123/callback')
+  insertPrincipal.run('single-principal', '101', 1_700_000_000, 1_700_000_000)
+  insertFamily.run('A'.repeat(43), 'single-client', 'single-principal', 1_700_000_000, 1_700_000_000)
+  insertRefresh.run('single-refresh-hash', 'A'.repeat(43), 1_700_000_000, 1_800_000_000)
+
+  insertClient.run('multi-client', 1_700_000_001, 'Multiple redirects', 1_700_000_001)
+  insertRedirect.run('multi-client', 'http://127.0.0.1:43122/a')
+  insertRedirect.run('multi-client', 'http://127.0.0.1:43123/callback')
+  insertPrincipal.run('multi-principal', '202', 1_700_000_001, 1_700_000_001)
+  insertFamily.run('B'.repeat(43), 'multi-client', 'multi-principal', 1_700_000_001, 1_700_000_001)
+  insertRefresh.run('multi-refresh-hash', 'B'.repeat(43), 1_700_000_001, 1_800_000_001)
+  db.close()
+
+  const store = openSqliteOAuthStore({ path, cipher, now: () => 1_700_000_010 })
+  t.after(() => store.close())
+  assert.equal(store.inspectForTest().schemaVersion, 2)
+  assert.equal(store.inspectForTest().migrationCount, 2)
+  assert.equal(
+    store.listSessions('example', '101', 1_700_000_010)[0].redirectUri,
+    'http://127.0.0.1:43123/callback',
+  )
+  assert.throws(
+    () => store.listSessions('example', '202', 1_700_000_010),
+    /session redirect is unavailable/i,
+  )
 })
 
 test('wrong restore key and unknown newer schema fail closed', async () => {
@@ -52,9 +131,8 @@ test('wrong restore key and unknown newer schema fail closed', async () => {
     /encryption key/i,
   )
 
-  const Database = (await import('better-sqlite3')).default
   const db = new Database(path)
-  db.prepare('UPDATE schema_migrations SET version = 999').run()
+  db.prepare('INSERT INTO schema_migrations (version, applied_at) VALUES (999, ?)').run(1_700_000_001)
   db.close()
   assert.throws(
     () => openSqliteOAuthStore({ path, cipher: new TokenCipher(Buffer.alloc(32, 6)) }),
@@ -68,7 +146,6 @@ test('an initialized store with a missing key check fails closed for every key',
   const originalKey = Buffer.alloc(32, 11)
   openSqliteOAuthStore({ path, cipher: new TokenCipher(originalKey) }).close()
 
-  const Database = (await import('better-sqlite3')).default
   const db = new Database(path)
   db.prepare("DELETE FROM store_metadata WHERE key = 'encryption_key_check'").run()
   db.close()
@@ -84,7 +161,6 @@ test('an initialized store with a missing key check fails closed for every key',
 test('store fails closed when an effective security pragma does not match', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'zendesk-oauth-pragma-mismatch-'))
   const path = join(directory, 'oauth.sqlite')
-  const Database = (await import('better-sqlite3')).default
   const originalPragma = Database.prototype.pragma
   Database.prototype.pragma = function (source, options) {
     if (source === 'trusted_schema = OFF') return []
@@ -137,7 +213,6 @@ test('backup destination is mode 0600 before and after SQLite writes', async (t)
 test('failed backup removes its pre-created private destination', async (t) => {
   const { directory, store } = await fixture(t, Buffer.alloc(32, 15))
   const backup = join(directory, 'failed-backup.sqlite')
-  const Database = (await import('better-sqlite3')).default
   const originalBackup = Database.prototype.backup
   Database.prototype.backup = async function (destination) {
     assert.equal(existsSync(destination) ? statSync(destination).mode & 0o777 : null, 0o600)
