@@ -1,0 +1,11 @@
+.git
+.gitignore
+.env
+.env.*
+node_modules
+dist
+coverage
+.idea
+.DS_Store
+docs
+test
