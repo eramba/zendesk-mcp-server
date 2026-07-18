@@ -12,111 +12,234 @@ A Model Context Protocol server for Zendesk, rewritten in TypeScript from [`remi
 - Zod input validation for tools/prompts
 - Consistent MCP tool error payloads (`isError` + message)
 - Help Center resource caching (1-hour TTL)
+- Per-user OAuth for Streamable HTTP while stdio keeps API-token authentication
 
 ## Requirements
 
 - Node.js 20+
-- Zendesk API token
+- For stdio: a Zendesk email and API token
+- For Streamable HTTP: a Zendesk OAuth client, an HTTPS public origin reachable by each user's browser, and persistent encrypted SQLite storage
 
 ## Setup
 
+Install and build once for either transport:
+
 ```bash
 npm install
-cp .env.example .env
-# edit .env with your credentials
 npm run build
 ```
 
-Run over stdio:
+### Stdio
+
+Stdio keeps the original single-user Zendesk API-token flow. Copy the stdio-only template, fill in the three Zendesk values, and start the server:
 
 ```bash
+cp .env.stdio.example .env
 npm start
 ```
 
-For local development:
-
-```bash
-npm run dev
-```
+For local development, use `npm run dev`. The Claude MCP configuration example below is also stdio-only.
 
 ### Streamable HTTP
 
-Build and start the HTTP transport locally:
+HTTP is OAuth-only and does not use the stdio email or API token. Copy the HTTP template and keep the populated file readable only by its owner:
 
 ```bash
-npm run build
-MCP_BEARER_TOKEN="$(openssl rand -hex 32)" \
-MCP_ALLOWED_HOSTS="localhost,127.0.0.1" \
-npm run start:http
+cp .env.http.example .env
+chmod 0600 .env
 ```
 
-The endpoints are `POST /mcp` and `GET /healthz`. `GET /mcp` and `DELETE /mcp` return `405` because the server is stateless.
+Set `PUBLIC_BASE_URL` to the origin only, for example `https://dev-server.tail22145b.ts.net`, and include that hostname in `MCP_ALLOWED_HOSTS`. Generate `OAUTH_ENCRYPTION_KEY` as a base64-encoded 32-byte key and place `OAUTH_DB_PATH` on persistent storage.
+
+Create a Zendesk OAuth client with the exact registered callback `${PUBLIC_BASE_URL}/oauth/zendesk/callback`, then set its client ID and secret in the HTTP environment. The Zendesk client must request exactly the upstream scopes `read tickets:write`.
+
+The public endpoints include `POST /mcp`, `GET /healthz`, OAuth metadata, registration, authorization, token, revocation, consent, and the Zendesk callback. `GET /mcp` and `DELETE /mcp` return authenticated `405` responses because the MCP transport is stateless.
 
 ### Docker Compose deployment
 
-The default deployment publishes plain HTTP only on the host loopback address, `127.0.0.1:38184`. Tailscale Serve provides the tailnet-only HTTPS endpoint:
-
-```text
-https://dev-server.tail22145b.ts.net/mcp
-```
-
-Create `.env` from `.env.example`, keep it mode `0600`, set the three `ZENDESK_*` values, and generate the server token with `openssl rand -hex 32`. Then run:
+The Compose deployment publishes plain HTTP only on host loopback at `127.0.0.1:38184` and persists encrypted OAuth state in the `oauth-data` volume:
 
 ```bash
 docker compose config
 docker compose up -d --build --wait
 docker compose ps
 docker compose logs --tail=50 zendesk-mcp
+```
+
+Proxy the full local origin through Tailscale Serve, not only the `/mcp` path, so discovery metadata, browser consent, and callback routes all remain reachable:
+
+```bash
 sudo tailscale serve --bg http://127.0.0.1:38184
 tailscale serve status
 ```
 
-Update an existing checkout with:
+Do not bind the plain-HTTP listener to a public or tailnet interface. Tailscale Serve terminates HTTPS on port `443`; tailnet grants control which users can reach it. The browser completing login must be connected to the tailnet.
 
-```bash
-git pull --ff-only origin master
-docker compose up -d --build --wait
-```
-
-Do not bind the plain-HTTP service to a public or tailnet interface. Tailscale Serve terminates HTTPS on port `443` and proxies to the loopback-only service; tailnet grants control which clients can connect.
-
-### Codex URL configuration
-
-```toml
-[mcp_servers.zendesk]
-url = "https://dev-server.tail22145b.ts.net/mcp"
-bearer_token_env_var = "ZENDESK_MCP_BEARER_TOKEN"
-```
-
-Set `ZENDESK_MCP_BEARER_TOKEN` to the shared MCP token on each trusted client. Do not copy `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`, or `ZENDESK_API_KEY` to clients.
-
-For a shell-launched Codex process on macOS or Linux:
-
-```bash
-export ZENDESK_MCP_BEARER_TOKEN='the-shared-mcp-token'
-```
-
-For the macOS Codex app in the current login session:
-
-```bash
-launchctl setenv ZENDESK_MCP_BEARER_TOKEN 'the-shared-mcp-token'
-```
-
-Fully quit and reopen the Codex app after changing its environment. Linux services must receive the same variable through their service manager and be restarted.
-
-Verify a configured endpoint without returning ticket data:
+Verify readiness and OAuth discovery without a copied credential or Zendesk call:
 
 ```bash
 MCP_URL=https://dev-server.tail22145b.ts.net/mcp npm run smoke:http
 ```
 
+### Codex URL configuration and login
+
+Configure only the URL:
+
+```toml
+[mcp_servers.zendesk]
+url = "https://dev-server.tail22145b.ts.net/mcp"
+```
+
+Then begin the standards-based browser flow and complete both the local consent page and Zendesk authorization:
+
+```bash
+codex mcp login zendesk
+```
+
+Each user signs in with their own Zendesk account. Zendesk remains authoritative for role and object permissions, and HTTP requests run under the audit identity of the authorizing user.
+
 ## Environment variables
+
+Use `.env.stdio.example` for stdio:
 
 - `ZENDESK_SUBDOMAIN`
 - `ZENDESK_EMAIL`
 - `ZENDESK_API_KEY`
 
-## Claude MCP config example
+Use `.env.http.example` for HTTP:
+
+- `PUBLIC_BASE_URL`
+- `ZENDESK_SUBDOMAIN`
+- `ZENDESK_OAUTH_CLIENT_ID`
+- `ZENDESK_OAUTH_CLIENT_SECRET`
+- `OAUTH_ENCRYPTION_KEY`
+- `OAUTH_DB_PATH`
+- `MCP_ALLOWED_HOSTS`, `HOST`, and `PORT`
+- `MCP_ACCESS_TOKEN_TTL_SECONDS` and `ZENDESK_HTTP_TIMEOUT_MS`
+- `MCP_BIND_ADDRESS` and `MCP_HOST_PORT`
+
+Do not combine the templates. In particular, the HTTP deployment must not receive the stdio email or API token.
+
+## OAuth session operations
+
+`codex mcp logout zendesk` is client-local only: it deletes the current Codex token record but does not call server revocation. The already issued access token can therefore remain server-valid for at most its 15-minute lifetime, and a copied refresh token remains valid until server expiry or explicit revocation.
+
+For server-side action, first list the non-secret sessions for the stable Zendesk user ID:
+
+```bash
+docker compose exec zendesk-mcp npm run oauth:sessions -- --zendesk-user-id <id>
+```
+
+Revoke exactly one MCP token family after confirming its opaque family ID:
+
+```bash
+docker compose exec zendesk-mcp npm run oauth:revoke-family -- --family-id <id> --confirm
+```
+
+This leaves the principal's Zendesk credential available to other active families. To invalidate all families for one principal and queue best-effort upstream Zendesk revocation, inspect the target first and then run:
+
+```bash
+docker compose exec zendesk-mcp npm run oauth:disconnect-user -- --zendesk-user-id <id> --confirm
+```
+
+Disconnect is the account-wide server operation. It increments the principal lifecycle epoch, revokes all of that principal's MCP families, prevents requests from using the credential, and retains failed upstream revocation in the durable retry outbox.
+
+Acceptance criteria: the selected family or principal becomes unusable, sessions belonging to other principals remain usable, and no command output contains an email, token, encryption key, database contents, or ciphertext.
+
+### Ordinary re-login tradeoff
+
+An ordinary re-login immediately replaces the locally usable Zendesk credential and securely removes the superseded local ciphertext, but intentionally does not revoke the superseded upstream grant. This avoids an `A -> B -> A` race in which a delayed revoke could delete the new credential. The old grant can therefore remain orphaned until Zendesk expiry. Use short Zendesk token lifetimes and the Zendesk tenant-side token audit/revocation flow to recover from a suspected orphaned grant.
+
+## Backup and restore
+
+Create a new encrypted SQLite backup through the store's consistent backup API; the destination is create-only and must be a new absolute path below `/data/backups/`:
+
+```bash
+docker compose exec zendesk-mcp npm run oauth:backup -- --destination /data/backups/<new-name>.sqlite
+```
+
+Keep the OAuth encryption key in separate custody from both the live volume and its backups. A database backup without the matching key is intentionally unrecoverable; storing both together removes the protection against database theft.
+
+Use this restore procedure:
+
+1. Place the completed consistent backup in a protected restore-input directory as a protected root-owned backup with mode `0600`. If recovery uses a separately captured SQLite snapshot instead, checkpoint that snapshot before copying it; never copy the live `oauth.sqlite`, `-wal`, and `-shm` files independently.
+2. In one Bash shell, resolve the exact already-built application image ID and generate a collision-resistant disposable-volume name locally. The name is non-empty and regex-validated before use. An owner nonce label plus the guarded exit trap ensures cleanup can remove only the volume created by this procedure; a pre-existing collision with a different or missing label is never removed. Override the image user to root for the copy step only so it can read the protected root-owned input, then hand the restored database back to the runtime user before the helper exits:
+
+   ```bash
+   set -euo pipefail
+   RESTORE_IMAGE="$(docker compose images --quiet zendesk-mcp)"
+   test -n "$RESTORE_IMAGE"
+
+   RESTORE_DRILL_NONCE="$(openssl rand -hex 16)"
+   [[ "$RESTORE_DRILL_NONCE" =~ ^[0-9a-f]{32}$ ]] || exit 1
+   RESTORE_DRILL_VOLUME="zendesk-oauth-restore-drill-${RESTORE_DRILL_NONCE}"
+   [[ "$RESTORE_DRILL_VOLUME" =~ ^zendesk-oauth-restore-drill-[0-9a-f]{32}$ ]] || exit 1
+   readonly RESTORE_DRILL_NONCE RESTORE_DRILL_VOLUME
+   RESTORE_DRILL_CREATED=false
+
+   cleanup_restore_drill() {
+     [[ "$RESTORE_DRILL_CREATED" == true ]] || return 0
+     local owned_nonce
+     owned_nonce="$(docker volume inspect --format '{{ index .Labels "zendesk.oauth.restore-drill" }}' "$RESTORE_DRILL_VOLUME")"
+     [[ "$owned_nonce" == "$RESTORE_DRILL_NONCE" ]] || return 1
+     docker volume rm "$RESTORE_DRILL_VOLUME"
+     RESTORE_DRILL_CREATED=false
+   }
+   trap cleanup_restore_drill EXIT
+
+   docker volume create --label "zendesk.oauth.restore-drill=$RESTORE_DRILL_NONCE" "$RESTORE_DRILL_VOLUME" >/dev/null
+   owned_nonce="$(docker volume inspect --format '{{ index .Labels "zendesk.oauth.restore-drill" }}' "$RESTORE_DRILL_VOLUME")"
+   [[ "$owned_nonce" == "$RESTORE_DRILL_NONCE" ]] || exit 1
+   RESTORE_DRILL_CREATED=true
+
+   docker run --rm --network none --user root \
+     --mount type=bind,source="$PWD/restore-input",target=/restore-input,readonly \
+     --mount type=volume,source="$RESTORE_DRILL_VOLUME",target=/data \
+     --entrypoint sh "$RESTORE_IMAGE" \
+     -c 'cp /restore-input/<new-name>.sqlite /data/oauth.sqlite && chown node:node /data/oauth.sqlite && chmod 0600 /data/oauth.sqlite'
+   ```
+
+3. Load the exact `ZENDESK_SUBDOMAIN` and the matching separately held `OAUTH_ENCRYPTION_KEY` into the operator shell without printing them. Verify the disposable database with the same exact image in a one-off, network-isolated admin process. Do not set `--user`: the image's default `USER node` must read the restored `node:node` database.
+
+   ```bash
+   docker run --rm --network none \
+     --mount type=volume,source="$RESTORE_DRILL_VOLUME",target=/data \
+     --entrypoint node \
+     --env ZENDESK_SUBDOMAIN \
+     --env OAUTH_ENCRYPTION_KEY \
+     --env OAUTH_DB_PATH=/data/oauth.sqlite \
+     "$RESTORE_IMAGE" \
+     scripts/oauth-admin.mjs sessions --zendesk-user-id <known-id>
+   ```
+
+   This invokes only the read-only `sessions` administration command. It does not start the HTTP entrypoint or revocation worker, and `--network none` makes an upstream mutation impossible. A missing or wrong key or subdomain must fail closed.
+4. In the same Bash shell, explicitly invoke the guarded cleanup after recording only the non-secret session result, then disable the exit trap. The trap runs the same guarded cleanup automatically if an earlier command fails:
+
+   ```bash
+   cleanup_restore_drill
+   trap - EXIT
+   ```
+
+5. For disaster recovery, keep the original volume untouched until the disposable-volume drill passes, then switch the deployment to a restored replacement volume during a maintenance window.
+
+Acceptance criteria: only the seed helper runs as root; it produces `/data/oauth.sqlite` owned by `node:node` with mode `0600`; every drill starts from a newly generated, validated, owner-labeled volume without stale database or WAL state; the consistent-backup or checkpointed-snapshot restore then opens as the image's default non-root `node` user only with the matching separately held key and subdomain, reports the expected non-secret sessions from the exact image, starts no HTTP process or worker, has no network, removes only the disposable volume created by this procedure, and does not modify the source backup or live volume.
+
+## Maintenance-window cutover and rollback
+
+Use one maintenance window for the OAuth-only HTTP cutover:
+
+1. Inventory every URL-based Codex client plus the deployed image, HTTP environment, and client configuration. Capture only redacted configuration; never print credential values.
+2. Secure a rollback copy, deploy the OAuth image and persistent volume, and replace the HTTP environment with `.env.http.example` values. Stdio remains on `.env.stdio.example` and is not part of this cutover.
+3. For every client, retain only the URL. In a redacted configuration check, confirm `http_headers.Authorization`, `bearer_token_env_var`, and `env_http_headers.Authorization` are absent.
+4. Run `codex mcp login zendesk` for every inventoried client, then complete the authenticated acceptance gates before declaring the cutover complete.
+
+If a release gate fails, roll back the image, environment, and affected client config atomically to the secured pre-window set. Do not leave legacy shared authentication and OAuth active at the same time.
+
+Retire old shared credentials and secured rollback copies only after every inventoried client passes, the maintenance window is closed, and a separate approval confirms the exact retirement scope. Delayed secret retirement preserves a controlled rollback without prematurely destroying recoverable material.
+
+Acceptance criteria: every inventoried URL client has URL-only configuration and a distinct successful OAuth login; the redacted checks show all three static authorization fields absent; stdio behavior is unchanged; and rollback can restore image, environment, and client config as one unit until separately approved retirement.
+
+## Claude MCP config example (stdio)
 
 ```json
 {
@@ -167,6 +290,7 @@ MCP_URL=https://dev-server.tail22145b.ts.net/mcp npm run smoke:http
 Issues and pull requests are welcome at [github.com/eramba/zendesk-mcp-server](https://github.com/eramba/zendesk-mcp-server).
 
 When submitting changes:
+
 - Keep changes focused and small
 - Include clear reproduction/validation steps
 - Update documentation for any tool or behavior changes

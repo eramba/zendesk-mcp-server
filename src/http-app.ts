@@ -1,55 +1,60 @@
-import { timingSafeEqual } from "node:crypto";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { Express, Router } from "express";
+import {
+  createStandaloneHttpOperationTracker,
+  type HttpOperationTracker,
+  trackHttpHandler,
+} from "./http-operation-tracker.js";
+import type { ZendeskBrokerOAuthProvider } from "./oauth/zendesk-broker-provider.js";
+import type { ZendeskClientResolverLike } from "./oauth/zendesk-client-resolver.js";
 import { buildZendeskServer } from "./server.js";
-import { ZendeskClient } from "./zendesk-client.js";
 
 export type HttpAppOptions = {
   host: string;
   allowedHosts: string[];
-  bearerToken: string;
-  client: ZendeskClient;
+  provider: ZendeskBrokerOAuthProvider;
+  resolver: ZendeskClientResolverLike;
+  oauthRouter: Router;
+  resourceMetadataUrl: string;
+  isReady: () => boolean;
+  operationTracker?: HttpOperationTracker;
   serverFactory?: typeof buildZendeskServer;
 };
 
-function bearerMatches(header: string | undefined, expected: string): boolean {
-  if (!header) return false;
-  const match = /^Bearer ([^\s]+)$/i.exec(header);
-  if (!match) return false;
-
-  const actualBuffer = Buffer.from(match[1], "utf8");
-  const expectedBuffer = Buffer.from(expected, "utf8");
-  return (
-    actualBuffer.length === expectedBuffer.length &&
-    timingSafeEqual(actualBuffer, expectedBuffer)
-  );
-}
-
-export function createHttpApp({
-  host,
-  allowedHosts,
-  bearerToken,
-  client,
-  serverFactory = buildZendeskServer,
-}: HttpAppOptions) {
+export function createHttpApp(options: HttpAppOptions): Express {
+  const {
+    host,
+    allowedHosts,
+    provider,
+    resolver,
+    oauthRouter,
+    resourceMetadataUrl,
+    isReady,
+    operationTracker = createStandaloneHttpOperationTracker(),
+    serverFactory = buildZendeskServer,
+  } = options;
   const app = createMcpExpressApp({ host, allowedHosts });
 
   app.get("/healthz", (_req, res) => {
-    res.status(200).json({ ok: true });
+    const ready = isReady();
+    res.status(ready ? 200 : 503).json({ ok: ready });
   });
 
-  app.use("/mcp", (req, res, next) => {
-    if (!bearerMatches(req.headers.authorization, bearerToken)) {
-      res.setHeader("WWW-Authenticate", "Bearer");
-      res.status(401).json({
-        jsonrpc: "2.0",
-        error: { code: -32001, message: "Unauthorized" },
-        id: null,
-      });
-      return;
-    }
-    next();
-  });
+  app.use(oauthRouter);
+
+  app.use(
+    "/mcp",
+    trackHttpHandler(
+      operationTracker,
+      requireBearerAuth({
+        verifier: provider,
+        requiredScopes: ["zendesk:read", "zendesk:write"],
+        resourceMetadataUrl,
+      }),
+    ),
+  );
 
   app.get("/mcp", (_req, res) => {
     res.setHeader("Allow", "POST");
@@ -69,33 +74,62 @@ export function createHttpApp({
     });
   });
 
-  app.post("/mcp", async (req, res) => {
+  app.post("/mcp", trackHttpHandler(operationTracker, async (req, res) => {
     let server: ReturnType<typeof buildZendeskServer> | undefined;
     let transport: StreamableHTTPServerTransport | undefined;
-    let closed = false;
+    let responseClosed = false;
+    let resourcesClosed = false;
+    let resourcesClosing: Promise<void> | undefined;
 
-    const closeResources = async () => {
-      if (closed) return;
-      closed = true;
-      if (transport) await transport.close().catch(() => undefined);
-      if (server) await server.close().catch(() => undefined);
+    const closeResources = (): Promise<void> => {
+      if (resourcesClosing) return resourcesClosing;
+      if (resourcesClosed || (!transport && !server)) return Promise.resolve();
+      resourcesClosed = true;
+      const allocatedTransport = transport;
+      const allocatedServer = server;
+      resourcesClosing = (async () => {
+        if (allocatedTransport) {
+          await allocatedTransport.close().catch(() => undefined);
+        }
+        if (allocatedServer) await allocatedServer.close().catch(() => undefined);
+      })();
+      return resourcesClosing;
     };
 
     res.once("close", () => {
+      responseClosed = true;
       void closeResources();
     });
 
     try {
+      const principalId = req.auth?.extra?.principalId;
+      if (typeof principalId !== "string") {
+        throw new Error("Authenticated principal is unavailable");
+      }
+      const client = await resolver.resolve(principalId);
+      if (responseClosed) return;
       server = serverFactory(client);
+      if (responseClosed) {
+        await closeResources();
+        return;
+      }
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });
+      if (responseClosed) {
+        await closeResources();
+        return;
+      }
       await server.connect(transport);
+      if (responseClosed) {
+        await closeResources();
+        return;
+      }
       await transport.handleRequest(req, res, req.body);
-    } catch (error) {
+    } catch {
       await closeResources();
-      const message = error instanceof Error ? error.message : "Unknown error";
-      console.error("Error handling MCP request:", message);
+      if (responseClosed) return;
+      console.error("Error handling MCP request");
       if (!res.headersSent) {
         res.status(500).json({
           jsonrpc: "2.0",
@@ -104,7 +138,7 @@ export function createHttpApp({
         });
       }
     }
-  });
+  }));
 
   return app;
 }

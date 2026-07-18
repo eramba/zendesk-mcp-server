@@ -8,11 +8,10 @@ import { ZendeskClient } from "./zendesk-client.js";
 async function main() {
   const config = readZendeskConfig();
 
-  const client = new ZendeskClient(
-    config.subdomain,
-    config.email,
-    config.apiKey,
-  );
+  const client = new ZendeskClient({
+    subdomain: config.subdomain,
+    auth: { kind: "api_token", email: config.email, apiToken: config.apiKey },
+  });
   const server = buildZendeskServer(client);
 
   const transport = new StdioServerTransport();
