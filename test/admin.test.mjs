@@ -214,6 +214,29 @@ test('reset removes one local mapping before bounded upstream revocation', async
   assert.equal(result.stdout.join('\n').includes('refresh-reset-sentinel'), false)
 })
 
+test('reset accepts a user email without rendering the selector', async () => {
+  const { env } = await fixture()
+  const email = 'colleague@example.test'
+  const fakeStore = {
+    resetUserByEmail: (value) => {
+      assert.equal(value, email)
+      return { kind: 'reset' }
+    },
+    close: () => undefined,
+  }
+  const result = await command(
+    env,
+    ['reset', '--user-email', email, '--upstream'],
+    { openStore: () => fakeStore },
+  )
+
+  assert.equal(result.code, 0)
+  assert.equal(field(result.stdout, 'local'), 'reset')
+  assert.equal(field(result.stdout, 'upstream'), 'unavailable')
+  assert.equal(result.stdout.join('\n').includes(email), false)
+  assert.deepEqual(result.stderr, [])
+})
+
 test('revoke without upstream and backup report bounded outcomes and mode 0600', async () => {
   const { directory, env } = await fixture()
   const created = await command(env, ['create', '--label', 'Backup'])
@@ -237,6 +260,7 @@ test('invalid commands and identifiers fail with sanitized usage', async () => {
     ['retrieve', '--user', 'anything'],
     ['revoke', '--user', 'not-a-uuid'],
     ['reset', '--user', '00000000-0000-4000-8000-000000000098'],
+    ['reset', '--user-email', 'not-an-email', '--upstream'],
     ['backup', '--output', 'relative.sqlite'],
   ]) {
     const result = await command(env, argv)

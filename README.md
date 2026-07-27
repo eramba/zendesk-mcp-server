@@ -150,6 +150,7 @@ Reset one mapping when that person must repeat the complete self-service flow:
 
 ```bash
 npm run admin -- reset --user <uuid> --upstream
+npm run admin -- reset --user-email "colleague@example.com" --upstream
 ```
 
 The command atomically removes only the selected internal user, bearer, OAuth
@@ -157,6 +158,8 @@ grant, and invitation records, releasing that Zendesk identity for a new
 `/create-account` enrollment. Other users are unchanged. The mandatory
 `--upstream` flag makes one bounded attempt to revoke the captured Zendesk
 grant after the local reset and reports `succeeded`, `failed`, or `unavailable`.
+Email matching is case-insensitive and proceeds only when exactly one stored
+mapping matches; missing or ambiguous emails fail without resetting anyone.
 
 ### Codex MCP configuration
 
@@ -229,6 +232,7 @@ docker compose exec -T zendesk-mcp npm run admin -- list
 docker compose exec -T zendesk-mcp npm run admin -- reauthorize --user <uuid>
 docker compose exec -T zendesk-mcp npm run admin -- revoke --user <uuid>
 docker compose exec -T zendesk-mcp npm run admin -- reset --user <uuid> --upstream
+docker compose exec -T zendesk-mcp npm run admin -- reset --user-email "colleague@example.com" --upstream
 ```
 
 ### Backup

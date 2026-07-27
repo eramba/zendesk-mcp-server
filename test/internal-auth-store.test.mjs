@@ -727,6 +727,36 @@ test('reset deletes only the selected mapping and releases its Zendesk identity'
   })
 })
 
+test('email reset requires one case-insensitive exact mapping', async (t) => {
+  const { store } = await fixture(t)
+  const selected = store.createPendingUser('Selected')
+  const other = store.createPendingUser('Other')
+  const selectedSnapshot = activate(store, selected, '811', 'selected-reset')
+  activate(store, other, '812', 'other-reset')
+
+  assert.deepEqual(store.resetUserByEmail('SELECTED-RESET@EXAMPLE.TEST'), {
+    kind: 'reset',
+    capturedGrant: selectedSnapshot.grant,
+  })
+  assert.equal(store.authenticateBearer(selected.bearer), undefined)
+  assert.deepEqual(store.authenticateBearer(other.bearer), {
+    userId: other.userId,
+  })
+  assert.deepEqual(store.resetUserByEmail('missing@example.test'), {
+    kind: 'not_found',
+  })
+
+  const duplicateOne = store.createPendingUser('Duplicate one')
+  const duplicateTwo = store.createPendingUser('Duplicate two')
+  activate(store, duplicateOne, '813', 'duplicate-reset')
+  activate(store, duplicateTwo, '814', 'duplicate-reset')
+  assert.deepEqual(store.resetUserByEmail('duplicate-reset@example.test'), {
+    kind: 'ambiguous',
+  })
+  assert.ok(store.authenticateBearer(duplicateOne.bearer))
+  assert.ok(store.authenticateBearer(duplicateTwo.bearer))
+})
+
 test('reauthorization replaces expired invitations without a worker', async (t) => {
   const { clock, path, store } = await fixture(t)
   const created = store.createPendingUser('Martin')

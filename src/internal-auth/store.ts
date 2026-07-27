@@ -76,6 +76,11 @@ type StoreOptions = {
   now?: () => number;
 };
 
+type UserResetResult =
+  | { kind: "reset"; capturedGrant?: OAuthGrant }
+  | { kind: "not_found" }
+  | { kind: "ambiguous" };
+
 type UserInspectionRow = {
   id: string;
   label: string;
@@ -984,28 +989,49 @@ export class InternalAuthStore {
     return result;
   }
 
-  resetUser(userId: string):
-    | { kind: "reset"; capturedGrant?: OAuthGrant }
-    | { kind: "not_found" } {
-    const reset = this.#database.transaction(() => {
-      const user = this.#database
-        .prepare("SELECT 1 FROM internal_users WHERE id = ?")
-        .get(userId);
-      if (!user) return { kind: "not_found" as const };
+  #resetUserRecord(userId: string): UserResetResult {
+    const user = this.#database
+      .prepare("SELECT 1 FROM internal_users WHERE id = ?")
+      .get(userId);
+    if (!user) return { kind: "not_found" };
 
-      let capturedGrant: OAuthGrant | undefined;
-      try {
-        capturedGrant = this.loadCredential(userId)?.grant;
-      } catch {
-        capturedGrant = undefined;
-      }
-      const deleted = this.#database
-        .prepare("DELETE FROM internal_users WHERE id = ?")
-        .run(userId);
-      if (deleted.changes !== 1) throw new Error("unable to reset user");
-      return capturedGrant
-        ? { kind: "reset" as const, capturedGrant }
-        : { kind: "reset" as const };
+    let capturedGrant: OAuthGrant | undefined;
+    try {
+      capturedGrant = this.loadCredential(userId)?.grant;
+    } catch {
+      capturedGrant = undefined;
+    }
+    const deleted = this.#database
+      .prepare("DELETE FROM internal_users WHERE id = ?")
+      .run(userId);
+    if (deleted.changes !== 1) throw new Error("unable to reset user");
+    return capturedGrant
+      ? { kind: "reset", capturedGrant }
+      : { kind: "reset" };
+  }
+
+  resetUser(userId: string): UserResetResult {
+    const reset = this.#database.transaction(() =>
+      this.#resetUserRecord(userId),
+    );
+    const result = reset();
+    this.#restrictDatabaseFiles();
+    return result;
+  }
+
+  resetUserByEmail(email: string): UserResetResult {
+    const reset = this.#database.transaction(() => {
+      const matches = this.#database
+        .prepare(
+          `SELECT id FROM internal_users
+           WHERE zendesk_email COLLATE NOCASE = ?
+           ORDER BY id
+           LIMIT 2`,
+        )
+        .all(email) as Array<{ id: string }>;
+      if (matches.length === 0) return { kind: "not_found" as const };
+      if (matches.length > 1) return { kind: "ambiguous" as const };
+      return this.#resetUserRecord(matches[0].id);
     });
     const result = reset();
     this.#restrictDatabaseFiles();

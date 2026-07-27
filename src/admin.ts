@@ -20,7 +20,7 @@ const USAGE = [
   "  npm run admin -- reauthorize --user <uuid>",
   "  npm run admin -- list",
   "  npm run admin -- revoke --user <uuid> [--upstream]",
-  "  npm run admin -- reset --user <uuid> --upstream",
+  "  npm run admin -- reset (--user <uuid> | --user-email <email>) --upstream",
   "  npm run admin -- backup --output <absolute-path>",
 ].join("\n");
 
@@ -37,13 +37,22 @@ type ParsedCommand =
   | { kind: "reauthorize"; userId: string }
   | { kind: "list" }
   | { kind: "revoke"; userId: string; upstream: boolean }
-  | { kind: "reset"; userId: string }
+  | {
+      kind: "reset";
+      selector:
+        | { kind: "user_id"; value: string }
+        | { kind: "user_email"; value: string };
+    }
   | { kind: "backup"; output: string };
 
 function isUuid(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
     value,
   );
+}
+
+function isEmail(value: string): boolean {
+  return value.length <= 320 && /^[^@\s]+@[^@\s]+$/.test(value);
 }
 
 function parseCommand(argv: string[]): ParsedCommand | undefined {
@@ -81,11 +90,20 @@ function parseCommand(argv: string[]): ParsedCommand | undefined {
   if (
     command === "reset" &&
     args.length === 3 &&
-    args[0] === "--user" &&
-    isUuid(args[1]) &&
     args[2] === "--upstream"
   ) {
-    return { kind: "reset", userId: args[1] };
+    if (args[0] === "--user" && isUuid(args[1])) {
+      return {
+        kind: "reset",
+        selector: { kind: "user_id", value: args[1] },
+      };
+    }
+    if (args[0] === "--user-email" && isEmail(args[1])) {
+      return {
+        kind: "reset",
+        selector: { kind: "user_email", value: args[1] },
+      };
+    }
   }
   if (
     command === "backup" &&
@@ -165,9 +183,14 @@ export async function runAdmin(
 
     const localResult =
       command.kind === "reset"
-        ? store.resetUser(command.userId)
+        ? command.selector.kind === "user_id"
+          ? store.resetUser(command.selector.value)
+          : store.resetUserByEmail(command.selector.value)
         : store.revokeUser(command.userId);
-    if (localResult.kind === "not_found") {
+    if (
+      localResult.kind === "not_found" ||
+      localResult.kind === "ambiguous"
+    ) {
       stderr("Administration command failed");
       return 1;
     }
