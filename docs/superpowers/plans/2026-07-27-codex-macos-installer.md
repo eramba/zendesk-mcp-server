@@ -90,7 +90,7 @@ curl --fail --silent http://127.0.0.1:38184/healthz
 
 Expected: all commands exit 0, all tests pass, the audit reports no vulnerabilities, and the local container is healthy. Preserve the existing Docker volume and enrollment database.
 
-- [ ] **Step 6: Commit and push the scoped change**
+- [x] **Step 6: Commit and push the scoped change**
 
 ```bash
 git add src/internal-auth/link-handlers.ts test/oauth-linking.test.mjs docs/superpowers/specs/2026-07-27-codex-macos-installer-design.md docs/superpowers/plans/2026-07-27-codex-macos-installer.md
