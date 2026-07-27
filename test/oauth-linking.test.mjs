@@ -59,6 +59,7 @@ async function fixture(t, oauthOverrides = {}) {
         id: '4242',
         name: 'Authoritative Agent',
         email: 'authoritative@example.test',
+        role: 'agent',
       }
     },
     async revokeCurrent(accessToken) {

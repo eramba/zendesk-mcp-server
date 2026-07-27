@@ -37,6 +37,7 @@ try {
       id: '999001',
       name: 'Fake smoke user',
       email: 'fake-smoke@example.test',
+      role: 'agent',
     },
     grant: {
       accessToken: 'fake-access-token',

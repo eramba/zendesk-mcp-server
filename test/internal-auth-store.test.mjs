@@ -70,6 +70,7 @@ function activate(store, created, identityId, label = identityId) {
       id: identityId,
       name: `Agent ${label}`,
       email: `${label}@example.test`,
+      role: 'agent',
     },
     grant: grant(label),
   })
@@ -360,7 +361,7 @@ test('callback mismatch and duplicate identity do not activate another mapping',
       store.completeLink({
         ...secondClaim,
         userId: first.userId,
-        identity: { id: '303', name: null, email: null },
+        identity: { id: '303', name: null, email: null, role: 'agent' },
         grant: grant('mismatch'),
       }),
     /Unable to activate linked user/,
@@ -371,7 +372,12 @@ test('callback mismatch and duplicate identity do not activate another mapping',
     () =>
       store.completeLink({
         ...secondClaim,
-        identity: { id: '202', name: 'Duplicate', email: null },
+        identity: {
+          id: '202',
+          name: 'Duplicate',
+          email: null,
+          role: 'agent',
+        },
         grant: grant('duplicate'),
       }),
     /Unable to activate linked user/,

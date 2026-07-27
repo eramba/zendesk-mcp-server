@@ -35,6 +35,7 @@ function activate(store, label, identityId, userGrant = grant(label)) {
       id: identityId,
       name: label,
       email: `${label.toLowerCase()}@example.test`,
+      role: 'agent',
     },
     grant: userGrant,
   })
@@ -123,7 +124,12 @@ test('same-user expiring credentials refresh once and persist before callers con
     },
     currentUser: async (token) => {
       assert.equal(token, 'access-rotated-sentinel')
-      return { id: '101', name: 'Martin', email: 'martin@example.test' }
+      return {
+        id: '101',
+        name: 'Martin',
+        email: 'martin@example.test',
+        role: 'agent',
+      }
     },
   }
   const authorizations = []
@@ -179,7 +185,12 @@ test('caller abort does not cancel a shared refresh for another caller', async (
     },
     currentUser: async (token) => {
       assert.equal(token, 'access-rotated-sentinel')
-      return { id: '101', name: 'Martin', email: 'martin@example.test' }
+      return {
+        id: '101',
+        name: 'Martin',
+        email: 'martin@example.test',
+        role: 'agent',
+      }
     },
   }
   const authorizations = []
@@ -249,6 +260,7 @@ test('different users refresh independently and preserve their identity boundary
       id: token.includes('first') ? '301' : '302',
       name: null,
       email: null,
+      role: 'agent',
     }),
   }
   const resolver = new UserClientResolver({
@@ -283,7 +295,12 @@ test('invalid_grant and refreshed identity mismatch disable only the affected ma
       }
       return grant('mismatch-new')
     },
-    currentUser: async () => ({ id: '999', name: null, email: null }),
+    currentUser: async () => ({
+      id: '999',
+      name: null,
+      email: null,
+      role: 'agent',
+    }),
   }
   const resolver = new UserClientResolver({
     store,
@@ -380,4 +397,37 @@ test('transient refresh failures are sanitized and do not disable any mapping', 
     assert.equal(rendered.includes(secret), false)
   }
   assert.equal(store.inspectUsers().find(({ id }) => id === created.userId).status, 'active')
+})
+
+test('demoted users fail refresh closed even when their Zendesk identity still matches', async (t) => {
+  const { store } = await fixture(t)
+  const created = activate(store, 'Demoted', '701', grant('old', NOW + 30))
+  const oauth = {
+    refresh: async () => grant('rotated'),
+    currentUser: async () => ({
+      id: '701',
+      name: 'Demoted',
+      email: 'demoted@example.test',
+      role: 'end-user',
+    }),
+  }
+  const resolver = new UserClientResolver({
+    store,
+    oauth,
+    subdomain: 'acme',
+    now: () => NOW,
+    fetch: ticketFetch([]),
+  })
+
+  await assert.rejects(
+    resolver.resolve(created.userId),
+    (error) =>
+      error instanceof SafeAuthError &&
+      error.category === 'reauthorization_required',
+  )
+  assert.equal(store.loadCredential(created.userId), undefined)
+  assert.equal(
+    store.inspectUsers().find(({ id }) => id === created.userId).status,
+    'reauthorization_required',
+  )
 })

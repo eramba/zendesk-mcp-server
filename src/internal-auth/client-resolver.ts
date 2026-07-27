@@ -7,7 +7,10 @@ import type {
   CredentialSnapshot,
   InternalAuthStore,
 } from "./store.js";
-import type { ZendeskOAuthGateway } from "./zendesk-oauth.js";
+import {
+  isEligibleZendeskIdentity,
+  type ZendeskOAuthGateway,
+} from "./zendesk-oauth.js";
 
 export interface UserClientResolverLike {
   resolve(userId: string, signal?: AbortSignal): Promise<ZendeskClient>;
@@ -201,7 +204,10 @@ export class UserClientResolver implements UserClientResolverLike {
         grant.accessToken,
         signal,
       );
-      if (identity.id !== snapshot.zendeskUserId) {
+      if (
+        identity.id !== snapshot.zendeskUserId ||
+        !isEligibleZendeskIdentity(identity)
+      ) {
         return this.#disable(snapshot);
       }
       const installed = this.#store.installRefreshedGrant({

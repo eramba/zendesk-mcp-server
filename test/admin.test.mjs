@@ -95,7 +95,12 @@ test('reauthorize prints only a new one-time link and never a bearer', async () 
   const claimed = store.claimCallback(state)
   store.completeLink({
     ...claimed,
-    identity: { id: '901', name: 'Adrian', email: 'adrian@example.test' },
+    identity: {
+      id: '901',
+      name: 'Adrian',
+      email: 'adrian@example.test',
+      role: 'agent',
+    },
     grant: {
       accessToken: 'access-admin-sentinel',
       refreshToken: 'refresh-admin-sentinel',

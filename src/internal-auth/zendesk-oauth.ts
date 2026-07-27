@@ -1,4 +1,4 @@
-import type { OAuthGrant } from "./store.js";
+import type { OAuthGrant, ZendeskIdentity } from "./store.js";
 import {
   SafeAuthError,
   type SafeAuthErrorCategory,
@@ -17,7 +17,7 @@ export interface ZendeskOAuthGateway {
   currentUser(
     accessToken: string,
     signal?: AbortSignal,
-  ): Promise<{ id: string; name: string | null; email: string | null }>;
+  ): Promise<ZendeskIdentity>;
   revokeCurrent(accessToken: string, signal?: AbortSignal): Promise<void>;
 }
 
@@ -47,6 +47,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isPositiveSafeInteger(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+export function isEligibleZendeskIdentity(
+  identity: ZendeskIdentity,
+): boolean {
+  return identity.role === "agent" || identity.role === "admin";
 }
 
 function parseTokenResponse(value: unknown): TokenResponse | undefined {
@@ -231,7 +237,7 @@ export class ZendeskOAuthClient implements ZendeskOAuthGateway {
   async currentUser(
     accessToken: string,
     signal?: AbortSignal,
-  ): Promise<{ id: string; name: string | null; email: string | null }> {
+  ): Promise<ZendeskIdentity> {
     const body = await this.#requestJson(
       "/api/v2/users/me.json",
       {
@@ -246,10 +252,12 @@ export class ZendeskOAuthClient implements ZendeskOAuthGateway {
     const id = body.user.id;
     const name = body.user.name;
     const email = body.user.email;
+    const role = body.user.role;
     if (
       !isPositiveSafeInteger(id) ||
       (name !== undefined && name !== null && typeof name !== "string") ||
-      (email !== undefined && email !== null && typeof email !== "string")
+      (email !== undefined && email !== null && typeof email !== "string") ||
+      (role !== "end-user" && role !== "agent" && role !== "admin")
     ) {
       throw new SafeAuthError("invalid_response");
     }
@@ -257,6 +265,7 @@ export class ZendeskOAuthClient implements ZendeskOAuthGateway {
       id: String(id),
       name: typeof name === "string" && name.length > 0 ? name : null,
       email: typeof email === "string" && email.length > 0 ? email : null,
+      role,
     };
   }
 

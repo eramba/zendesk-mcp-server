@@ -160,6 +160,7 @@ test('uses users/me as identity and the current-token revocation endpoint', asyn
       id: 424242,
       name: 'Martin Agent',
       email: 'martin@example.test',
+      role: 'agent',
     },
   }))
   fake.queue(response(undefined, 204))
@@ -168,6 +169,7 @@ test('uses users/me as identity and the current-token revocation endpoint', asyn
     id: '424242',
     name: 'Martin Agent',
     email: 'martin@example.test',
+    role: 'agent',
   })
   await client.revokeCurrent('revoke-token-sentinel')
 
@@ -191,7 +193,7 @@ test('uses users/me as identity and the current-token revocation endpoint', asyn
   ])
 })
 
-test('rejects malformed token and identity responses', async () => {
+test('rejects malformed token and users/me identity responses', async () => {
   const invalidTokens = [
     tokenBody({ access_token: '' }),
     tokenBody({ refresh_token: undefined }),
@@ -219,6 +221,9 @@ test('rejects malformed token and identity responses', async () => {
     { user: { id: 0 } },
     { user: { id: 1.5 } },
     { user: { id: '42' } },
+    { user: { id: 42 } },
+    { user: { id: 42, role: 'owner' } },
+    { user: { id: 42, role: 7 } },
     { user: { id: 42, name: 7 } },
     { user: { id: 42, email: [] } },
   ]) {

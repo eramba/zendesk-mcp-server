@@ -22,6 +22,13 @@ export type OAuthGrant = {
   scopes: string[];
 };
 
+export type ZendeskIdentity = {
+  id: string;
+  name: string | null;
+  email: string | null;
+  role: "end-user" | "agent" | "admin";
+};
+
 export type UserStatus =
   | "pending"
   | "active"
@@ -212,11 +219,7 @@ function parseGrant(value: string): OAuthGrant {
   });
 }
 
-function validateIdentity(identity: {
-  id: string;
-  name: string | null;
-  email: string | null;
-}): void {
+function validateIdentity(identity: ZendeskIdentity): void {
   if (!/^[1-9]\d*$/.test(identity.id)) {
     throw new Error("Zendesk identity is invalid");
   }
@@ -230,6 +233,9 @@ function validateIdentity(identity: {
     ) {
       throw new Error("Zendesk identity is invalid");
     }
+  }
+  if (!(["end-user", "agent", "admin"] as const).includes(identity.role)) {
+    throw new Error("Zendesk identity is invalid");
   }
 }
 
@@ -441,11 +447,7 @@ export class InternalAuthStore {
   completeLink(input: {
     invitationId: string;
     userId: string;
-    identity: {
-      id: string;
-      name: string | null;
-      email: string | null;
-    };
+    identity: ZendeskIdentity;
     grant: OAuthGrant;
   }): CredentialSnapshot {
     try {
