@@ -1,3 +1,6 @@
+import { isIP } from "node:net";
+import { isAbsolute } from "node:path";
+
 export type Environment = Readonly<Record<string, string | undefined>>;
 
 export type ZendeskConfig = {
@@ -6,11 +9,18 @@ export type ZendeskConfig = {
   apiKey: string;
 };
 
-export type HttpConfig = {
+export type HttpOAuthConfig = {
   host: string;
   port: number;
-  bearerToken: string;
   allowedHosts: string[];
+  publicBaseUrl: URL;
+  zendeskSubdomain: string;
+  zendeskOAuthClientId: string;
+  zendeskOAuthClientSecret: string;
+  oauthEncryptionKey: Buffer;
+  oauthDbPath: string;
+  zendeskCallbackUrl: URL;
+  selfServiceEnrollmentEnabled: boolean;
 };
 
 const ZENDESK_KEYS = [
@@ -19,30 +29,34 @@ const ZENDESK_KEYS = [
   "ZENDESK_API_KEY",
 ] as const;
 
+const HTTP_OAUTH_KEYS = [
+  "PUBLIC_BASE_URL",
+  "ZENDESK_SUBDOMAIN",
+  "ZENDESK_OAUTH_CLIENT_ID",
+  "ZENDESK_OAUTH_CLIENT_SECRET",
+  "OAUTH_ENCRYPTION_KEY",
+  "OAUTH_DB_PATH",
+] as const;
+
 function isBlank(value: string | undefined): boolean {
   return value === undefined || value.trim() === "";
 }
 
-export function readZendeskConfig(
-  env: Environment = process.env,
-): ZendeskConfig {
-  const missing = ZENDESK_KEYS.filter((key) => isBlank(env[key]));
-  if (missing.length > 0) {
-    throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
-  }
-
-  return {
-    subdomain: env.ZENDESK_SUBDOMAIN as string,
-    email: env.ZENDESK_EMAIL as string,
-    apiKey: env.ZENDESK_API_KEY as string,
-  };
+function readOptionalBoolean(
+  env: Environment,
+  key: string,
+): boolean {
+  const value = env[key];
+  if (value === undefined || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error(`${key} must be true or false`);
 }
 
-export function readHttpConfig(env: Environment = process.env): HttpConfig {
-  if (isBlank(env.MCP_BEARER_TOKEN)) {
-    throw new Error("Missing required environment variable: MCP_BEARER_TOKEN");
-  }
-
+function readNetworkConfig(env: Environment): {
+  host: string;
+  port: number;
+  allowedHosts: string[];
+} {
   const rawPort = env.PORT ?? "3000";
   if (!/^\d+$/.test(rawPort)) {
     throw new Error("PORT must be an integer between 1 and 65535");
@@ -70,7 +84,111 @@ export function readHttpConfig(env: Environment = process.env): HttpConfig {
   return {
     host: env.HOST?.trim() || "0.0.0.0",
     port,
-    bearerToken: env.MCP_BEARER_TOKEN as string,
     allowedHosts,
+  };
+}
+
+function isLoopbackHost(hostname: string): boolean {
+  const unwrapped = hostname.startsWith("[") && hostname.endsWith("]")
+    ? hostname.slice(1, -1)
+    : hostname;
+  if (unwrapped.toLowerCase() === "localhost" || unwrapped === "::1") {
+    return true;
+  }
+  return isIP(unwrapped) === 4 && unwrapped.startsWith("127.");
+}
+
+function readPublicBaseUrl(value: string): URL {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("PUBLIC_BASE_URL must be a canonical HTTPS origin");
+  }
+
+  const secure = url.protocol === "https:";
+  const loopbackDevelopment =
+    url.protocol === "http:" && isLoopbackHost(url.hostname);
+  if (
+    (!secure && !loopbackDevelopment) ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.pathname !== "/" ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
+    throw new Error("PUBLIC_BASE_URL must be a canonical HTTPS origin");
+  }
+  return url;
+}
+
+function readEncryptionKey(value: string): Buffer {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new Error(
+      "OAUTH_ENCRYPTION_KEY must be canonical base64url for exactly 32 bytes",
+    );
+  }
+  const key = Buffer.from(value, "base64url");
+  if (key.length !== 32 || key.toString("base64url") !== value) {
+    throw new Error(
+      "OAUTH_ENCRYPTION_KEY must be canonical base64url for exactly 32 bytes",
+    );
+  }
+  return key;
+}
+
+export function readZendeskConfig(
+  env: Environment = process.env,
+): ZendeskConfig {
+  const missing = ZENDESK_KEYS.filter((key) => isBlank(env[key]));
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
+  }
+
+  return {
+    subdomain: env.ZENDESK_SUBDOMAIN as string,
+    email: env.ZENDESK_EMAIL as string,
+    apiKey: env.ZENDESK_API_KEY as string,
+  };
+}
+
+export function readHttpOAuthConfig(
+  env: Environment = process.env,
+): HttpOAuthConfig {
+  const missing = HTTP_OAUTH_KEYS.filter((key) => isBlank(env[key]));
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required environment variables: ${missing.join(", ")}`,
+    );
+  }
+
+  const publicBaseUrl = readPublicBaseUrl(env.PUBLIC_BASE_URL as string);
+  const zendeskSubdomain = (env.ZENDESK_SUBDOMAIN as string)
+    .trim()
+    .toLowerCase();
+  if (
+    !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(zendeskSubdomain)
+  ) {
+    throw new Error("ZENDESK_SUBDOMAIN must be one DNS label");
+  }
+
+  const oauthDbPath = (env.OAUTH_DB_PATH as string).trim();
+  if (!isAbsolute(oauthDbPath)) {
+    throw new Error("OAUTH_DB_PATH must be an absolute path");
+  }
+
+  return {
+    ...readNetworkConfig(env),
+    publicBaseUrl,
+    zendeskSubdomain,
+    zendeskOAuthClientId: (env.ZENDESK_OAUTH_CLIENT_ID as string).trim(),
+    zendeskOAuthClientSecret: env.ZENDESK_OAUTH_CLIENT_SECRET as string,
+    oauthEncryptionKey: readEncryptionKey(env.OAUTH_ENCRYPTION_KEY as string),
+    oauthDbPath,
+    zendeskCallbackUrl: new URL("/oauth/callback", publicBaseUrl),
+    selfServiceEnrollmentEnabled: readOptionalBoolean(
+      env,
+      "SELF_SERVICE_ENROLLMENT_ENABLED",
+    ),
   };
 }

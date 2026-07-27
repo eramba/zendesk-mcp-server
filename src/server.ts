@@ -241,6 +241,21 @@ export function buildZendeskServer(client: ZendeskClient): McpServer {
   );
 
   server.registerTool(
+    "get_current_user",
+    {
+      description: "Retrieve the Zendesk user authenticated for this MCP connection",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        return jsonText(await client.getCurrentUser());
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
     "search_users",
     {
       description: "Search Zendesk users by query",

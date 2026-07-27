@@ -14,6 +14,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build --chown=node:node /app/dist ./dist
+RUN mkdir -p /data && chown node:node /data
 
 USER node
 EXPOSE 3000

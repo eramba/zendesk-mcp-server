@@ -7,17 +7,38 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 
 import { createHttpApp } from '../dist/http-app.js'
+import { SafeAuthError } from '../dist/internal-auth/errors.js'
 import { buildZendeskServer } from '../dist/server.js'
 import { ZendeskClient } from '../dist/zendesk-client.js'
 
 const BEARER_TOKEN = 'test-bearer-token'
+const USER_ID = '00000000-0000-4000-8000-000000000001'
+
+function apiClient(label = 'default') {
+  return new ZendeskClient({
+    subdomain: 'example',
+    auth: {
+      kind: 'api-token',
+      email: `${label}@example.test`,
+      token: `${label}-zendesk-token`,
+    },
+  })
+}
 
 function makeApp(overrides = {}) {
   return createHttpApp({
     host: '127.0.0.1',
     allowedHosts: ['127.0.0.1', 'localhost'],
-    bearerToken: BEARER_TOKEN,
-    client: new ZendeskClient('example', 'agent@example.test', 'zendesk-token'),
+    authenticateBearer: (token) =>
+      token === BEARER_TOKEN ? { userId: USER_ID } : undefined,
+    resolver: { resolve: async () => apiClient() },
+    selfServiceEnrollmentEnabled: false,
+    linkHandlers: {
+      link: (_req, res) => res.status(204).end(),
+      callback: (_req, res) => res.status(204).end(),
+      createAccount: (_req, res) => res.status(210).end(),
+      startEnrollment: (_req, res) => res.status(211).end(),
+    },
     ...overrides,
   })
 }
@@ -71,11 +92,44 @@ test('healthz is public and does not require Zendesk access', async (t) => {
   assert.deepEqual(await response.json(), { ok: true })
 })
 
-test('mcp rejects missing and incorrect bearer tokens before building a server', async (t) => {
+test('create-account routes mount only when self-service enrollment is enabled', async (t) => {
+  const disabled = await listen(t, makeApp())
+  assert.equal((await fetch(`${disabled}/create-account`)).status, 404)
+  assert.equal(
+    (await fetch(`${disabled}/create-account`, { method: 'POST' })).status,
+    404,
+  )
+
+  const enabled = await listen(
+    t,
+    makeApp({ selfServiceEnrollmentEnabled: true }),
+  )
+  assert.equal((await fetch(`${enabled}/create-account`)).status, 210)
+  assert.equal(
+    (await fetch(`${enabled}/create-account`, { method: 'POST' })).status,
+    211,
+  )
+  assert.equal((await fetch(`${enabled}/oauth/link`)).status, 204)
+  assert.equal((await fetch(`${enabled}/oauth/callback`)).status, 204)
+})
+
+test('mcp rejects every invalid or inactive bearer shape before credential use or server creation', async (t) => {
   let serversBuilt = 0
+  let resolverCalls = 0
+  let credentialUses = 0
   const baseUrl = await listen(
     t,
     makeApp({
+      authenticateBearer: (token) => {
+        if (token === 'would-use-credentials') credentialUses += 1
+        return undefined
+      },
+      resolver: {
+        resolve: async () => {
+          resolverCalls += 1
+          throw new Error('resolver must not run')
+        },
+      },
       serverFactory: (client) => {
         serversBuilt += 1
         return buildZendeskServer(client)
@@ -83,9 +137,21 @@ test('mcp rejects missing and incorrect bearer tokens before building a server',
     }),
   )
 
-  for (const authorization of [undefined, 'Bearer wrong-token', 'Basic abc']) {
+  for (const authorization of [
+    undefined,
+    '',
+    'Bearer',
+    'Bearer ',
+    'Bearer unknown',
+    'Bearer pending',
+    'Bearer revoked',
+    'Bearer reauthorization-required',
+    'Bearer token extra',
+    'Basic abc',
+    'Digest abc',
+  ]) {
     const headers = { 'Content-Type': 'application/json' }
-    if (authorization) headers.Authorization = authorization
+    if (authorization !== undefined) headers.Authorization = authorization
     const response = await fetch(`${baseUrl}/mcp`, {
       method: 'POST',
       headers,
@@ -96,6 +162,8 @@ test('mcp rejects missing and incorrect bearer tokens before building a server',
   }
 
   assert.equal(serversBuilt, 0)
+  assert.equal(resolverCalls, 0)
+  assert.equal(credentialUses, 0)
 })
 
 test('host validation rejects an unapproved hostname', async (t) => {
@@ -107,8 +175,21 @@ test('host validation rejects an unapproved hostname', async (t) => {
   assert.equal(response.status, 403)
 })
 
-test('authenticated GET and DELETE mcp requests return 405', async (t) => {
-  const baseUrl = await listen(t, makeApp())
+test('authenticated GET and DELETE mcp requests return 405 without credential resolution', async (t) => {
+  let resolverCalls = 0
+  let serversBuilt = 0
+  const baseUrl = await listen(t, makeApp({
+    resolver: {
+      resolve: async () => {
+        resolverCalls += 1
+        return apiClient()
+      },
+    },
+    serverFactory: (client) => {
+      serversBuilt += 1
+      return buildZendeskServer(client)
+    },
+  }))
 
   for (const method of ['GET', 'DELETE']) {
     const response = await fetch(`${baseUrl}/mcp`, {
@@ -118,9 +199,11 @@ test('authenticated GET and DELETE mcp requests return 405', async (t) => {
     assert.equal(response.status, 405)
     assert.equal(response.headers.get('allow'), 'POST')
   }
+  assert.equal(resolverCalls, 0)
+  assert.equal(serversBuilt, 0)
 })
 
-test('unexpected request setup failures return a protocol-shaped 500', async (t) => {
+test('resolver failures are protocol-shaped, secret-free, and happen before serverFactory', async (t) => {
   const errors = []
   const originalConsoleError = console.error
   console.error = (...args) => {
@@ -130,65 +213,106 @@ test('unexpected request setup failures return a protocol-shaped 500', async (t)
     console.error = originalConsoleError
   })
 
-  const baseUrl = await listen(
-    t,
-    makeApp({
-      serverFactory: () => {
-        throw new Error('test setup failure')
+  for (const [error, status, message] of [
+    [
+      new SafeAuthError('reauthorization_required', {
+        correlationId: '00000000-0000-4000-8000-000000000011',
+      }),
+      401,
+      'Unauthorized',
+    ],
+    [
+      new SafeAuthError('temporarily_unavailable', {
+        retryable: true,
+        correlationId: '00000000-0000-4000-8000-000000000012',
+      }),
+      503,
+      'Authentication temporarily unavailable',
+    ],
+    [new Error('setup-secret-sentinel'), 500, 'Internal server error'],
+  ]) {
+    let serversBuilt = 0
+    const baseUrl = await listen(
+      t,
+      makeApp({
+        resolver: { resolve: async () => { throw error } },
+        serverFactory: () => {
+          serversBuilt += 1
+          throw new Error('factory-secret-sentinel')
+        },
+      }),
+    )
+    const response = await fetch(`${baseUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${BEARER_TOKEN}`,
+        'Content-Type': 'application/json',
       },
-    }),
-  )
-  const response = await fetch(`${baseUrl}/mcp`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${BEARER_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: '{}',
-  })
+      body: '{}',
+    })
 
-  assert.equal(response.status, 500)
-  assert.deepEqual(await response.json(), {
-    jsonrpc: '2.0',
-    error: { code: -32603, message: 'Internal server error' },
-    id: null,
-  })
-  assert.deepEqual(errors, ['Error handling MCP request: test setup failure'])
+    assert.equal(response.status, status)
+    assert.equal((await response.json()).error.message, message)
+    if (status === 401) {
+      assert.equal(response.headers.get('www-authenticate'), 'Bearer')
+    }
+    assert.equal(serversBuilt, 0)
+  }
+  const rendered = errors.join(' ')
+  assert.equal(rendered.includes('setup-secret-sentinel'), false)
+  assert.equal(rendered.includes('factory-secret-sentinel'), false)
 })
 
-test('official SDK client initializes and every POST gets a fresh MCP server', async (t) => {
+test('two bearer-selected users initialize distinct clients and every POST gets a fresh server', async (t) => {
   let serversBuilt = 0
   let postsSent = 0
+  const firstClient = apiClient('first')
+  const secondClient = apiClient('second')
+  const clientsBuilt = []
   const baseUrl = await listen(
     t,
     makeApp({
+      authenticateBearer: (token) => {
+        if (token === 'first-bearer') return { userId: 'first-user' }
+        if (token === 'second-bearer') return { userId: 'second-user' }
+        return undefined
+      },
+      resolver: {
+        resolve: async (userId) =>
+          userId === 'first-user' ? firstClient : secondClient,
+      },
       serverFactory: (client) => {
         serversBuilt += 1
+        clientsBuilt.push(client)
         return buildZendeskServer(client)
       },
     }),
   )
 
-  const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), {
-    requestInit: {
-      headers: { Authorization: `Bearer ${BEARER_TOKEN}` },
-    },
-    fetch: async (input, init) => {
-      if (init?.method === 'POST') postsSent += 1
-      return fetch(input, init)
-    },
-  })
-  const client = new Client({ name: 'http-test-client', version: '1.0.0' })
-
-  await client.connect(transport)
-  try {
-    const result = await client.listTools()
-    const names = result.tools.map((tool) => tool.name)
-    assert.ok(names.includes('get_ticket'))
-    assert.ok(names.includes('create_ticket_comment'))
-    assert.ok(postsSent >= 2)
-    assert.equal(serversBuilt, postsSent)
-  } finally {
-    await client.close()
+  for (const bearer of ['first-bearer', 'second-bearer']) {
+    const transport = new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), {
+      requestInit: {
+        headers: { Authorization: `Bearer ${bearer}` },
+      },
+      fetch: async (input, init) => {
+        if (init?.method === 'POST') postsSent += 1
+        return fetch(input, init)
+      },
+    })
+    const client = new Client({ name: 'http-test-client', version: '1.0.0' })
+    await client.connect(transport)
+    try {
+      const result = await client.listTools()
+      const names = result.tools.map((tool) => tool.name)
+      assert.ok(names.includes('get_ticket'))
+      assert.ok(names.includes('create_ticket_comment'))
+    } finally {
+      await client.close()
+    }
   }
+  assert.ok(postsSent >= 4)
+  assert.equal(serversBuilt, postsSent)
+  assert.ok(clientsBuilt.includes(firstClient))
+  assert.ok(clientsBuilt.includes(secondClient))
+  assert.equal(clientsBuilt.some((client) => client !== firstClient && client !== secondClient), false)
 })
