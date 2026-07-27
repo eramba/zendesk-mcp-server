@@ -18,15 +18,16 @@ const KEY = Buffer.alloc(32, 7)
 async function fixture(t, key = KEY) {
   const directory = await mkdtemp(join(tmpdir(), 'zendesk-internal-auth-'))
   const path = join(directory, 'oauth.sqlite')
+  const clock = { value: NOW }
   const store = InternalAuthStore.open({
     path,
     cipher: new SecretCipher(key),
     subdomain: 'acme',
     clientId: 'internal-mcp',
-    now: () => NOW,
+    now: () => clock.value,
   })
   t.after(() => store.close())
-  return { directory, path, store }
+  return { clock, directory, path, store }
 }
 
 async function databaseFiles(path) {
@@ -41,6 +42,37 @@ async function databaseFiles(path) {
     }
   }
   return existing
+}
+
+function grant(label, accessExpiresAt = NOW + 1_800) {
+  return {
+    accessToken: `access-${label}-sentinel`,
+    refreshToken: `refresh-${label}-sentinel`,
+    accessExpiresAt,
+    refreshExpiresAt: NOW + 30 * 24 * 60 * 60,
+    scopes: ['read', 'tickets:write'],
+  }
+}
+
+function claimInvitation(store, created, state = randomOpaque()) {
+  const started = store.startInvitation(created.invitation, state)
+  assert.ok(started)
+  const claimed = store.claimCallback(state)
+  assert.ok(claimed)
+  return claimed
+}
+
+function activate(store, created, identityId, label = identityId) {
+  const claimed = claimInvitation(store, created)
+  return store.completeLink({
+    ...claimed,
+    identity: {
+      id: identityId,
+      name: `Agent ${label}`,
+      email: `${label}@example.test`,
+    },
+    grant: grant(label),
+  })
 }
 
 test('SecretCipher round trips with associated data and rejects unsafe envelopes', () => {
@@ -245,5 +277,289 @@ test('malformed key-check ciphertext fails closed without exposing the value', a
       assert.equal(error.message.includes('malformed-ciphertext-sentinel'), false)
       return true
     },
+  )
+})
+
+test('invitation start and callback claim are expiry-bound and one-time', async (t) => {
+  const { clock, path, store } = await fixture(t)
+  const created = store.createPendingUser('Martin')
+  const state = randomOpaque()
+
+  assert.equal(store.startInvitation('unknown-invitation', state), undefined)
+  const started = store.startInvitation(created.invitation, state)
+  assert.deepEqual(started, {
+    invitationId: assert.match(started.invitationId, /^[0-9a-f-]{36}$/) ?? started.invitationId,
+    userId: created.userId,
+    expiresAt: NOW + 30 * 60,
+  })
+  assert.equal(store.startInvitation(created.invitation, randomOpaque()), undefined)
+  assert.equal(store.claimCallback(randomOpaque()), undefined)
+
+  const claimed = store.claimCallback(state)
+  assert.deepEqual(claimed, {
+    invitationId: started.invitationId,
+    userId: created.userId,
+  })
+  assert.equal(store.claimCallback(state), undefined)
+
+  for (const file of await databaseFiles(path)) {
+    const bytes = await readFile(file)
+    assert.equal(bytes.includes(Buffer.from(created.invitation)), false)
+    assert.equal(bytes.includes(Buffer.from(state)), false)
+  }
+
+  const expired = store.createPendingUser('Expired')
+  clock.value = expired.expiresAt
+  assert.equal(
+    store.startInvitation(expired.invitation, randomOpaque()),
+    undefined,
+  )
+})
+
+test('callback completion activates only the claimed mapping from authoritative identity', async (t) => {
+  const { path, store } = await fixture(t)
+  const martin = store.createPendingUser('Administrator label')
+  const adrian = store.createPendingUser('Adrian')
+  const installed = activate(store, martin, '101', 'martin')
+
+  assert.deepEqual(installed, {
+    userId: martin.userId,
+    zendeskUserId: '101',
+    version: 1,
+    grant: grant('martin'),
+  })
+  assert.deepEqual(store.authenticateBearer(martin.bearer), {
+    userId: martin.userId,
+  })
+  assert.equal(store.authenticateBearer(adrian.bearer), undefined)
+  assert.deepEqual(store.loadCredential(martin.userId), installed)
+
+  const metadata = store.inspectUsers().find(({ id }) => id === martin.userId)
+  assert.equal(metadata.label, 'Administrator label')
+  assert.equal(metadata.zendeskUserId, '101')
+  assert.equal(metadata.zendeskName, 'Agent martin')
+  assert.equal(metadata.zendeskEmail, 'martin@example.test')
+  assert.equal(metadata.status, 'active')
+
+  for (const file of await databaseFiles(path)) {
+    const bytes = await readFile(file)
+    assert.equal(bytes.includes(Buffer.from(grant('martin').accessToken)), false)
+    assert.equal(bytes.includes(Buffer.from(grant('martin').refreshToken)), false)
+  }
+})
+
+test('callback mismatch and duplicate identity do not activate another mapping', async (t) => {
+  const { store } = await fixture(t)
+  const first = store.createPendingUser('First')
+  const second = store.createPendingUser('Second')
+  activate(store, first, '202', 'first')
+
+  const secondClaim = claimInvitation(store, second)
+  assert.throws(
+    () =>
+      store.completeLink({
+        ...secondClaim,
+        userId: first.userId,
+        identity: { id: '303', name: null, email: null },
+        grant: grant('mismatch'),
+      }),
+    /Unable to activate linked user/,
+  )
+  assert.equal(store.authenticateBearer(second.bearer), undefined)
+
+  assert.throws(
+    () =>
+      store.completeLink({
+        ...secondClaim,
+        identity: { id: '202', name: 'Duplicate', email: null },
+        grant: grant('duplicate'),
+      }),
+    /Unable to activate linked user/,
+  )
+  assert.equal(store.authenticateBearer(second.bearer), undefined)
+  assert.equal(store.loadCredential(second.userId), undefined)
+  assert.equal(
+    store.inspectUsers().find(({ id }) => id === second.userId).status,
+    'pending',
+  )
+})
+
+test('malformed encrypted grants fail closed without exposing ciphertext', async (t) => {
+  const { path, store } = await fixture(t)
+  const created = store.createPendingUser('Martin')
+  activate(store, created, '404', 'malformed')
+  store.close()
+
+  const Database = (await import('better-sqlite3')).default
+  const database = new Database(path)
+  database
+    .prepare('UPDATE oauth_grants SET encrypted_grant = ? WHERE user_id = ?')
+    .run('malformed-grant-sentinel', created.userId)
+  database.close()
+
+  const reopened = InternalAuthStore.open({
+    path,
+    cipher: new SecretCipher(KEY),
+    subdomain: 'acme',
+    clientId: 'internal-mcp',
+    now: () => NOW,
+  })
+  t.after(() => reopened.close())
+  assert.throws(() => reopened.loadCredential(created.userId), (error) => {
+    assert.match(error.message, /Unable to load OAuth credential/)
+    assert.equal(error.message.includes('malformed-grant-sentinel'), false)
+    return true
+  })
+})
+
+test('conditional refresh persists a rotated grant and stale writers adopt it', async (t) => {
+  const { path, store } = await fixture(t)
+  const created = store.createPendingUser('Martin')
+  const initial = activate(store, created, '505', 'initial')
+  const rotated = grant('rotated', NOW + 3_600)
+
+  const installed = store.installRefreshedGrant({
+    userId: created.userId,
+    expectedVersion: initial.version,
+    grant: rotated,
+  })
+  assert.deepEqual(installed, {
+    kind: 'installed',
+    snapshot: {
+      userId: created.userId,
+      zendeskUserId: '505',
+      version: 2,
+      grant: rotated,
+    },
+  })
+
+  const observer = InternalAuthStore.open({
+    path,
+    cipher: new SecretCipher(KEY),
+    subdomain: 'acme',
+    clientId: 'internal-mcp',
+    now: () => NOW,
+  })
+  assert.deepEqual(observer.loadCredential(created.userId), installed.snapshot)
+  observer.close()
+
+  assert.deepEqual(
+    store.installRefreshedGrant({
+      userId: created.userId,
+      expectedVersion: 1,
+      grant: grant('stale'),
+    }),
+    { kind: 'newer', snapshot: installed.snapshot },
+  )
+})
+
+test('terminal reauthorization disables only the current grant and issues no bearer', async (t) => {
+  const { store } = await fixture(t)
+  const first = store.createPendingUser('First')
+  const second = store.createPendingUser('Second')
+  const firstSnapshot = activate(store, first, '601', 'first')
+  activate(store, second, '602', 'second')
+
+  assert.equal(
+    store.markReauthorizationRequired(first.userId, firstSnapshot.version + 1),
+    false,
+  )
+  assert.equal(
+    store.markReauthorizationRequired(first.userId, firstSnapshot.version),
+    true,
+  )
+  assert.equal(store.authenticateBearer(first.bearer), undefined)
+  assert.equal(store.loadCredential(first.userId), undefined)
+  assert.deepEqual(store.authenticateBearer(second.bearer), {
+    userId: second.userId,
+  })
+
+  const reauthorization = store.createReauthorization(first.userId)
+  assert.deepEqual(Object.keys(reauthorization).sort(), [
+    'expiresAt',
+    'invitation',
+  ])
+  assert.match(reauthorization.invitation, /^[A-Za-z0-9_-]{43}$/)
+  assert.equal(reauthorization.expiresAt, NOW + 30 * 60)
+  assert.equal(
+    store.inspectUsers().find(({ id }) => id === first.userId).status,
+    'reauthorization_required',
+  )
+})
+
+test('revocation blocks access atomically and returns a bounded in-memory grant', async (t) => {
+  const { store } = await fixture(t)
+  const created = store.createPendingUser('Martin')
+  const snapshot = activate(store, created, '701', 'revoke')
+
+  assert.deepEqual(store.revokeUser(created.userId), {
+    kind: 'revoked',
+    capturedGrant: snapshot.grant,
+  })
+  assert.equal(store.authenticateBearer(created.bearer), undefined)
+  assert.equal(store.loadCredential(created.userId), undefined)
+  assert.equal(
+    store.inspectUsers().find(({ id }) => id === created.userId).status,
+    'revoked',
+  )
+  assert.deepEqual(store.revokeUser(created.userId), {
+    kind: 'already_revoked',
+  })
+  assert.deepEqual(store.revokeUser('00000000-0000-0000-0000-000000000000'), {
+    kind: 'not_found',
+  })
+  assert.throws(
+    () => store.createReauthorization(created.userId),
+    /Unable to create reauthorization invitation/,
+  )
+})
+
+test('reauthorization replaces expired invitations without a worker', async (t) => {
+  const { clock, path, store } = await fixture(t)
+  const created = store.createPendingUser('Martin')
+  clock.value = created.expiresAt
+  const replacement = store.createReauthorization(created.userId)
+
+  assert.notEqual(replacement.invitation, created.invitation)
+  const Database = (await import('better-sqlite3')).default
+  const database = new Database(path, { readonly: true })
+  const count = database
+    .prepare('SELECT COUNT(*) AS count FROM oauth_invitations WHERE user_id = ?')
+    .get(created.userId).count
+  database.close()
+  assert.equal(count, 1)
+})
+
+test('online backup is consistent, mode-0600, and bound to the encryption key', async (t) => {
+  const { directory, store } = await fixture(t)
+  const created = store.createPendingUser('Martin')
+  activate(store, created, '801', 'backup')
+  const destination = join(directory, 'backup.sqlite')
+
+  await store.backup(destination)
+  assert.equal((await stat(destination)).mode & 0o777, 0o600)
+
+  const backup = InternalAuthStore.open({
+    path: destination,
+    cipher: new SecretCipher(KEY),
+    subdomain: 'acme',
+    clientId: 'internal-mcp',
+    now: () => NOW,
+  })
+  assert.deepEqual(backup.authenticateBearer(created.bearer), {
+    userId: created.userId,
+  })
+  backup.close()
+
+  assert.throws(
+    () =>
+      InternalAuthStore.open({
+        path: destination,
+        cipher: new SecretCipher(Buffer.alloc(32, 9)),
+        subdomain: 'acme',
+        clientId: 'internal-mcp',
+        now: () => NOW,
+      }),
+    /Unable to open OAuth credential store/,
   )
 })

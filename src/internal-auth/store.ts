@@ -1,5 +1,5 @@
 import { chmodSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import { randomUUID } from "node:crypto";
 
 import Database from "better-sqlite3";
@@ -70,6 +70,20 @@ type UserInspectionRow = {
   invitation_expires_at: number | null;
   invitation_started_at: number | null;
   invitation_consumed_at: number | null;
+};
+
+type CredentialRow = {
+  user_id: string;
+  status: UserStatus;
+  zendesk_user_id: string | null;
+  version: number;
+  encrypted_grant: string;
+};
+
+type InvitationRow = {
+  id: string;
+  user_id: string;
+  expires_at: number;
 };
 
 const SCHEMA = `
@@ -152,6 +166,73 @@ function sqliteCode(error: unknown): string | undefined {
   return typeof code === "string" ? code : undefined;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function canonicalGrant(grant: OAuthGrant): OAuthGrant {
+  if (
+    typeof grant.accessToken !== "string" ||
+    grant.accessToken.length === 0 ||
+    typeof grant.refreshToken !== "string" ||
+    grant.refreshToken.length === 0 ||
+    !Number.isSafeInteger(grant.accessExpiresAt) ||
+    !Number.isSafeInteger(grant.refreshExpiresAt) ||
+    grant.accessExpiresAt < 0 ||
+    grant.refreshExpiresAt <= grant.accessExpiresAt
+  ) {
+    throw new Error("OAuth grant is invalid");
+  }
+  const scopes = [...new Set(grant.scopes)];
+  if (
+    scopes.length !== 2 ||
+    !scopes.includes("read") ||
+    !scopes.includes("tickets:write")
+  ) {
+    throw new Error("OAuth grant is invalid");
+  }
+  return {
+    accessToken: grant.accessToken,
+    refreshToken: grant.refreshToken,
+    accessExpiresAt: grant.accessExpiresAt,
+    refreshExpiresAt: grant.refreshExpiresAt,
+    scopes: ["read", "tickets:write"],
+  };
+}
+
+function parseGrant(value: string): OAuthGrant {
+  const parsed: unknown = JSON.parse(value);
+  if (!isRecord(parsed)) throw new Error("invalid grant");
+  return canonicalGrant({
+    accessToken: parsed.accessToken as string,
+    refreshToken: parsed.refreshToken as string,
+    accessExpiresAt: parsed.accessExpiresAt as number,
+    refreshExpiresAt: parsed.refreshExpiresAt as number,
+    scopes: parsed.scopes as string[],
+  });
+}
+
+function validateIdentity(identity: {
+  id: string;
+  name: string | null;
+  email: string | null;
+}): void {
+  if (!/^[1-9]\d*$/.test(identity.id)) {
+    throw new Error("Zendesk identity is invalid");
+  }
+  for (const value of [identity.name, identity.email]) {
+    if (
+      value !== null &&
+      (typeof value !== "string" ||
+        value.length === 0 ||
+        value.length > 512 ||
+        /[\r\n\0]/.test(value))
+    ) {
+      throw new Error("Zendesk identity is invalid");
+    }
+  }
+}
+
 export class InternalAuthStore {
   readonly #database: Database.Database;
   readonly #path: string;
@@ -189,6 +270,7 @@ export class InternalAuthStore {
 
       const store = new InternalAuthStore(database, options);
       store.#initializeMetadata();
+      store.#cleanupInvitations();
       return store;
     } catch {
       try {
@@ -267,8 +349,438 @@ export class InternalAuthStore {
     return row ? { userId: row.id } : undefined;
   }
 
-  loadCredential(_userId: string): CredentialSnapshot | undefined {
-    return undefined;
+  startInvitation(
+    invitation: string,
+    state: string,
+  ): {
+    invitationId: string;
+    userId: string;
+    expiresAt: number;
+  } | undefined {
+    if (
+      !/^[A-Za-z0-9_-]{43}$/.test(invitation) ||
+      !/^[A-Za-z0-9_-]{43}$/.test(state)
+    ) {
+      return undefined;
+    }
+    const now = this.#currentTime();
+    this.#cleanupInvitations(now);
+    const start = this.#database.transaction(() => {
+      const row = this.#database
+        .prepare(
+          `SELECT invitation.id, invitation.user_id, invitation.expires_at
+           FROM oauth_invitations AS invitation
+           INNER JOIN internal_users AS users ON users.id = invitation.user_id
+           WHERE invitation.invitation_hash = ?
+             AND invitation.started_at IS NULL
+             AND invitation.consumed_at IS NULL
+             AND invitation.expires_at > ?
+             AND users.status IN ('pending', 'reauthorization_required')`,
+        )
+        .get(hashOpaque(invitation), now) as InvitationRow | undefined;
+      if (!row) return undefined;
+      const result = this.#database
+        .prepare(
+          `UPDATE oauth_invitations
+           SET state_hash = ?, started_at = ?
+           WHERE id = ?
+             AND started_at IS NULL
+             AND consumed_at IS NULL
+             AND expires_at > ?`,
+        )
+        .run(hashOpaque(state), now, row.id, now);
+      if (result.changes !== 1) return undefined;
+      return {
+        invitationId: row.id,
+        userId: row.user_id,
+        expiresAt: row.expires_at,
+      };
+    });
+    const result = start();
+    this.#restrictDatabaseFiles();
+    return result;
+  }
+
+  claimCallback(
+    state: string,
+  ): { invitationId: string; userId: string } | undefined {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(state)) return undefined;
+    const now = this.#currentTime();
+    this.#cleanupInvitations(now);
+    const claim = this.#database.transaction(() => {
+      const row = this.#database
+        .prepare(
+          `SELECT invitation.id, invitation.user_id, invitation.expires_at
+           FROM oauth_invitations AS invitation
+           INNER JOIN internal_users AS users ON users.id = invitation.user_id
+           WHERE invitation.state_hash = ?
+             AND invitation.started_at IS NOT NULL
+             AND invitation.consumed_at IS NULL
+             AND invitation.expires_at > ?
+             AND users.status IN ('pending', 'reauthorization_required')`,
+        )
+        .get(hashOpaque(state), now) as InvitationRow | undefined;
+      if (!row) return undefined;
+      const result = this.#database
+        .prepare(
+          `UPDATE oauth_invitations
+           SET consumed_at = ?
+           WHERE id = ?
+             AND consumed_at IS NULL
+             AND expires_at > ?`,
+        )
+        .run(now, row.id, now);
+      if (result.changes !== 1) return undefined;
+      return { invitationId: row.id, userId: row.user_id };
+    });
+    const result = claim();
+    this.#restrictDatabaseFiles();
+    return result;
+  }
+
+  completeLink(input: {
+    invitationId: string;
+    userId: string;
+    identity: {
+      id: string;
+      name: string | null;
+      email: string | null;
+    };
+    grant: OAuthGrant;
+  }): CredentialSnapshot {
+    try {
+      validateIdentity(input.identity);
+      const grant = canonicalGrant(input.grant);
+      const now = this.#currentTime();
+      if (
+        grant.accessExpiresAt <= now ||
+        grant.refreshExpiresAt <= now
+      ) {
+        throw new Error("OAuth grant is expired");
+      }
+      const version = 1;
+      const encryptedGrant = this.#encryptGrant(
+        input.userId,
+        version,
+        grant,
+      );
+      const complete = this.#database.transaction(() => {
+        const invitation = this.#database
+          .prepare(
+            `SELECT invitation.id
+             FROM oauth_invitations AS invitation
+             INNER JOIN internal_users AS users ON users.id = invitation.user_id
+             WHERE invitation.id = ?
+               AND invitation.user_id = ?
+               AND invitation.started_at IS NOT NULL
+               AND invitation.consumed_at IS NOT NULL
+               AND invitation.expires_at > ?
+               AND users.status IN ('pending', 'reauthorization_required')`,
+          )
+          .get(input.invitationId, input.userId, now);
+        if (!invitation) throw new Error("invalid callback claim");
+
+        this.#database
+          .prepare(
+            `INSERT INTO oauth_grants (
+              user_id, version, encrypted_grant, access_expires_at,
+              refresh_expires_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              version = excluded.version,
+              encrypted_grant = excluded.encrypted_grant,
+              access_expires_at = excluded.access_expires_at,
+              refresh_expires_at = excluded.refresh_expires_at,
+              updated_at = excluded.updated_at`,
+          )
+          .run(
+            input.userId,
+            version,
+            encryptedGrant,
+            grant.accessExpiresAt,
+            grant.refreshExpiresAt,
+            now,
+          );
+        const updated = this.#database
+          .prepare(
+            `UPDATE internal_users
+             SET status = 'active',
+                 zendesk_user_id = ?,
+                 zendesk_name = ?,
+                 zendesk_email = ?,
+                 updated_at = ?,
+                 revoked_at = NULL
+             WHERE id = ?
+               AND status IN ('pending', 'reauthorization_required')`,
+          )
+          .run(
+            input.identity.id,
+            input.identity.name,
+            input.identity.email,
+            now,
+            input.userId,
+          );
+        if (updated.changes !== 1) throw new Error("inactive user");
+      });
+      complete();
+      this.#restrictDatabaseFiles();
+      return {
+        userId: input.userId,
+        zendeskUserId: input.identity.id,
+        version,
+        grant,
+      };
+    } catch {
+      throw new Error("Unable to activate linked user");
+    }
+  }
+
+  createReauthorization(userId: string): {
+    invitation: string;
+    expiresAt: number;
+  } {
+    try {
+      const now = this.#currentTime();
+      const expiresAt = now + INVITATION_TTL_SECONDS;
+      if (!Number.isSafeInteger(expiresAt)) {
+        throw new Error("invalid expiry");
+      }
+      this.#cleanupInvitations(now);
+      const create = this.#database.transaction(() => {
+        const user = this.#database
+          .prepare(
+            `SELECT id FROM internal_users
+             WHERE id = ?
+               AND status IN ('pending', 'reauthorization_required')`,
+          )
+          .get(userId);
+        if (!user) throw new Error("invalid user");
+        this.#database
+          .prepare("DELETE FROM oauth_invitations WHERE user_id = ?")
+          .run(userId);
+
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          const invitation = randomOpaque();
+          try {
+            this.#database
+              .prepare(
+                `INSERT INTO oauth_invitations (
+                  id, user_id, invitation_hash, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?)`,
+              )
+              .run(
+                randomUUID(),
+                userId,
+                hashOpaque(invitation),
+                now,
+                expiresAt,
+              );
+            return { invitation, expiresAt };
+          } catch (error) {
+            if (sqliteCode(error) !== "SQLITE_CONSTRAINT_UNIQUE") throw error;
+          }
+        }
+        throw new Error("unable to allocate invitation");
+      });
+      const created = create();
+      this.#restrictDatabaseFiles();
+      return created;
+    } catch {
+      throw new Error("Unable to create reauthorization invitation");
+    }
+  }
+
+  loadCredential(userId: string): CredentialSnapshot | undefined {
+    const row = this.#loadCredentialRow(userId);
+    if (!row || row.status !== "active" || row.zendesk_user_id === null) {
+      return undefined;
+    }
+    try {
+      return {
+        userId: row.user_id,
+        zendeskUserId: row.zendesk_user_id,
+        version: row.version,
+        grant: this.#decryptGrant(
+          row.user_id,
+          row.version,
+          row.encrypted_grant,
+        ),
+      };
+    } catch {
+      throw new Error("Unable to load OAuth credential");
+    }
+  }
+
+  installRefreshedGrant(input: {
+    userId: string;
+    expectedVersion: number;
+    grant: OAuthGrant;
+  }):
+    | { kind: "installed"; snapshot: CredentialSnapshot }
+    | { kind: "newer"; snapshot: CredentialSnapshot }
+    | { kind: "inactive" } {
+    const grant = canonicalGrant(input.grant);
+    const now = this.#currentTime();
+    if (grant.accessExpiresAt <= now || grant.refreshExpiresAt <= now) {
+      throw new Error("OAuth grant is expired");
+    }
+
+    const install = this.#database.transaction(() => {
+      const current = this.loadCredential(input.userId);
+      if (!current) return { kind: "inactive" as const };
+      if (current.version !== input.expectedVersion) {
+        return { kind: "newer" as const, snapshot: current };
+      }
+
+      const version = current.version + 1;
+      if (!Number.isSafeInteger(version)) {
+        throw new Error("OAuth credential version is invalid");
+      }
+      const encryptedGrant = this.#encryptGrant(
+        input.userId,
+        version,
+        grant,
+      );
+      const updated = this.#database
+        .prepare(
+          `UPDATE oauth_grants
+           SET version = ?,
+               encrypted_grant = ?,
+               access_expires_at = ?,
+               refresh_expires_at = ?,
+               updated_at = ?
+           WHERE user_id = ?
+             AND version = ?
+             AND EXISTS (
+               SELECT 1 FROM internal_users
+               WHERE id = ? AND status = 'active'
+             )`,
+        )
+        .run(
+          version,
+          encryptedGrant,
+          grant.accessExpiresAt,
+          grant.refreshExpiresAt,
+          now,
+          input.userId,
+          input.expectedVersion,
+          input.userId,
+        );
+      if (updated.changes !== 1) {
+        const winner = this.loadCredential(input.userId);
+        return winner
+          ? { kind: "newer" as const, snapshot: winner }
+          : { kind: "inactive" as const };
+      }
+      this.#database
+        .prepare("UPDATE internal_users SET updated_at = ? WHERE id = ?")
+        .run(now, input.userId);
+      return {
+        kind: "installed" as const,
+        snapshot: {
+          userId: input.userId,
+          zendeskUserId: current.zendeskUserId,
+          version,
+          grant,
+        },
+      };
+    });
+    const result = install();
+    this.#restrictDatabaseFiles();
+    return result;
+  }
+
+  markReauthorizationRequired(
+    userId: string,
+    expectedVersion: number,
+  ): boolean {
+    const now = this.#currentTime();
+    const mark = this.#database.transaction(() => {
+      const current = this.#database
+        .prepare(
+          `SELECT grants.version
+           FROM oauth_grants AS grants
+           INNER JOIN internal_users AS users ON users.id = grants.user_id
+           WHERE grants.user_id = ?
+             AND grants.version = ?
+             AND users.status = 'active'`,
+        )
+        .get(userId, expectedVersion);
+      if (!current) return false;
+      const updated = this.#database
+        .prepare(
+          `UPDATE internal_users
+           SET status = 'reauthorization_required', updated_at = ?
+           WHERE id = ? AND status = 'active'`,
+        )
+        .run(now, userId);
+      if (updated.changes !== 1) return false;
+      this.#database
+        .prepare("DELETE FROM oauth_grants WHERE user_id = ?")
+        .run(userId);
+      this.#database
+        .prepare("DELETE FROM oauth_invitations WHERE user_id = ?")
+        .run(userId);
+      return true;
+    });
+    const changed = mark();
+    this.#restrictDatabaseFiles();
+    return changed;
+  }
+
+  revokeUser(userId: string):
+    | { kind: "revoked"; capturedGrant?: OAuthGrant }
+    | { kind: "already_revoked" }
+    | { kind: "not_found" } {
+    const now = this.#currentTime();
+    const revoke = this.#database.transaction(() => {
+      const user = this.#database
+        .prepare("SELECT status FROM internal_users WHERE id = ?")
+        .get(userId) as { status: UserStatus } | undefined;
+      if (!user) return { kind: "not_found" as const };
+      if (user.status === "revoked") {
+        return { kind: "already_revoked" as const };
+      }
+
+      let capturedGrant: OAuthGrant | undefined;
+      try {
+        capturedGrant = this.loadCredential(userId)?.grant;
+      } catch {
+        capturedGrant = undefined;
+      }
+      this.#database
+        .prepare(
+          `UPDATE internal_users
+           SET status = 'revoked', updated_at = ?, revoked_at = ?
+           WHERE id = ?`,
+        )
+        .run(now, now, userId);
+      this.#database
+        .prepare("DELETE FROM oauth_grants WHERE user_id = ?")
+        .run(userId);
+      this.#database
+        .prepare("DELETE FROM oauth_invitations WHERE user_id = ?")
+        .run(userId);
+      return capturedGrant
+        ? { kind: "revoked" as const, capturedGrant }
+        : { kind: "revoked" as const };
+    });
+    const result = revoke();
+    this.#restrictDatabaseFiles();
+    return result;
+  }
+
+  async backup(destination: string): Promise<void> {
+    if (!isAbsolute(destination) || destination === this.#path) {
+      throw new Error("Backup destination must be a different absolute path");
+    }
+    mkdirSync(dirname(destination), { recursive: true, mode: 0o700 });
+    try {
+      await this.#database.backup(destination);
+      chmodSync(destination, 0o600);
+    } catch {
+      throw new Error("Unable to create OAuth store backup");
+    }
   }
 
   inspectUsers(): UserInspection[] {
@@ -372,6 +884,57 @@ export class InternalAuthStore {
       }
     });
     initialize();
+    this.#restrictDatabaseFiles();
+  }
+
+  #loadCredentialRow(userId: string): CredentialRow | undefined {
+    return this.#database
+      .prepare(
+        `SELECT
+           grants.user_id,
+           users.status,
+           users.zendesk_user_id,
+           grants.version,
+           grants.encrypted_grant
+         FROM oauth_grants AS grants
+         INNER JOIN internal_users AS users ON users.id = grants.user_id
+         WHERE grants.user_id = ?`,
+      )
+      .get(userId) as CredentialRow | undefined;
+  }
+
+  #encryptGrant(
+    userId: string,
+    version: number,
+    grant: OAuthGrant,
+  ): string {
+    return this.#cipher.encrypt(
+      JSON.stringify(canonicalGrant(grant)),
+      this.#grantAssociatedData(userId, version),
+    );
+  }
+
+  #decryptGrant(
+    userId: string,
+    version: number,
+    encryptedGrant: string,
+  ): OAuthGrant {
+    return parseGrant(
+      this.#cipher.decrypt(
+        encryptedGrant,
+        this.#grantAssociatedData(userId, version),
+      ),
+    );
+  }
+
+  #grantAssociatedData(userId: string, version: number): string {
+    return `grant:v1:${this.#subdomain}:${this.#clientId}:${userId}:${version}`;
+  }
+
+  #cleanupInvitations(now = this.#currentTime()): void {
+    this.#database
+      .prepare("DELETE FROM oauth_invitations WHERE expires_at <= ?")
+      .run(now);
     this.#restrictDatabaseFiles();
   }
 
