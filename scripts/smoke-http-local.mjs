@@ -28,8 +28,9 @@ try {
   const state = randomOpaque()
   const started = store.startInvitation(created.invitation, state)
   assert.ok(started)
-  const claimed = store.claimCallback(state)
+  const claimed = store.claimAuthorization(state)
   assert.ok(claimed)
+  assert.equal(claimed.kind, 'invitation')
   const now = Math.floor(Date.now() / 1_000)
   store.completeLink({
     ...claimed,

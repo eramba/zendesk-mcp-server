@@ -92,7 +92,8 @@ test('reauthorize prints only a new one-time link and never a bearer', async () 
   const invitation = new URL(field(created.stdout, 'link_url')).searchParams.get('invitation')
   const state = randomOpaque()
   const started = store.startInvitation(invitation, state)
-  const claimed = store.claimCallback(state)
+  const claimed = store.claimAuthorization(state)
+  assert.equal(claimed.kind, 'invitation')
   store.completeLink({
     ...claimed,
     identity: {

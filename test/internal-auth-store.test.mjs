@@ -57,8 +57,9 @@ function grant(label, accessExpiresAt = NOW + 1_800) {
 function claimInvitation(store, created, state = randomOpaque()) {
   const started = store.startInvitation(created.invitation, state)
   assert.ok(started)
-  const claimed = store.claimCallback(state)
+  const claimed = store.claimAuthorization(state)
   assert.ok(claimed)
+  assert.equal(claimed.kind, 'invitation')
   return claimed
 }
 
@@ -153,6 +154,7 @@ test('creates only the focused schema and a mode-0600 database', async (t) => {
     'internal_users',
     'oauth_grants',
     'oauth_invitations',
+    'oauth_self_enrollments',
     'store_metadata',
   ])
   assert.equal(database.pragma('journal_mode', { simple: true }), 'wal')
@@ -294,14 +296,15 @@ test('invitation start and callback claim are expiry-bound and one-time', async 
     expiresAt: NOW + 30 * 60,
   })
   assert.equal(store.startInvitation(created.invitation, randomOpaque()), undefined)
-  assert.equal(store.claimCallback(randomOpaque()), undefined)
+  assert.equal(store.claimAuthorization(randomOpaque()), undefined)
 
-  const claimed = store.claimCallback(state)
+  const claimed = store.claimAuthorization(state)
   assert.deepEqual(claimed, {
+    kind: 'invitation',
     invitationId: started.invitationId,
     userId: created.userId,
   })
-  assert.equal(store.claimCallback(state), undefined)
+  assert.equal(store.claimAuthorization(state), undefined)
 
   for (const file of await databaseFiles(path)) {
     const bytes = await readFile(file)
@@ -315,6 +318,170 @@ test('invitation start and callback claim are expiry-bound and one-time', async 
     store.startInvitation(expired.invitation, randomOpaque()),
     undefined,
   )
+})
+
+test('self-enrollment authorization states are hash-only expiry-bound and one-time', async (t) => {
+  const { clock, path, store } = await fixture(t)
+  const created = []
+
+  for (let index = 0; index < 100; index += 1) {
+    created.push(store.createSelfEnrollment())
+  }
+
+  assert.equal(new Set(created.map(({ state }) => state)).size, 100)
+  for (const enrollment of created) {
+    assert.match(enrollment.state, /^[A-Za-z0-9_-]{43}$/)
+    assert.equal(enrollment.expiresAt, NOW + 10 * 60)
+  }
+
+  const claimed = store.claimAuthorization(created[0].state)
+  assert.deepEqual(claimed, {
+    kind: 'self_enrollment',
+    enrollmentId:
+      assert.match(claimed.enrollmentId, /^[0-9a-f-]{36}$/) ??
+      claimed.enrollmentId,
+  })
+  assert.equal(store.claimAuthorization(created[0].state), undefined)
+
+  clock.value = created[1].expiresAt
+  assert.equal(store.claimAuthorization(created[1].state), undefined)
+
+  for (const file of await databaseFiles(path)) {
+    const bytes = await readFile(file)
+    for (const { state } of created) {
+      assert.equal(bytes.includes(Buffer.from(state)), false)
+    }
+  }
+})
+
+test('authorization state claim has exactly one winner across store connections', async (t) => {
+  const { path, store } = await fixture(t)
+  const enrollment = store.createSelfEnrollment()
+  const observer = InternalAuthStore.open({
+    path,
+    cipher: new SecretCipher(KEY),
+    subdomain: 'acme',
+    clientId: 'internal-mcp',
+    now: () => NOW,
+  })
+  t.after(() => observer.close())
+
+  const results = [
+    store.claimAuthorization(enrollment.state),
+    observer.claimAuthorization(enrollment.state),
+  ]
+  assert.equal(results.filter(Boolean).length, 1)
+  assert.equal(results.find(Boolean).kind, 'self_enrollment')
+})
+
+test('self-enrollment atomically creates one hash-only bearer for one eligible identity', async (t) => {
+  const { path, store } = await fixture(t)
+  const enrollment = store.createSelfEnrollment()
+  const claimed = store.claimAuthorization(enrollment.state)
+  assert.equal(claimed.kind, 'self_enrollment')
+
+  const created = store.completeSelfEnrollment({
+    enrollmentId: claimed.enrollmentId,
+    identity: {
+      id: '4242',
+      name: 'Authoritative Agent',
+      email: 'agent@example.test',
+      role: 'agent',
+    },
+    grant: grant('self-service'),
+  })
+  assert.equal(created.kind, 'created')
+  assert.match(created.userId, /^[0-9a-f-]{36}$/)
+  assert.match(created.bearer, /^zmcp_[A-Za-z0-9_-]{43}$/)
+  assert.deepEqual(store.authenticateBearer(created.bearer), {
+    userId: created.userId,
+  })
+  assert.throws(
+    () =>
+      store.completeSelfEnrollment({
+        enrollmentId: claimed.enrollmentId,
+        identity: {
+          id: '4243',
+          name: 'Replay Agent',
+          email: 'replay@example.test',
+          role: 'agent',
+        },
+        grant: grant('replay'),
+      }),
+    /Unable to complete self-service enrollment/,
+  )
+  assert.equal(store.inspectUsers().length, 1)
+  assert.deepEqual(store.inspectUsers()[0], {
+    id: created.userId,
+    label: 'Authoritative Agent',
+    status: 'active',
+    zendeskUserId: '4242',
+    zendeskName: 'Authoritative Agent',
+    zendeskEmail: 'agent@example.test',
+    createdAt: NOW,
+    updatedAt: NOW,
+    revokedAt: null,
+    invitationStatus: 'none',
+    invitationExpiresAt: null,
+  })
+
+  const duplicateEnrollment = store.createSelfEnrollment()
+  const duplicateClaim = store.claimAuthorization(duplicateEnrollment.state)
+  assert.deepEqual(
+    store.completeSelfEnrollment({
+      enrollmentId: duplicateClaim.enrollmentId,
+      identity: {
+        id: '4242',
+        name: 'Renamed Agent',
+        email: 'renamed@example.test',
+        role: 'admin',
+      },
+      grant: grant('duplicate'),
+    }),
+    { kind: 'already_registered' },
+  )
+  assert.equal(store.inspectUsers().length, 1)
+
+  for (const file of await databaseFiles(path)) {
+    const bytes = await readFile(file)
+    for (const secret of [
+      created.bearer,
+      grant('self-service').accessToken,
+      grant('self-service').refreshToken,
+      grant('duplicate').accessToken,
+      grant('duplicate').refreshToken,
+    ]) {
+      assert.equal(bytes.includes(Buffer.from(secret)), false)
+    }
+  }
+})
+
+test('self-enrollment rejects ineligible or invalid activation without a partial user', async (t) => {
+  const { store } = await fixture(t)
+
+  for (const [role, userGrant] of [
+    ['end-user', grant('end-user')],
+    ['agent', grant('expired', NOW - 1)],
+  ]) {
+    const enrollment = store.createSelfEnrollment()
+    const claimed = store.claimAuthorization(enrollment.state)
+    assert.throws(
+      () =>
+        store.completeSelfEnrollment({
+          enrollmentId: claimed.enrollmentId,
+          identity: {
+            id: role === 'end-user' ? '5001' : '5002',
+            name: 'Rejected identity',
+            email: 'rejected@example.test',
+            role,
+          },
+          grant: userGrant,
+        }),
+      /Unable to complete self-service enrollment/,
+    )
+  }
+
+  assert.deepEqual(store.inspectUsers(), [])
 })
 
 test('callback completion activates only the claimed mapping from authoritative identity', async (t) => {

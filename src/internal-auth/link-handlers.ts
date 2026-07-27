@@ -77,8 +77,8 @@ export function createLinkHandlers(options: {
       return;
     }
 
-    const claimed = options.store.claimCallback(state);
-    if (!claimed) {
+    const claimed = options.store.claimAuthorization(state);
+    if (!claimed || claimed.kind !== "invitation") {
       html(response, 400, INVALID_CALLBACK_PAGE);
       return;
     }

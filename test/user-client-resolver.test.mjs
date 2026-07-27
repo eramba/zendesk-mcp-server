@@ -27,8 +27,9 @@ function activate(store, label, identityId, userGrant = grant(label)) {
   const state = randomOpaque()
   const started = store.startInvitation(created.invitation, state)
   assert.ok(started)
-  const claimed = store.claimCallback(state)
+  const claimed = store.claimAuthorization(state)
   assert.ok(claimed)
+  assert.equal(claimed.kind, 'invitation')
   store.completeLink({
     ...claimed,
     identity: {

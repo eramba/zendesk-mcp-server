@@ -12,6 +12,7 @@ import {
 
 const SCHEMA_VERSION = "1";
 const INVITATION_TTL_SECONDS = 30 * 60;
+const SELF_ENROLLMENT_TTL_SECONDS = 10 * 60;
 const KEY_CHECK_PLAINTEXT = "zendesk-internal-user-bearers";
 
 export type OAuthGrant = {
@@ -28,6 +29,17 @@ export type ZendeskIdentity = {
   email: string | null;
   role: "end-user" | "agent" | "admin";
 };
+
+export type AuthorizationClaim =
+  | {
+      kind: "invitation";
+      invitationId: string;
+      userId: string;
+    }
+  | {
+      kind: "self_enrollment";
+      enrollmentId: string;
+    };
 
 export type UserStatus =
   | "pending"
@@ -93,6 +105,11 @@ type InvitationRow = {
   expires_at: number;
 };
 
+type SelfEnrollmentRow = {
+  id: string;
+  expires_at: number;
+};
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS store_metadata (
   key TEXT PRIMARY KEY,
@@ -138,6 +155,17 @@ ON oauth_invitations(user_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS oauth_invitations_expiry_idx
 ON oauth_invitations(expires_at);
+
+CREATE TABLE IF NOT EXISTS oauth_self_enrollments (
+  id TEXT PRIMARY KEY,
+  state_hash TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  consumed_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS oauth_self_enrollments_expiry_idx
+ON oauth_self_enrollments(expires_at);
 
 CREATE TABLE IF NOT EXISTS oauth_grants (
   user_id TEXT PRIMARY KEY REFERENCES internal_users(id) ON DELETE CASCADE,
@@ -239,6 +267,25 @@ function validateIdentity(identity: ZendeskIdentity): void {
   }
 }
 
+function eligibleIdentityLabel(identity: ZendeskIdentity): string {
+  if (identity.role !== "agent" && identity.role !== "admin") {
+    throw new Error("Zendesk identity is not eligible");
+  }
+  for (const candidate of [
+    identity.name,
+    identity.email,
+    `Zendesk user ${identity.id}`,
+  ]) {
+    if (candidate === null) continue;
+    try {
+      return validateLabel(candidate);
+    } catch {
+      // Fall through to the next authoritative identity field.
+    }
+  }
+  throw new Error("Zendesk identity has no safe label");
+}
+
 export class InternalAuthStore {
   readonly #database: Database.Database;
   readonly #path: string;
@@ -276,7 +323,7 @@ export class InternalAuthStore {
 
       const store = new InternalAuthStore(database, options);
       store.#initializeMetadata();
-      store.#cleanupInvitations();
+      store.#cleanupExpiredAuthorizationState();
       return store;
     } catch {
       try {
@@ -340,6 +387,38 @@ export class InternalAuthStore {
     return created;
   }
 
+  createSelfEnrollment(): { state: string; expiresAt: number } {
+    const now = this.#currentTime();
+    const expiresAt = now + SELF_ENROLLMENT_TTL_SECONDS;
+    if (!Number.isSafeInteger(expiresAt)) {
+      throw new Error("Authentication store clock is invalid");
+    }
+    this.#cleanupExpiredAuthorizationState(now);
+
+    const insert = this.#database.transaction(() => {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const state = randomOpaque();
+        try {
+          this.#database
+            .prepare(
+              `INSERT INTO oauth_self_enrollments (
+                id, state_hash, created_at, expires_at
+              ) VALUES (?, ?, ?, ?)`,
+            )
+            .run(randomUUID(), hashOpaque(state), now, expiresAt);
+          return { state, expiresAt };
+        } catch (error) {
+          if (sqliteCode(error) !== "SQLITE_CONSTRAINT_UNIQUE") throw error;
+        }
+      }
+      throw new Error("Unable to allocate self-service enrollment state");
+    });
+
+    const created = insert.immediate();
+    this.#restrictDatabaseFiles();
+    return created;
+  }
+
   authenticateBearer(bearer: string): { userId: string } | undefined {
     if (!/^zmcp_[A-Za-z0-9_-]{43}$/.test(bearer)) return undefined;
     const row = this.#database
@@ -370,7 +449,7 @@ export class InternalAuthStore {
       return undefined;
     }
     const now = this.#currentTime();
-    this.#cleanupInvitations(now);
+    this.#cleanupExpiredAuthorizationState(now);
     const start = this.#database.transaction(() => {
       const row = this.#database
         .prepare(
@@ -407,14 +486,13 @@ export class InternalAuthStore {
     return result;
   }
 
-  claimCallback(
-    state: string,
-  ): { invitationId: string; userId: string } | undefined {
+  claimAuthorization(state: string): AuthorizationClaim | undefined {
     if (!/^[A-Za-z0-9_-]{43}$/.test(state)) return undefined;
     const now = this.#currentTime();
-    this.#cleanupInvitations(now);
+    this.#cleanupExpiredAuthorizationState(now);
     const claim = this.#database.transaction(() => {
-      const row = this.#database
+      const stateHash = hashOpaque(state);
+      const invitation = this.#database
         .prepare(
           `SELECT invitation.id, invitation.user_id, invitation.expires_at
            FROM oauth_invitations AS invitation
@@ -425,21 +503,54 @@ export class InternalAuthStore {
              AND invitation.expires_at > ?
              AND users.status IN ('pending', 'reauthorization_required')`,
         )
-        .get(hashOpaque(state), now) as InvitationRow | undefined;
-      if (!row) return undefined;
+        .get(stateHash, now) as InvitationRow | undefined;
+      const enrollment = this.#database
+        .prepare(
+          `SELECT id, expires_at
+           FROM oauth_self_enrollments
+           WHERE state_hash = ?
+             AND consumed_at IS NULL
+             AND expires_at > ?`,
+        )
+        .get(stateHash, now) as SelfEnrollmentRow | undefined;
+
+      if ((invitation ? 1 : 0) + (enrollment ? 1 : 0) !== 1) {
+        return undefined;
+      }
+      if (invitation) {
+        const result = this.#database
+          .prepare(
+            `UPDATE oauth_invitations
+             SET consumed_at = ?
+             WHERE id = ?
+               AND consumed_at IS NULL
+               AND expires_at > ?`,
+          )
+          .run(now, invitation.id, now);
+        if (result.changes !== 1) return undefined;
+        return {
+          kind: "invitation" as const,
+          invitationId: invitation.id,
+          userId: invitation.user_id,
+        };
+      }
+
       const result = this.#database
         .prepare(
-          `UPDATE oauth_invitations
+          `UPDATE oauth_self_enrollments
            SET consumed_at = ?
            WHERE id = ?
              AND consumed_at IS NULL
              AND expires_at > ?`,
         )
-        .run(now, row.id, now);
+        .run(now, (enrollment as SelfEnrollmentRow).id, now);
       if (result.changes !== 1) return undefined;
-      return { invitationId: row.id, userId: row.user_id };
+      return {
+        kind: "self_enrollment" as const,
+        enrollmentId: (enrollment as SelfEnrollmentRow).id,
+      };
     });
-    const result = claim();
+    const result = claim.immediate();
     this.#restrictDatabaseFiles();
     return result;
   }
@@ -537,6 +648,107 @@ export class InternalAuthStore {
     }
   }
 
+  completeSelfEnrollment(input: {
+    enrollmentId: string;
+    identity: ZendeskIdentity;
+    grant: OAuthGrant;
+  }):
+    | { kind: "created"; userId: string; bearer: string }
+    | { kind: "already_registered" } {
+    try {
+      validateIdentity(input.identity);
+      const label = eligibleIdentityLabel(input.identity);
+      const grant = canonicalGrant(input.grant);
+      const now = this.#currentTime();
+      if (grant.accessExpiresAt <= now || grant.refreshExpiresAt <= now) {
+        throw new Error("OAuth grant is expired");
+      }
+
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const userId = randomUUID();
+        const bearer = randomOpaque("zmcp_");
+        const version = 1;
+        const encryptedGrant = this.#encryptGrant(userId, version, grant);
+        const complete = this.#database.transaction(() => {
+          const enrollment = this.#database
+            .prepare(
+              `SELECT id
+               FROM oauth_self_enrollments
+               WHERE id = ?
+                 AND consumed_at IS NOT NULL
+                 AND expires_at > ?`,
+            )
+            .get(input.enrollmentId, now);
+          if (!enrollment) throw new Error("invalid enrollment claim");
+
+          this.#database
+            .prepare(
+              `INSERT INTO internal_users (
+                id, label, bearer_hash, status,
+                zendesk_user_id, zendesk_name, zendesk_email,
+                created_at, updated_at
+              ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              userId,
+              label,
+              hashOpaque(bearer),
+              input.identity.id,
+              input.identity.name,
+              input.identity.email,
+              now,
+              now,
+            );
+          this.#database
+            .prepare(
+              `INSERT INTO oauth_grants (
+                user_id, version, encrypted_grant, access_expires_at,
+                refresh_expires_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              userId,
+              version,
+              encryptedGrant,
+              grant.accessExpiresAt,
+              grant.refreshExpiresAt,
+              now,
+            );
+          const removed = this.#database
+            .prepare(
+              `DELETE FROM oauth_self_enrollments
+               WHERE id = ?
+                 AND consumed_at IS NOT NULL
+                 AND expires_at > ?`,
+            )
+            .run(input.enrollmentId, now);
+          if (removed.changes !== 1) {
+            throw new Error("invalid enrollment completion");
+          }
+        });
+
+        try {
+          complete.immediate();
+          this.#restrictDatabaseFiles();
+          return { kind: "created", userId, bearer };
+        } catch (error) {
+          if (sqliteCode(error) !== "SQLITE_CONSTRAINT_UNIQUE") throw error;
+          const existingIdentity = this.#database
+            .prepare(
+              `SELECT 1
+               FROM internal_users
+               WHERE zendesk_user_id = ?`,
+            )
+            .get(input.identity.id);
+          if (existingIdentity) return { kind: "already_registered" };
+        }
+      }
+      throw new Error("Unable to allocate unique authentication credentials");
+    } catch {
+      throw new Error("Unable to complete self-service enrollment");
+    }
+  }
+
   createReauthorization(userId: string): {
     invitation: string;
     expiresAt: number;
@@ -547,7 +759,7 @@ export class InternalAuthStore {
       if (!Number.isSafeInteger(expiresAt)) {
         throw new Error("invalid expiry");
       }
-      this.#cleanupInvitations(now);
+      this.#cleanupExpiredAuthorizationState(now);
       const create = this.#database.transaction(() => {
         const user = this.#database
           .prepare(
@@ -933,10 +1145,16 @@ export class InternalAuthStore {
     return `grant:v1:${this.#subdomain}:${this.#clientId}:${userId}:${version}`;
   }
 
-  #cleanupInvitations(now = this.#currentTime()): void {
-    this.#database
-      .prepare("DELETE FROM oauth_invitations WHERE expires_at <= ?")
-      .run(now);
+  #cleanupExpiredAuthorizationState(now = this.#currentTime()): void {
+    const cleanup = this.#database.transaction(() => {
+      this.#database
+        .prepare("DELETE FROM oauth_invitations WHERE expires_at <= ?")
+        .run(now);
+      this.#database
+        .prepare("DELETE FROM oauth_self_enrollments WHERE expires_at <= ?")
+        .run(now);
+    });
+    cleanup.immediate();
     this.#restrictDatabaseFiles();
   }
 
