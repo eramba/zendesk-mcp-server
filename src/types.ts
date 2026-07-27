@@ -158,6 +158,12 @@ export type CursorPage<T> = {
   next_cursor: string | null;
 };
 
+export type ZendeskUserTicketRelationship =
+  | "requested"
+  | "assigned"
+  | "ccd"
+  | "followed";
+
 export type ZendeskView = {
   id: number;
   title: string | null;

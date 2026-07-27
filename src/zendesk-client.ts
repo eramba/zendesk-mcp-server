@@ -19,6 +19,7 @@ import type {
   ZendeskTicketField,
   ZendeskTicketWriteFields,
   ZendeskUser,
+  ZendeskUserTicketRelationship,
   ZendeskView,
 } from "./types.js";
 import { SafeAuthError } from "./internal-auth/errors.js";
@@ -786,6 +787,55 @@ export class ZendeskClient {
   async getCurrentUser(): Promise<ZendeskUser> {
     const data = await this.request<{ user: UserPayload }>("/users/me.json");
     return normalizeUser(data.user);
+  }
+
+  async getUser(userId: number): Promise<ZendeskUser> {
+    const data = await this.request<{ user: UserPayload }>(`/users/${userId}.json`);
+    return normalizeUser(data.user);
+  }
+
+  async getOrganization(organizationId: number): Promise<ZendeskOrganization> {
+    const data = await this.request<{ organization: OrganizationPayload }>(
+      `/organizations/${organizationId}.json`,
+    );
+    return normalizeOrganization(data.organization);
+  }
+
+  async listUserTickets(
+    userId: number,
+    relationship: ZendeskUserTicketRelationship,
+    options: CursorInput,
+  ): Promise<CursorPage<ZendeskTicket>> {
+    const query = this.cursorQuery(options);
+    const data = await this.request<{
+      tickets: TicketPayload[];
+      links?: { next?: string | null };
+      meta?: { has_more?: boolean };
+    }>(`/users/${userId}/tickets/${relationship}.json?${query.toString()}`);
+    return this.cursorPage(
+      data.tickets.map(normalizeTicket),
+      options,
+      data.meta?.has_more,
+      data.links?.next,
+    );
+  }
+
+  async listOrganizationTickets(
+    organizationId: number,
+    options: CursorInput,
+  ): Promise<CursorPage<ZendeskTicket>> {
+    const query = this.cursorQuery(options);
+    const data = await this.request<{
+      tickets: TicketPayload[];
+      links?: { next?: string | null };
+      meta?: { has_more?: boolean };
+    }>(`/organizations/${organizationId}/tickets.json?${query.toString()}`);
+    return this.cursorPage(
+      data.tickets.map(normalizeTicket),
+      options,
+      data.meta?.has_more,
+      data.links?.next,
+    );
   }
 
   async listViews(options: CursorInput): Promise<CursorPage<ZendeskView>> {
