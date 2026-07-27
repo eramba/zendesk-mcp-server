@@ -83,6 +83,36 @@ function enrollmentSuccessPage(input: {
   bearer: string;
   mcpUrl: string;
 }): string {
+  const installer = [
+    "/bin/zsh -c '",
+    "set -e",
+    "umask 077",
+    "command -v codex >/dev/null || {",
+    '  echo "Codex CLI is not installed."',
+    "  exit 1",
+    "}",
+    "",
+    'read -r -s "token?Paste MCP bearer: "',
+    "echo",
+    "",
+    '[[ "$token" =~ ^zmcp_[A-Za-z0-9_-]{43}$ ]] || {',
+    '  echo "Invalid MCP bearer."',
+    "  exit 1",
+    "}",
+    "",
+    "codex mcp add zendesk \\",
+    `  --url "${input.mcpUrl}"`,
+    "",
+    'config="$HOME/.codex/config.toml"',
+    'chmod 600 "$config"',
+    'printf "\\n[mcp_servers.zendesk.http_headers]\\nAuthorization = \\"Bearer %s\\"\\n" "$token" >> "$config"',
+    "unset token",
+    "",
+    "codex mcp get zendesk",
+    "echo",
+    'echo "Zendesk MCP configured. Restart Codex."',
+    "'",
+  ].join("\n");
   const config = [
     "[mcp_servers.zendesk]",
     `url = "${input.mcpUrl}"`,
@@ -96,7 +126,12 @@ function enrollmentSuccessPage(input: {
 <p><strong>The MCP bearer is displayed once and cannot be recovered. Copy it now.</strong></p>
 <p>user_id:</p><pre>${escapeHtml(input.userId)}</pre>
 <p>mcp_bearer:</p><pre>${escapeHtml(input.bearer)}</pre>
-<p>Codex configuration:</p><pre>${escapeHtml(config)}</pre>`;
+<h2>Recommended: configure Codex automatically</h2>
+<p>Copy and run this entire command in Terminal. When prompted, paste the MCP bearer shown above and press Enter. Restart Codex when it finishes.</p>
+<pre id="codex-installer">${escapeHtml(installer)}</pre>
+<h2>Manual fallback</h2>
+<p>If the installer cannot be used, replace the existing zendesk block in ~/.codex/config.toml with this complete configuration:</p>
+<pre id="codex-config">${escapeHtml(config)}</pre>`;
 }
 
 async function revokeBestEffort(

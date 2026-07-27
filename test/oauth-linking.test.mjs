@@ -122,6 +122,17 @@ function assertBrowserSecurity(response, referrerPolicy = 'no-referrer') {
   assert.match(response.headers.get('permissions-policy'), /camera=\(\)/)
 }
 
+function preformattedText(body, id) {
+  const match = body.match(new RegExp(`<pre id="${id}">([\\s\\S]*?)</pre>`))
+  assert.ok(match, `missing ${id} preformatted block`)
+  return match[1]
+    .replaceAll('&quot;', '"')
+    .replaceAll('&#39;', "'")
+    .replaceAll('&gt;', '>')
+    .replaceAll('&lt;', '<')
+    .replaceAll('&amp;', '&')
+}
+
 async function beginSelfEnrollment(f, origin = PUBLIC_BASE_URL.origin) {
   const response = await fetch(`${f.baseUrl}/create-account`, {
     method: 'POST',
@@ -215,6 +226,19 @@ for (const eligibleRole of ['agent', 'admin']) {
     assert.match(body, /https:\/\/mcp\.example\.test\/mcp/)
     assert.match(body, /Authorization = &quot;Bearer zmcp_/)
     assert.match(body, /shown once|displayed once|cannot be recovered/i)
+    const installer = preformattedText(body, 'codex-installer')
+    const fallback = preformattedText(body, 'codex-config')
+    assert.match(installer, /^\/bin\/zsh -c '\nset -e\numask 077\n/)
+    assert.match(installer, /read -r -s "token\?Paste MCP bearer: "/)
+    assert.match(installer, /\^zmcp_\[A-Za-z0-9_-\]\{43\}\$/)
+    assert.match(installer, /codex mcp add zendesk \\\n  --url "https:\/\/mcp\.example\.test\/mcp"/)
+    assert.match(installer, /chmod 600 "\$config"/)
+    assert.match(installer, /codex mcp get zendesk/)
+    assert.match(installer, /Restart Codex/)
+    assert.equal(installer.includes(bearer), false)
+    assert.match(fallback, /^\[mcp_servers\.zendesk\]/)
+    assert.match(fallback, /url = "https:\/\/mcp\.example\.test\/mcp"/)
+    assert.equal(fallback.includes(`Authorization = "Bearer ${bearer}"`), true)
     assert.deepEqual(f.store.authenticateBearer(bearer), { userId })
     assert.deepEqual(f.calls.exchanges, ['self-code-sentinel'])
     assert.deepEqual(f.calls.identities, ['access-linked-sentinel'])
