@@ -146,6 +146,53 @@ export type ZendeskOrganization = {
   tags: string[];
 };
 
+export type CursorInput = {
+  pageSize: number;
+  after?: string;
+};
+
+export type CursorPage<T> = {
+  items: T[];
+  page_size: number;
+  has_more: boolean;
+  next_cursor: string | null;
+};
+
+export type ZendeskView = {
+  id: number;
+  title: string | null;
+  description: string | null;
+  active: boolean;
+  default: boolean;
+  position: number | null;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type ZendeskGroup = {
+  id: number;
+  name: string | null;
+  description: string | null;
+  default: boolean;
+  deleted: boolean;
+  is_public: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type ZendeskGroupMembership = {
+  id: number;
+  user_id: number;
+  group_id: number;
+  default: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type ZendeskGroupMembersPage = CursorPage<ZendeskGroupMembership> & {
+  users: ZendeskUser[];
+};
+
 export type TicketListResult = {
   tickets: ZendeskTicket[];
   page: number;

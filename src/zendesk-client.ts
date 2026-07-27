@@ -1,10 +1,15 @@
 import type {
+  CursorInput,
+  CursorPage,
   TicketAuditListResult,
   TicketFieldListResult,
   TicketListResult,
   TicketSearchResult,
   ZendeskAttachment,
   ZendeskComment,
+  ZendeskGroup,
+  ZendeskGroupMembership,
+  ZendeskGroupMembersPage,
   ZendeskKnowledgeBase,
   ZendeskOrganization,
   ZendeskSearchResult,
@@ -14,6 +19,7 @@ import type {
   ZendeskTicketField,
   ZendeskTicketWriteFields,
   ZendeskUser,
+  ZendeskView,
 } from "./types.js";
 import { SafeAuthError } from "./internal-auth/errors.js";
 
@@ -115,6 +121,37 @@ type OrganizationPayload = {
 };
 
 type SearchResultPayload = TicketPayload | UserPayload | OrganizationPayload;
+
+type ViewPayload = {
+  id?: number;
+  title?: string;
+  description?: string;
+  active?: boolean;
+  default?: boolean;
+  position?: number;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type GroupPayload = {
+  id?: number;
+  name?: string;
+  description?: string;
+  default?: boolean;
+  deleted?: boolean;
+  is_public?: boolean;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type GroupMembershipPayload = {
+  id?: number;
+  user_id?: number;
+  group_id?: number;
+  default?: boolean;
+  created_at?: string;
+  updated_at?: string;
+};
 
 type TicketFieldPayload = {
   id?: number;
@@ -358,6 +395,45 @@ function normalizeOrganization(organization: OrganizationPayload): ZendeskOrgani
     updated_at: organization.updated_at ?? null,
     shared_tickets: Boolean(organization.shared_tickets),
     tags: Array.isArray(organization.tags) ? organization.tags : [],
+  };
+}
+
+function normalizeView(view: ViewPayload): ZendeskView {
+  return {
+    id: Number(view.id),
+    title: view.title ?? null,
+    description: view.description ?? null,
+    active: Boolean(view.active),
+    default: Boolean(view.default),
+    position: view.position ?? null,
+    created_at: view.created_at ?? null,
+    updated_at: view.updated_at ?? null,
+  };
+}
+
+function normalizeGroup(group: GroupPayload): ZendeskGroup {
+  return {
+    id: Number(group.id),
+    name: group.name ?? null,
+    description: group.description ?? null,
+    default: Boolean(group.default),
+    deleted: Boolean(group.deleted),
+    is_public: Boolean(group.is_public),
+    created_at: group.created_at ?? null,
+    updated_at: group.updated_at ?? null,
+  };
+}
+
+function normalizeGroupMembership(
+  membership: GroupMembershipPayload,
+): ZendeskGroupMembership {
+  return {
+    id: Number(membership.id),
+    user_id: Number(membership.user_id),
+    group_id: Number(membership.group_id),
+    default: Boolean(membership.default),
+    created_at: membership.created_at ?? null,
+    updated_at: membership.updated_at ?? null,
   };
 }
 
@@ -712,6 +788,78 @@ export class ZendeskClient {
     return normalizeUser(data.user);
   }
 
+  async listViews(options: CursorInput): Promise<CursorPage<ZendeskView>> {
+    const query = this.cursorQuery(options, { active: "true" });
+    const data = await this.request<{
+      views: ViewPayload[];
+      links?: { next?: string | null };
+      meta?: { has_more?: boolean };
+    }>(`/views.json?${query.toString()}`);
+    return this.cursorPage(
+      data.views.map(normalizeView),
+      options,
+      data.meta?.has_more,
+      data.links?.next,
+    );
+  }
+
+  async listViewTickets(
+    viewId: number,
+    options: CursorInput,
+  ): Promise<CursorPage<ZendeskTicket>> {
+    const query = this.cursorQuery(options);
+    const data = await this.request<{
+      tickets: TicketPayload[];
+      links?: { next?: string | null };
+      meta?: { has_more?: boolean };
+    }>(`/views/${viewId}/tickets.json?${query.toString()}`);
+    return this.cursorPage(
+      data.tickets.map(normalizeTicket),
+      options,
+      data.meta?.has_more,
+      data.links?.next,
+    );
+  }
+
+  async listAssignableGroups(
+    options: CursorInput,
+  ): Promise<CursorPage<ZendeskGroup>> {
+    const query = this.cursorQuery(options);
+    const data = await this.request<{
+      groups: GroupPayload[];
+      links?: { next?: string | null };
+      meta?: { has_more?: boolean };
+    }>(`/groups/assignable.json?${query.toString()}`);
+    return this.cursorPage(
+      data.groups.map(normalizeGroup),
+      options,
+      data.meta?.has_more,
+      data.links?.next,
+    );
+  }
+
+  async listGroupMembers(
+    groupId: number,
+    options: CursorInput,
+  ): Promise<ZendeskGroupMembersPage> {
+    const query = this.cursorQuery(options, { include: "users" });
+    const data = await this.request<{
+      group_memberships: GroupMembershipPayload[];
+      users?: UserPayload[];
+      links?: { next?: string | null };
+      meta?: { has_more?: boolean };
+    }>(`/groups/${groupId}/memberships.json?${query.toString()}`);
+    return {
+      ...this.cursorPage(
+        data.group_memberships.map(normalizeGroupMembership),
+        options,
+        data.meta?.has_more,
+        data.links?.next,
+      ),
+      users: (data.users ?? []).map(normalizeUser),
+    };
+  }
+
   async searchUsers(options: {
     query: string;
     page: number;
@@ -932,5 +1080,34 @@ export class ZendeskClient {
     }
 
     return nextUrl;
+  }
+
+  private cursorQuery(
+    options: CursorInput,
+    leading: Record<string, string> = {},
+  ): URLSearchParams {
+    const query = new URLSearchParams(leading);
+    query.set("page[size]", String(Math.min(options.pageSize, 100)));
+    if (options.after) query.set("page[after]", options.after);
+    return query;
+  }
+
+  private cursorPage<T>(
+    items: T[],
+    options: CursorInput,
+    hasMore = false,
+    nextUrl: string | null = null,
+  ): CursorPage<T> {
+    const nextPath = this.nextPath(nextUrl);
+    const nextCursor = nextPath
+      ? new URL(`${this.baseUrl}${nextPath}`).searchParams.get("page[after]")
+      : null;
+    if (hasMore && !nextCursor) throw new SafeAuthError("invalid_response");
+    return {
+      items,
+      page_size: Math.min(options.pageSize, 100),
+      has_more: Boolean(hasMore),
+      next_cursor: hasMore ? nextCursor : null,
+    };
   }
 }
