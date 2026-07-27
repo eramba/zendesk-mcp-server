@@ -304,6 +304,7 @@ Tools:
 - `get_tickets`
 - `search_tickets`
 - `search`
+- `get_current_user`
 - `search_users`
 - `search_organizations`
 - `list_ticket_fields`

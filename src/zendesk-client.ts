@@ -613,6 +613,11 @@ export class ZendeskClient {
     };
   }
 
+  async getCurrentUser(): Promise<ZendeskUser> {
+    const data = await this.request<{ user: UserPayload }>("/users/me.json");
+    return normalizeUser(data.user);
+  }
+
   async searchUsers(options: {
     query: string;
     page: number;
