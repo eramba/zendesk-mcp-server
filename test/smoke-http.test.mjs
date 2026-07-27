@@ -5,7 +5,7 @@ import test from 'node:test'
 
 const execFileAsync = promisify(execFile)
 
-test('fake-only local smoke proves health, auth rejection, MCP initialization, and zero Zendesk calls', async () => {
+test('fake-only local smoke proves browser enrollment, MCP initialization, replay rejection, and zero Zendesk calls', async () => {
   const { stdout, stderr } = await execFileAsync(
     process.execPath,
     ['scripts/smoke-http-local.mjs'],
@@ -21,6 +21,10 @@ test('fake-only local smoke proves health, auth rejection, MCP initialization, a
     ok: true,
     healthStatus: 200,
     unauthenticatedStatus: 401,
+    enrollmentPage: true,
+    oauthRedirect: true,
+    enrollmentCompleted: true,
+    replayRejected: true,
     initialized: true,
     toolsListed: true,
     zendeskRequests: 0,

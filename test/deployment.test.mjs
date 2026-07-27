@@ -73,11 +73,13 @@ test('HTTP and stdio environment examples keep authentication boundaries separat
     'OAUTH_ENCRYPTION_KEY',
     'OAUTH_DB_PATH',
     'MCP_ALLOWED_HOSTS',
+    'SELF_SERVICE_ENROLLMENT_ENABLED',
   ]) {
     assert.match(httpExample, new RegExp(`^${name}=`, 'm'))
   }
   assert.equal(httpExample.includes('MCP_BEARER_TOKEN='), false)
   assert.equal(httpExample.includes('ZENDESK_API_KEY='), false)
+  assert.match(httpExample, /^SELF_SERVICE_ENROLLMENT_ENABLED=false$/m)
   assert.match(stdioExample, /^ZENDESK_EMAIL=/m)
   assert.match(stdioExample, /^ZENDESK_API_KEY=/m)
   assert.equal(stdioExample.includes('OAUTH_ENCRYPTION_KEY='), false)

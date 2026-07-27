@@ -55,6 +55,8 @@ Set the generated value as `OAUTH_ENCRYPTION_KEY`, then configure:
 - `ZENDESK_OAUTH_CLIENT_ID` and `ZENDESK_OAUTH_CLIENT_SECRET`
 - `OAUTH_DB_PATH`: absolute SQLite path (`/data/oauth.sqlite` in Compose)
 - `MCP_ALLOWED_HOSTS`, `HOST`, and `PORT` as needed
+- `SELF_SERVICE_ENROLLMENT_ENABLED`: exact `true` or `false`; defaults to
+  `false`
 
 The server never derives its callback from `Host` or forwarded headers.
 `GET /healthz` is public and never contacts Zendesk. `POST /mcp` is protected;
@@ -68,6 +70,36 @@ npm install
 npm run build
 npm run start:http
 ```
+
+### Optional self-service enrollment
+
+Enable self-service only when the canonical HTTPS origin is restricted to the
+intended colleagues through Tailscale access policy. Tailscale is the network
+boundary; the application does not infer or verify Tailscale identity from
+forwarded headers.
+
+```dotenv
+SELF_SERVICE_ENROLLMENT_ENABLED=true
+```
+
+After restarting the service, an internal colleague opens:
+
+```text
+https://your-internal-mcp.example/create-account
+```
+
+The page redirects through the same fixed Zendesk OAuth client. Only an
+authoritative Zendesk `agent` or `admin` identity can complete enrollment; an
+end user receives no MCP account or bearer. After OAuth succeeds, the browser
+shows the personal bearer and a Codex configuration fragment once. The bearer
+is not recoverable from the database or a second page load, so it must be
+copied immediately to the colleague's protected Codex configuration.
+
+One Zendesk identity can have only one internal account. A duplicate,
+previously revoked, lost-bearer, or reauthorization case must be handled with
+the administrator commands below. Disable new self-service enrollment at any
+time by setting the flag to `false` and restarting; existing linked bearers
+continue to work.
 
 ### Create and link a user
 
@@ -128,6 +160,21 @@ Set only that user's bearer on the client:
 export ZENDESK_MCP_BEARER_TOKEN='the-user-specific-bearer'
 ```
 
+For a Codex desktop configuration that must survive a computer restart without
+depending on a launch environment variable, use the one-time fragment shown by
+the enrollment page:
+
+```toml
+[mcp_servers.zendesk]
+url = "https://your-internal-mcp.example/mcp"
+
+[mcp_servers.zendesk.http_headers]
+Authorization = "Bearer zmcp_the-user-specific-bearer"
+```
+
+This stores the bearer as plaintext in the user's protected Codex config, so
+the file must not be shared or committed.
+
 Do not copy the Zendesk OAuth client secret, encryption key, database, access
 token, or refresh token to MCP clients.
 
@@ -147,7 +194,8 @@ credentials and asserts that zero Zendesk requests occur.
 
 Compose publishes plain HTTP on host loopback by default. Terminate HTTPS in
 the existing trusted reverse proxy and do not expose the plain HTTP port
-directly.
+directly. Before enabling self-service, verify that the HTTPS origin is not
+reachable outside the approved Tailscale users.
 
 ```bash
 docker compose config

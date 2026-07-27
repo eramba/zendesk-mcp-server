@@ -9,7 +9,8 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 
 import { createHttpApp } from '../dist/http-app.js'
 import { UserClientResolver } from '../dist/internal-auth/client-resolver.js'
-import { SecretCipher, randomOpaque } from '../dist/internal-auth/crypto.js'
+import { SecretCipher } from '../dist/internal-auth/crypto.js'
+import { createLinkHandlers } from '../dist/internal-auth/link-handlers.js'
 import { InternalAuthStore } from '../dist/internal-auth/store.js'
 
 const directory = await mkdtemp(join(tmpdir(), 'zendesk-mcp-local-smoke-'))
@@ -19,35 +20,51 @@ const store = InternalAuthStore.open({
   subdomain: 'fake',
   clientId: 'fake-client',
 })
+const publicBaseUrl = new URL('http://127.0.0.1:38184/')
 let listener
 let client
 let zendeskRequests = 0
 
 try {
-  const created = store.createPendingUser('Fake smoke user')
-  const state = randomOpaque()
-  const started = store.startInvitation(created.invitation, state)
-  assert.ok(started)
-  const claimed = store.claimAuthorization(state)
-  assert.ok(claimed)
-  assert.equal(claimed.kind, 'invitation')
   const now = Math.floor(Date.now() / 1_000)
-  store.completeLink({
-    ...claimed,
-    identity: {
-      id: '999001',
-      name: 'Fake smoke user',
-      email: 'fake-smoke@example.test',
-      role: 'agent',
+  const oauthCalls = {
+    authorizationStates: [],
+    exchanges: [],
+    identities: [],
+  }
+  const oauth = {
+    authorizationUrl(state) {
+      oauthCalls.authorizationStates.push(state)
+      const url = new URL('https://fake.zendesk.com/oauth/authorizations/new')
+      url.searchParams.set('state', state)
+      return url
     },
-    grant: {
-      accessToken: 'fake-access-token',
-      refreshToken: 'fake-refresh-token',
-      accessExpiresAt: now + 1_800,
-      refreshExpiresAt: now + 2_592_000,
-      scopes: ['read', 'tickets:write'],
+    async exchangeCode(code) {
+      oauthCalls.exchanges.push(code)
+      return {
+        accessToken: 'fake-access-token',
+        refreshToken: 'fake-refresh-token',
+        accessExpiresAt: now + 1_800,
+        refreshExpiresAt: now + 2_592_000,
+        scopes: ['read', 'tickets:write'],
+      }
     },
-  })
+    async currentUser(accessToken) {
+      oauthCalls.identities.push(accessToken)
+      return {
+        id: '999001',
+        name: 'Fake smoke agent',
+        email: 'fake-smoke@example.test',
+        role: 'agent',
+      }
+    },
+    async revokeCurrent() {
+      assert.fail('successful smoke enrollment must not revoke')
+    },
+    async refresh() {
+      assert.fail('fresh smoke credentials must not refresh')
+    },
+  }
 
   const neverZendesk = async () => {
     zendeskRequests += 1
@@ -55,27 +72,23 @@ try {
   }
   const resolver = new UserClientResolver({
     store,
-    oauth: {
-      authorizationUrl: () => {
-        throw new Error('not used')
-      },
-      exchangeCode: neverZendesk,
-      refresh: neverZendesk,
-      currentUser: neverZendesk,
-      revokeCurrent: neverZendesk,
-    },
+    oauth,
     subdomain: 'fake',
     fetch: neverZendesk,
+  })
+  const linkHandlers = createLinkHandlers({
+    store,
+    oauth,
+    publicBaseUrl,
+    selfServiceEnabled: true,
   })
   const app = createHttpApp({
     host: '127.0.0.1',
     allowedHosts: ['127.0.0.1'],
     authenticateBearer: (bearer) => store.authenticateBearer(bearer),
     resolver,
-    linkHandlers: {
-      link: (_request, response) => response.status(404).end(),
-      callback: (_request, response) => response.status(404).end(),
-    },
+    selfServiceEnrollmentEnabled: true,
+    linkHandlers,
   })
   listener = app.listen(0, '127.0.0.1')
   await once(listener, 'listening')
@@ -89,12 +102,32 @@ try {
     headers: { 'content-type': 'application/json' },
     body: '{}',
   })
+  const enrollmentPageResponse = await fetch(`${baseUrl}/create-account`)
+  const enrollmentPageBody = await enrollmentPageResponse.text()
+  const enrollmentStart = await fetch(`${baseUrl}/create-account`, {
+    method: 'POST',
+    headers: { Origin: publicBaseUrl.origin },
+    redirect: 'manual',
+  })
+  const authorizationLocation = new URL(
+    enrollmentStart.headers.get('location'),
+  )
+  const state = authorizationLocation.searchParams.get('state')
+  const callback = await fetch(
+    `${baseUrl}/oauth/callback?code=fake-smoke-code&state=${state}`,
+  )
+  const callbackBody = await callback.text()
+  const bearer = callbackBody.match(/zmcp_[A-Za-z0-9_-]{43}/)?.[0]
+  assert.ok(bearer)
+  const replay = await fetch(
+    `${baseUrl}/oauth/callback?code=fake-replay-code&state=${state}`,
+  )
 
   const transport = new StreamableHTTPClientTransport(
     new URL(`${baseUrl}/mcp`),
     {
       requestInit: {
-        headers: { authorization: `Bearer ${created.bearer}` },
+        headers: { authorization: `Bearer ${bearer}` },
       },
     },
   )
@@ -104,12 +137,27 @@ try {
 
   assert.equal(health.status, 200)
   assert.equal(unauthenticated.status, 401)
+  assert.equal(enrollmentPageResponse.status, 200)
+  assert.match(enrollmentPageBody, /Connect Zendesk/)
+  assert.equal(enrollmentStart.status, 302)
+  assert.equal(authorizationLocation.origin, 'https://fake.zendesk.com')
+  assert.match(state, /^[A-Za-z0-9_-]{43}$/)
+  assert.equal(callback.status, 200)
+  assert.ok(store.authenticateBearer(bearer))
+  assert.equal(replay.status, 400)
+  assert.deepEqual(oauthCalls.authorizationStates, [state])
+  assert.deepEqual(oauthCalls.exchanges, ['fake-smoke-code'])
+  assert.deepEqual(oauthCalls.identities, ['fake-access-token'])
   assert.ok(tools.tools.some(({ name }) => name === 'get_ticket'))
   assert.equal(zendeskRequests, 0)
   console.log(JSON.stringify({
     ok: true,
     healthStatus: health.status,
     unauthenticatedStatus: unauthenticated.status,
+    enrollmentPage: true,
+    oauthRedirect: true,
+    enrollmentCompleted: true,
+    replayRejected: true,
     initialized: true,
     toolsListed: true,
     zendeskRequests,
