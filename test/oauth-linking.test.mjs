@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { once } from 'node:events'
 import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -122,6 +123,16 @@ function assertBrowserSecurity(response, referrerPolicy = 'no-referrer') {
   assert.match(response.headers.get('permissions-policy'), /camera=\(\)/)
 }
 
+function assertPageStyle(response, body) {
+  const style = body.match(/<style>([\s\S]*?)<\/style>/)?.[1]
+  assert.ok(style, 'missing page stylesheet')
+  const hash = createHash('sha256').update(style).digest('base64')
+  const csp = response.headers.get('content-security-policy')
+  assert.equal(csp.includes(`style-src 'sha256-${hash}'`), true)
+  assert.equal(csp.includes("'unsafe-inline'"), false)
+  assert.equal(body.includes('://cdn.'), false)
+}
+
 function preformattedText(body, id) {
   const match = body.match(new RegExp(`<pre id="${id}">([\\s\\S]*?)</pre>`))
   assert.ok(match, `missing ${id} preformatted block`)
@@ -174,6 +185,7 @@ test('self-service enrollment page is explicit, side-effect free, and same-origi
   )
   assert.equal(page.headers.get('content-security-policy').includes('*'), false)
   const pageBody = await page.text()
+  assertPageStyle(page, pageBody)
   assert.match(pageBody, /<form[^>]+method="post"[^>]+action="\/create-account"/i)
   assert.match(pageBody, /Connect Zendesk/i)
   assert.equal(pageBody.includes('<script'), false)
@@ -219,6 +231,7 @@ for (const eligibleRole of ['agent', 'admin']) {
     assert.equal(callback.status, 200)
     assertBrowserSecurity(callback)
     const body = await callback.text()
+    assertPageStyle(callback, body)
     const bearer = body.match(/zmcp_[A-Za-z0-9_-]{43}/)?.[0]
     const userId = body.match(/[0-9a-f]{8}-[0-9a-f-]{27}/i)?.[0]
     assert.match(bearer, /^zmcp_[A-Za-z0-9_-]{43}$/)
