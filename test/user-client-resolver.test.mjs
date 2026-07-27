@@ -160,6 +160,77 @@ test('same-user expiring credentials refresh once and persist before callers con
   ])
 })
 
+test('caller abort does not cancel a shared refresh for another caller', async (t) => {
+  const { store } = await fixture(t)
+  const created = activate(store, 'Martin', '101', grant('old', NOW + 30))
+  const release = deferred()
+  let refreshCalls = 0
+  const oauth = {
+    refresh: (token, signal) => {
+      refreshCalls += 1
+      assert.equal(token, 'refresh-old-sentinel')
+      return new Promise((resolve, reject) => {
+        const abort = () => reject(new SafeAuthError('aborted', { retryable: true }))
+        signal?.addEventListener('abort', abort, { once: true })
+        release.promise.then(resolve, reject).finally(() => {
+          signal?.removeEventListener('abort', abort)
+        })
+      })
+    },
+    currentUser: async (token) => {
+      assert.equal(token, 'access-rotated-sentinel')
+      return { id: '101', name: 'Martin', email: 'martin@example.test' }
+    },
+  }
+  const authorizations = []
+  const resolver = new UserClientResolver({
+    store,
+    oauth,
+    subdomain: 'acme',
+    now: () => NOW,
+    fetch: ticketFetch(authorizations),
+  })
+  const firstController = new AbortController()
+  const first = resolver
+    .resolve(created.userId, firstController.signal)
+    .then((client) => ({ client }), (error) => ({ error }))
+  const second = resolver
+    .resolve(created.userId)
+    .then((client) => ({ client }), (error) => ({ error }))
+
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(refreshCalls, 1)
+  firstController.abort()
+
+  const firstResult = await first
+  assert.ok(firstResult.error instanceof SafeAuthError)
+  assert.equal(firstResult.error.category, 'aborted')
+
+  const third = resolver
+    .resolve(created.userId)
+    .then((client) => ({ client }), (error) => ({ error }))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(refreshCalls, 1)
+
+  release.resolve(grant('rotated'))
+  const [secondResult, thirdResult] = await Promise.all([second, third])
+  assert.ok(secondResult.client)
+  assert.ok(thirdResult.client)
+  assert.equal(store.loadCredential(created.userId).version, 2)
+  assert.equal(
+    store.loadCredential(created.userId).grant.accessToken,
+    'access-rotated-sentinel',
+  )
+  await Promise.all([
+    secondResult.client.getTicket(1),
+    thirdResult.client.getTicket(1),
+  ])
+  assert.deepEqual(authorizations, [
+    'Bearer access-rotated-sentinel',
+    'Bearer access-rotated-sentinel',
+  ])
+})
+
 test('different users refresh independently and preserve their identity boundary', async (t) => {
   const { store } = await fixture(t)
   const first = activate(store, 'First', '301', grant('first-old', NOW + 30))

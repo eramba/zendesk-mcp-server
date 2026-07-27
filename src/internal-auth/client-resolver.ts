@@ -138,27 +138,44 @@ export class UserClientResolver implements UserClientResolverLike {
 
     const existing = this.#refreshes.get(requested.userId);
     if (existing) {
-      try {
-        return await existing.pending;
-      } catch (error) {
-        if (error instanceof SafeAuthError) throw error;
-        throw new SafeAuthError("temporarily_unavailable", {
-          retryable: true,
-        });
-      }
+      return this.#waitForRefresh(existing.pending, signal);
     }
 
     const entry: PendingRefresh = {
       version: current.version,
-      pending: this.#performRefresh(current, signal),
+      pending: this.#performRefresh(current, this.#shutdownSignal),
     };
     this.#refreshes.set(current.userId, entry);
-    try {
-      return await entry.pending;
-    } finally {
+    const clear = () => {
       if (this.#refreshes.get(current.userId) === entry) {
         this.#refreshes.delete(current.userId);
       }
+    };
+    void entry.pending.then(clear, clear);
+    return this.#waitForRefresh(entry.pending, signal);
+  }
+
+  async #waitForRefresh(
+    pending: Promise<CredentialSnapshot>,
+    signal?: AbortSignal,
+  ): Promise<CredentialSnapshot> {
+    let abort: (() => void) | undefined;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      if (!signal) return;
+      abort = () => {
+        reject(new SafeAuthError("aborted", { retryable: true }));
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      if (signal.aborted) abort();
+    });
+
+    try {
+      return signal ? await Promise.race([pending, aborted]) : await pending;
+    } catch (error) {
+      if (error instanceof SafeAuthError) throw error;
+      throw new SafeAuthError("temporarily_unavailable", { retryable: true });
+    } finally {
+      if (signal && abort) signal.removeEventListener("abort", abort);
     }
   }
 

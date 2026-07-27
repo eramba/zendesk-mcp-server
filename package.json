@@ -12,7 +12,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
     "dev:http": "tsx src/http.ts",
-    "admin": "npm run build --silent && node dist/admin.js",
+    "admin": "node dist/admin.js",
     "smoke:http": "node scripts/smoke-http.mjs",
     "smoke:http:local": "node scripts/smoke-http-local.mjs",
     "start": "node dist/index.js",

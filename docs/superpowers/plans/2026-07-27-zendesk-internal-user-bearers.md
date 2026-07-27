@@ -16,7 +16,7 @@
 - HTTP has no shared Zendesk credential, shared bearer fallback, global mutable user, credential tool input, inbound MCP OAuth server, token family, durable worker, outbox, distributed lock, or web admin UI.
 - Use one fixed Zendesk subdomain, OAuth client ID, callback URL, and scope `read tickets:write`.
 - Store MCP bearers, invitation tokens, and OAuth states only as SHA-256 hashes; encrypt access and refresh tokens with AES-256-GCM and a separately configured 32-byte base64url key.
-- Network operations have 10-second bounded timeouts, reject redirects, respect cancellation, and expose no secrets in errors or logs.
+- Network operations have 10-second bounded timeouts, reject redirects, respect ownership-aware cancellation, and expose no secrets in errors or logs.
 - Same-user refreshes are single-flight and use conditional versioned persistence; different users refresh independently.
 - Locally revoke first. Optional upstream revocation is one bounded synchronous attempt with an exact reported outcome and no retry machinery.
 - No live Zendesk login, request, mutation, revocation, deployment, cutover, or credential retirement is authorized.
@@ -789,6 +789,8 @@ Use real SQLite and deferred fake OAuth calls. Prove:
 - no absent/invalid user can resolve and no shared credential exists;
 - fresh grants do not call refresh or `users/me`;
 - expiring same-user calls join exactly one refresh promise;
+- aborting one same-user caller stops only its wait while another caller and a
+  later joiner retain the same refresh promise;
 - two users enter two independent refresh promises before either is released;
 - rotated credentials are visible in a separately reopened store before
   resolver callers continue;
@@ -815,9 +817,11 @@ Expected RED: resolver does not exist.
 - [ ] **Step 4: Implement version-keyed single-flight**
 
 The map value contains `{ version, pending }`. On refresh entry, reload the
-snapshot and adopt a newer version. Always remove only the same map entry in
-`finally`. Persist before returning. Convert `invalid_grant` to conditional
-reauthorization, while transient failures leave the mapping active.
+snapshot and adopt a newer version. Bind the shared promise to shutdown and
+timeout rather than one caller; each caller waits with its own cancellation.
+Remove only the same map entry when the shared promise settles. Persist before
+returning. Convert `invalid_grant` to conditional reauthorization, while
+transient failures leave the mapping active.
 
 - [ ] **Step 5: Run the focused test and confirm GREEN**
 
@@ -1063,7 +1067,7 @@ Expected RED: CLI and package script do not exist.
 Add:
 
 ```json
-"admin": "npm run build --silent && node dist/admin.js"
+"admin": "node dist/admin.js"
 ```
 
 Use only exact command/flag names. Print JSON for `list` and stable labeled
@@ -1173,6 +1177,8 @@ Document:
 - Zendesk confidential client setup and `read tickets:write`;
 - create, one-time handoff, link, list, reauthorize, revoke, optional upstream
   outcome, and backup commands;
+- Compose-aware administration through the compiled runtime CLI and the shared
+  `/data` volume;
 - Codex Streamable HTTP URL plus bearer environment variable;
 - migration from the shared HTTP identity;
 - stdio compatibility and Zendesk API-token retirement dates;

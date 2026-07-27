@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
+import { cp, mkdir, mkdtemp, readFile, rm, symlink } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 
 const root = new URL('../', import.meta.url)
+const execFileAsync = promisify(execFile)
 
 test('container deployment retains non-root/read-only hardening and persists only /data', async () => {
   const [dockerfile, compose] = await Promise.all([
@@ -22,6 +28,36 @@ test('container deployment retains non-root/read-only hardening and persists onl
   assert.equal(compose.includes('MCP_BEARER_TOKEN:'), false)
   assert.equal(compose.includes('ZENDESK_API_KEY:'), false)
   assert.equal(compose.includes('ZENDESK_EMAIL:'), false)
+})
+
+test('production artifact runs the compiled admin CLI without development dependencies', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'zendesk-admin-runtime-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+
+  await Promise.all([
+    cp(fileURLToPath(new URL('package.json', root)), join(directory, 'package.json')),
+    cp(fileURLToPath(new URL('dist', root)), join(directory, 'dist'), { recursive: true }),
+    mkdir(join(directory, 'node_modules')),
+  ])
+  await Promise.all(
+    ['better-sqlite3', 'dotenv'].map((dependency) =>
+      symlink(
+        fileURLToPath(new URL(`node_modules/${dependency}`, root)),
+        join(directory, 'node_modules', dependency),
+        'dir',
+      ),
+    ),
+  )
+
+  const outcome = await execFileAsync('npm', ['run', 'admin', '--', 'list'], {
+    cwd: directory,
+    env: { PATH: process.env.PATH },
+  }).catch((error) => error)
+
+  const output = `${outcome.stdout ?? ''}\n${outcome.stderr ?? ''}`
+  assert.equal(outcome.code, 1)
+  assert.match(output, /Administration command failed/)
+  assert.doesNotMatch(output, /tsc: not found/)
 })
 
 test('HTTP and stdio environment examples keep authentication boundaries separate', async () => {

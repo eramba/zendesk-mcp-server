@@ -160,6 +160,16 @@ The runtime runs as the unprivileged `node` user with a read-only root
 filesystem, `no-new-privileges`, writable tmpfs at `/tmp`, and one named volume
 mounted at `/data`. Restarting the service preserves `/data/oauth.sqlite`.
 
+Run administration commands inside the running service so they use the same
+environment and `/data` volume as the server:
+
+```bash
+docker compose exec -T zendesk-mcp npm run admin -- create --label "Martin"
+docker compose exec -T zendesk-mcp npm run admin -- list
+docker compose exec -T zendesk-mcp npm run admin -- reauthorize --user <uuid>
+docker compose exec -T zendesk-mcp npm run admin -- revoke --user <uuid>
+```
+
 ### Backup
 
 Keep the encryption key separately; a database backup without its matching key
@@ -167,11 +177,17 @@ cannot be opened. Use the SQLite online backup command rather than copying a
 live database and its WAL files:
 
 ```bash
-npm run admin -- backup --output /absolute/secure/path/oauth-backup.sqlite
+backup_name="oauth-backup-$(date -u +%Y%m%d-%H%M%S).sqlite"
+docker compose exec -T zendesk-mcp npm run admin -- \
+  backup --output "/data/backups/$backup_name"
+docker compose cp "zendesk-mcp:/data/backups/$backup_name" "./$backup_name"
+chmod 0600 "./$backup_name"
 ```
 
 The backup is created mode `0600`. Protect, rotate, and test-restores of both
-the database backup and encryption key using normal infrastructure controls.
+the copied database backup and encryption key using normal infrastructure
+controls. The command leaves the original backup under `/data/backups`; remove
+that exact in-volume copy after verifying the protected host copy.
 
 ## Migration from the shared HTTP identity
 

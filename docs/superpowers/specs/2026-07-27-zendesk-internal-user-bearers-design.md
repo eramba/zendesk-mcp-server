@@ -296,6 +296,12 @@ npm run admin -- revoke --user <internal-user-id> --upstream
 npm run admin -- backup --output /absolute/secure/path/oauth.sqlite
 ```
 
+Local commands run against an already-built checkout. A Compose deployment
+runs the same compiled CLI inside the service container so it shares the
+server's environment and `/data` volume; it never rebuilds TypeScript in the
+production image. Compose backup copies are created online under `/data` and
+then copied to an operator-controlled protected path.
+
 `create` prints the internal user ID, one MCP bearer, one link URL, and the
 expiry. The bearer and invitation token exist in plaintext only in command
 memory and output. The output explicitly says both are shown once and must be
@@ -372,7 +378,8 @@ All Zendesk OAuth requests:
 - use the fixed Zendesk origin;
 - reject redirects;
 - have a 10-second timeout;
-- combine timeout, request, and shutdown cancellation;
+- combine timeout and shutdown cancellation, plus request cancellation for
+  request-owned work such as code exchange;
 - validate status and response shape;
 - never include upstream bodies, headers, codes, states, tokens, or transport
   error text in application errors or logs.
@@ -413,6 +420,8 @@ for a specific stored version:
 
 - same user and version join one promise;
 - different users use independent promises;
+- one caller's cancellation stops only that caller's wait and never cancels or
+  removes a shared refresh still needed by other callers;
 - a caller that sees a newer stored version adopts it without refreshing;
 - successful rotation is encrypted and conditionally persisted before callers
   continue;
@@ -523,7 +532,8 @@ Focused RED/GREEN tests will prove:
 - two active bearers resolve distinct clients and access tokens under
   concurrency;
 - proactive and `401` refresh persist rotated credentials before retry;
-- same-user refresh is single-flight and different-user refresh is independent;
+- same-user refresh is single-flight, survives one caller's cancellation, and
+  different-user refresh is independent;
 - terminal refresh failure and a second invalid token disable only the intended
   mapping with no fallback;
 - revocation immediately blocks authentication and optional upstream outcome is
