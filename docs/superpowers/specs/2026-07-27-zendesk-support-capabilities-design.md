@@ -1,7 +1,8 @@
 # Zendesk Support Capabilities Design
 
-**Date:** 2026-07-27  
-**Branch:** `codex/zendesk-support-capabilities`  
+**Date:** 2026-07-27
+
+**Branch:** `codex/zendesk-support-capabilities`
 **Base:** merged `master` at `4f08385`
 
 ## Context
