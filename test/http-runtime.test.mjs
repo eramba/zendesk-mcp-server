@@ -65,6 +65,10 @@ test('runtime wires one fixed store, OAuth gateway, resolver, handlers, and app'
       assert.equal(options.store, store)
       assert.equal(options.oauth, oauth)
       assert.equal(options.publicBaseUrl.href, config.publicBaseUrl.href)
+      assert.equal(
+        options.zendeskAuthorizationOrigin.href,
+        'https://acme.zendesk.com/',
+      )
       assert.equal(options.selfServiceEnabled, true)
       return handlers
     },

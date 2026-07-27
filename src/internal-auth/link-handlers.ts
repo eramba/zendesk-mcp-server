@@ -28,15 +28,26 @@ const CREATE_ACCOUNT_PAGE = `<!doctype html>
   <button type="submit">Connect Zendesk</button>
 </form>`;
 
-function browserHeaders(response: Response): void {
+type BrowserHeaderOptions = {
+  referrerPolicy?: "no-referrer" | "same-origin";
+  formActionOrigin?: string;
+};
+
+function browserHeaders(
+  response: Response,
+  options: BrowserHeaderOptions = {},
+): void {
   response.setHeader("Cache-Control", "no-store");
   response.setHeader("Pragma", "no-cache");
-  response.setHeader("Referrer-Policy", "no-referrer");
+  response.setHeader(
+    "Referrer-Policy",
+    options.referrerPolicy ?? "no-referrer",
+  );
   response.setHeader("X-Content-Type-Options", "nosniff");
   response.setHeader("X-Frame-Options", "DENY");
   response.setHeader(
     "Content-Security-Policy",
-    "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    `default-src 'none'; form-action 'self'${options.formActionOrigin ? ` ${options.formActionOrigin}` : ""}; base-uri 'none'; frame-ancestors 'none'`,
   );
   response.setHeader(
     "Permissions-Policy",
@@ -44,8 +55,13 @@ function browserHeaders(response: Response): void {
   );
 }
 
-function html(response: Response, status: number, body: string): void {
-  browserHeaders(response);
+function html(
+  response: Response,
+  status: number,
+  body: string,
+  options: BrowserHeaderOptions = {},
+): void {
+  browserHeaders(response, options);
   response.status(status).type("html").send(body);
 }
 
@@ -94,6 +110,7 @@ export function createLinkHandlers(options: {
   store: InternalAuthStore;
   oauth: ZendeskOAuthGateway;
   publicBaseUrl: URL;
+  zendeskAuthorizationOrigin: URL;
   selfServiceEnabled: boolean;
   now?: () => number;
 }): {
@@ -103,6 +120,9 @@ export function createLinkHandlers(options: {
   callback: RequestHandler;
 } {
   const publicBaseUrl = new URL(options.publicBaseUrl.href);
+  const zendeskAuthorizationOrigin = new URL(
+    options.zendeskAuthorizationOrigin.origin,
+  );
   const selfServiceEnabled = options.selfServiceEnabled;
 
   const createAccount: RequestHandler = (_request, response) => {
@@ -110,7 +130,10 @@ export function createLinkHandlers(options: {
       html(response, 404, "<!doctype html><title>Not found</title>");
       return;
     }
-    html(response, 200, CREATE_ACCOUNT_PAGE);
+    html(response, 200, CREATE_ACCOUNT_PAGE, {
+      referrerPolicy: "same-origin",
+      formActionOrigin: zendeskAuthorizationOrigin.origin,
+    });
   };
 
   const startEnrollment: RequestHandler = (request, response) => {

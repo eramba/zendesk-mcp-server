@@ -14,6 +14,7 @@ import { InternalAuthStore } from '../dist/internal-auth/store.js'
 
 const NOW = 1_700_000_000
 const PUBLIC_BASE_URL = new URL('https://mcp.example.test/')
+const ZENDESK_AUTHORIZATION_ORIGIN = new URL('https://acme.zendesk.com/')
 
 function grant(label) {
   return {
@@ -75,6 +76,7 @@ async function fixture(t, oauthOverrides = {}, handlerOverrides = {}) {
     store,
     oauth,
     publicBaseUrl: PUBLIC_BASE_URL,
+    zendeskAuthorizationOrigin: ZENDESK_AUTHORIZATION_ORIGIN,
     selfServiceEnabled: true,
     now: () => clock.value,
     ...handlerOverrides,
@@ -109,10 +111,10 @@ async function fixture(t, oauthOverrides = {}, handlerOverrides = {}) {
   }
 }
 
-function assertBrowserSecurity(response) {
+function assertBrowserSecurity(response, referrerPolicy = 'no-referrer') {
   assert.equal(response.headers.get('cache-control'), 'no-store')
   assert.equal(response.headers.get('pragma'), 'no-cache')
-  assert.equal(response.headers.get('referrer-policy'), 'no-referrer')
+  assert.equal(response.headers.get('referrer-policy'), referrerPolicy)
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff')
   assert.equal(response.headers.get('x-frame-options'), 'DENY')
   assert.match(response.headers.get('content-security-policy'), /default-src 'none'/)
@@ -154,7 +156,12 @@ test('self-service enrollment page is explicit, side-effect free, and same-origi
   const f = await fixture(t)
   const page = await fetch(`${f.baseUrl}/create-account`)
   assert.equal(page.status, 200)
-  assertBrowserSecurity(page)
+  assertBrowserSecurity(page, 'same-origin')
+  assert.match(
+    page.headers.get('content-security-policy'),
+    /form-action 'self' https:\/\/acme\.zendesk\.com(?:;|$)/,
+  )
+  assert.equal(page.headers.get('content-security-policy').includes('*'), false)
   const pageBody = await page.text()
   assert.match(pageBody, /<form[^>]+method="post"[^>]+action="\/create-account"/i)
   assert.match(pageBody, /Connect Zendesk/i)

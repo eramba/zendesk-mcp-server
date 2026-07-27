@@ -80,6 +80,7 @@ try {
     store,
     oauth,
     publicBaseUrl,
+    zendeskAuthorizationOrigin: new URL('https://fake.zendesk.com/'),
     selfServiceEnabled: true,
   })
   const app = createHttpApp({

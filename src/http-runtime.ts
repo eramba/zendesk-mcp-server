@@ -76,6 +76,9 @@ export function createHttpRuntime(
       store,
       oauth,
       publicBaseUrl: config.publicBaseUrl,
+      zendeskAuthorizationOrigin: new URL(
+        `https://${config.zendeskSubdomain}.zendesk.com`,
+      ),
       selfServiceEnabled: config.selfServiceEnrollmentEnabled,
     });
     const app = (dependencies.createApp ?? createHttpApp)({
