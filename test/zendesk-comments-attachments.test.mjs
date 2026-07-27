@@ -73,7 +73,14 @@ test('getTicketComments includes inline images, follows pagination, and normaliz
     })
   })
 
-  const client = new ZendeskClient('example', 'agent@example.test', 'test-token')
+  const client = new ZendeskClient({
+    subdomain: 'example',
+    auth: {
+      kind: 'api-token',
+      email: 'agent@example.test',
+      token: 'test-token',
+    },
+  })
   const comments = await client.getTicketComments(36870)
 
   assert.equal(calls.length, 2)
@@ -141,7 +148,14 @@ test('getTicketComments stops when cursor metadata reports no more pages', async
     })
   })
 
-  const client = new ZendeskClient('example', 'agent@example.test', 'test-token')
+  const client = new ZendeskClient({
+    subdomain: 'example',
+    auth: {
+      kind: 'api-token',
+      email: 'agent@example.test',
+      token: 'test-token',
+    },
+  })
   const comments = await client.getTicketComments(36870)
 
   assert.equal(calls, 1)
@@ -162,7 +176,14 @@ test('get_ticket_comments exposes attachment defaults through MCP', async (t) =>
     }),
   )
 
-  const zendesk = new ZendeskClient('example', 'agent@example.test', 'test-token')
+  const zendesk = new ZendeskClient({
+    subdomain: 'example',
+    auth: {
+      kind: 'api-token',
+      email: 'agent@example.test',
+      token: 'test-token',
+    },
+  })
   const server = buildZendeskServer(zendesk)
   const client = new Client({ name: 'attachment-test-client', version: '1.0.0' })
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()

@@ -7,11 +7,14 @@ import { ZendeskClient } from "./zendesk-client.js";
 function main() {
   const zendeskConfig = readZendeskConfig();
   const httpConfig = readHttpConfig();
-  const client = new ZendeskClient(
-    zendeskConfig.subdomain,
-    zendeskConfig.email,
-    zendeskConfig.apiKey,
-  );
+  const client = new ZendeskClient({
+    subdomain: zendeskConfig.subdomain,
+    auth: {
+      kind: "api-token",
+      email: zendeskConfig.email,
+      token: zendeskConfig.apiKey,
+    },
+  });
   const app = createHttpApp({
     host: httpConfig.host,
     allowedHosts: httpConfig.allowedHosts,
