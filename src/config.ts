@@ -9,13 +9,6 @@ export type ZendeskConfig = {
   apiKey: string;
 };
 
-export type HttpConfig = {
-  host: string;
-  port: number;
-  bearerToken: string;
-  allowedHosts: string[];
-};
-
 export type HttpOAuthConfig = {
   host: string;
   port: number;
@@ -182,16 +175,5 @@ export function readHttpOAuthConfig(
     oauthEncryptionKey: readEncryptionKey(env.OAUTH_ENCRYPTION_KEY as string),
     oauthDbPath,
     zendeskCallbackUrl: new URL("/oauth/callback", publicBaseUrl),
-  };
-}
-
-export function readHttpConfig(env: Environment = process.env): HttpConfig {
-  if (isBlank(env.MCP_BEARER_TOKEN)) {
-    throw new Error("Missing required environment variable: MCP_BEARER_TOKEN");
-  }
-
-  return {
-    bearerToken: env.MCP_BEARER_TOKEN as string,
-    ...readNetworkConfig(env),
   };
 }
