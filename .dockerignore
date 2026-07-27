@@ -5,6 +5,9 @@
 node_modules
 dist
 coverage
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 .idea
 .DS_Store
 docs

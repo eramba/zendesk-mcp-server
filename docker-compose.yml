@@ -10,6 +10,7 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 3000
+      OAUTH_DB_PATH: /data/oauth.sqlite
     ports:
       - "${MCP_BIND_ADDRESS:-127.0.0.1}:${MCP_HOST_PORT:-38184}:3000"
     healthcheck:
@@ -25,6 +26,11 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+    volumes:
+      - zendesk_mcp_data:/data
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 15s
+
+volumes:
+  zendesk_mcp_data:

@@ -1,147 +1,223 @@
-> **Important note:** All credits go to [reminia](https://github.com/reminia).  
-> This project is a TypeScript port of [`reminia/zendesk-mcp-server`](https://github.com/reminia/zendesk-mcp-server), with some upgrades and new tools.
+> **Important note:** All credits go to [reminia](https://github.com/reminia).
+> This project is a TypeScript port of
+> [`reminia/zendesk-mcp-server`](https://github.com/reminia/zendesk-mcp-server),
+> with additional tools and internal Streamable HTTP deployment support.
 
 # Zendesk MCP Server (TypeScript)
 
-A Model Context Protocol server for Zendesk, rewritten in TypeScript from [`reminia/zendesk-mcp-server`](https://github.com/reminia/zendesk-mcp-server).
+A Model Context Protocol server for Zendesk with stdio and stateless
+Streamable HTTP transports.
 
-## What's updated
+## Authentication modes
 
-- TypeScript + strict typing
-- Native Zendesk REST integration via `fetch` (no Python/Zenpy dependency)
-- Zod input validation for tools/prompts
-- Consistent MCP tool error payloads (`isError` + message)
-- Help Center resource caching (1-hour TTL)
+- Streamable HTTP uses one random MCP bearer per internal colleague. The
+  bearer selects that colleague's encrypted Zendesk OAuth grant; each POST
+  constructs a request-scoped Zendesk client.
+- Stdio retains the existing email/API-token configuration for compatibility.
+  It does not use the HTTP user store.
+
+Zendesk has announced that Support API tokens begin inactivity-based
+deactivation on July 28, 2026 and are permanently deactivated on April 30,
+2027. New HTTP deployments should use the OAuth flow documented here. See
+[Zendesk's retirement announcement](https://support.zendesk.com/hc/en-us/articles/10840968198042-Announcing-the-removal-of-API-tokens-as-an-authentication-method-for-API-requests)
+and [OAuth migration guide](https://developer.zendesk.com/documentation/api-basics/authentication/oauth-migration/).
 
 ## Requirements
 
 - Node.js 20+
-- Zendesk API token
+- one fixed Zendesk subdomain
+- a confidential Zendesk OAuth client
+- HTTPS for the public callback URL (loopback HTTP is accepted for development)
+- a persistent path for the SQLite OAuth store
 
-## Setup
+## Streamable HTTP setup
+
+Create the Zendesk OAuth client for the fixed deployment subdomain and set its
+callback URL exactly to:
+
+```text
+https://your-internal-mcp.example/oauth/callback
+```
+
+Copy the HTTP environment example and generate a 32-byte canonical base64url
+encryption key:
+
+```bash
+cp .env.example .env
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\\n'
+chmod 0600 .env
+```
+
+Set the generated value as `OAUTH_ENCRYPTION_KEY`, then configure:
+
+- `PUBLIC_BASE_URL`: canonical public origin, with no path or query
+- `ZENDESK_SUBDOMAIN`: one fixed Zendesk subdomain
+- `ZENDESK_OAUTH_CLIENT_ID` and `ZENDESK_OAUTH_CLIENT_SECRET`
+- `OAUTH_DB_PATH`: absolute SQLite path (`/data/oauth.sqlite` in Compose)
+- `MCP_ALLOWED_HOSTS`, `HOST`, and `PORT` as needed
+
+The server never derives its callback from `Host` or forwarded headers.
+`GET /healthz` is public and never contacts Zendesk. `POST /mcp` is protected;
+authenticated `GET /mcp` and `DELETE /mcp` return `405` because each POST uses
+a fresh stateless transport.
+
+Build and start locally:
 
 ```bash
 npm install
-cp .env.example .env
-# edit .env with your credentials
 npm run build
-```
-
-Run over stdio:
-
-```bash
-npm start
-```
-
-For local development:
-
-```bash
-npm run dev
-```
-
-### Streamable HTTP
-
-Build and start the HTTP transport locally:
-
-```bash
-npm run build
-MCP_BEARER_TOKEN="$(openssl rand -hex 32)" \
-MCP_ALLOWED_HOSTS="localhost,127.0.0.1" \
 npm run start:http
 ```
 
-The endpoints are `POST /mcp` and `GET /healthz`. `GET /mcp` and `DELETE /mcp` return `405` because the server is stateless.
+### Create and link a user
 
-### Docker Compose deployment
-
-The default deployment publishes plain HTTP only on the host loopback address, `127.0.0.1:38184`. Tailscale Serve provides the tailnet-only HTTPS endpoint:
-
-```text
-https://dev-server.tail22145b.ts.net/mcp
+```bash
+npm run admin -- create --label "Martin"
 ```
 
-Create `.env` from `.env.example`, keep it mode `0600`, set the three `ZENDESK_*` values, and generate the server token with `openssl rand -hex 32`. Then run:
+The command prints a user ID, one MCP bearer, and one short-lived link. The
+bearer is shown once and cannot be retrieved later. Transfer the link and
+bearer separately through approved secure channels:
+
+1. The colleague opens the link and authorizes the fixed Zendesk OAuth client.
+2. The callback exchanges the code and establishes identity through
+   `users/me`.
+3. After linking succeeds, give that colleague their unique MCP bearer.
+
+List non-secret metadata:
+
+```bash
+npm run admin -- list
+```
+
+When a refresh grant becomes terminal, the mapping changes to
+`reauthorization_required` and MCP access fails closed. Generate a fresh
+one-time link without changing or reprinting the bearer:
+
+```bash
+npm run admin -- reauthorize --user <uuid>
+```
+
+Revoke local access immediately:
+
+```bash
+npm run admin -- revoke --user <uuid>
+```
+
+Optionally attempt one bounded upstream Zendesk revocation after the local
+commit:
+
+```bash
+npm run admin -- revoke --user <uuid> --upstream
+```
+
+The command reports `succeeded`, `failed`, or `unavailable`; there is no
+background retry or outbox.
+
+### Codex MCP configuration
+
+```toml
+[mcp_servers.zendesk]
+url = "https://your-internal-mcp.example/mcp"
+bearer_token_env_var = "ZENDESK_MCP_BEARER_TOKEN"
+```
+
+Set only that user's bearer on the client:
+
+```bash
+export ZENDESK_MCP_BEARER_TOKEN='the-user-specific-bearer'
+```
+
+Do not copy the Zendesk OAuth client secret, encryption key, database, access
+token, or refresh token to MCP clients.
+
+Verify MCP initialization without calling Zendesk:
+
+```bash
+MCP_URL=https://your-internal-mcp.example/mcp \
+MCP_BEARER_TOKEN="$ZENDESK_MCP_BEARER_TOKEN" \
+npm run smoke:http
+```
+
+`npm run smoke:http` calls Zendesk only when the explicit `--zendesk` option is
+added. The self-contained `npm run smoke:http:local` uses fake encrypted
+credentials and asserts that zero Zendesk requests occur.
+
+## Docker Compose
+
+Compose publishes plain HTTP on host loopback by default. Terminate HTTPS in
+the existing trusted reverse proxy and do not expose the plain HTTP port
+directly.
 
 ```bash
 docker compose config
 docker compose up -d --build --wait
 docker compose ps
 docker compose logs --tail=50 zendesk-mcp
-sudo tailscale serve --bg http://127.0.0.1:38184
-tailscale serve status
 ```
 
-Update an existing checkout with:
+The runtime runs as the unprivileged `node` user with a read-only root
+filesystem, `no-new-privileges`, writable tmpfs at `/tmp`, and one named volume
+mounted at `/data`. Restarting the service preserves `/data/oauth.sqlite`.
+
+### Backup
+
+Keep the encryption key separately; a database backup without its matching key
+cannot be opened. Use the SQLite online backup command rather than copying a
+live database and its WAL files:
 
 ```bash
-git pull --ff-only origin master
-docker compose up -d --build --wait
+npm run admin -- backup --output /absolute/secure/path/oauth-backup.sqlite
 ```
 
-Do not bind the plain-HTTP service to a public or tailnet interface. Tailscale Serve terminates HTTPS on port `443` and proxies to the loopback-only service; tailnet grants control which clients can connect.
+The backup is created mode `0600`. Protect, rotate, and test-restores of both
+the database backup and encryption key using normal infrastructure controls.
 
-### Codex URL configuration
+## Migration from the shared HTTP identity
 
-```toml
-[mcp_servers.zendesk]
-url = "https://dev-server.tail22145b.ts.net/mcp"
-bearer_token_env_var = "ZENDESK_MCP_BEARER_TOKEN"
-```
+1. Back up the current deployment configuration.
+2. Configure the Zendesk OAuth client, fixed callback, encryption key, and
+   persistent store.
+3. Deploy the new image without retiring the old credentials.
+4. Create and complete one link per colleague.
+5. Update each MCP client to its unique bearer and verify initialization.
+6. Verify a non-destructive Zendesk read under each expected identity.
+7. Revoke the old shared MCP bearer and retire legacy Zendesk credentials only
+   after the separate live cutover is approved.
 
-Set `ZENDESK_MCP_BEARER_TOKEN` to the shared MCP token on each trusted client. Do not copy `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`, or `ZENDESK_API_KEY` to clients.
+No migration automatically imports the shared API-token identity.
 
-For a shell-launched Codex process on macOS or Linux:
+### Rollback
+
+Preserve the OAuth database and encryption key, stop the new container, and
+restore the previously pinned image and configuration. Restore the previous
+shared HTTP bearer/API-token settings only while Zendesk still permits them
+and only under the organization's normal approval process. A rollback does not
+delete the new OAuth store or revoke upstream grants; perform either action
+separately if required.
+
+## Stdio compatibility
+
+Copy `.env.stdio.example`, set `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`, and
+`ZENDESK_API_KEY`, then run:
 
 ```bash
-export ZENDESK_MCP_BEARER_TOKEN='the-shared-mcp-token'
+npm run build
+npm start
 ```
 
-For the macOS Codex app in the current login session:
+The equivalent MCP client command remains `node /absolute/path/dist/index.js`.
+Stdio API-token compatibility is temporary because of Zendesk's published
+retirement schedule.
 
-```bash
-launchctl setenv ZENDESK_MCP_BEARER_TOKEN 'the-shared-mcp-token'
-```
+## MCP surface
 
-Fully quit and reopen the Codex app after changing its environment. Linux services must receive the same variable through their service manager and be restarted.
-
-Verify a configured endpoint without returning ticket data:
-
-```bash
-MCP_URL=https://dev-server.tail22145b.ts.net/mcp npm run smoke:http
-```
-
-## Environment variables
-
-- `ZENDESK_SUBDOMAIN`
-- `ZENDESK_EMAIL`
-- `ZENDESK_API_KEY`
-
-## Claude MCP config example
-
-```json
-{
-  "mcpServers": {
-    "zendesk": {
-      "command": "node",
-      "args": [
-        "/absolute/path/to/zendesk-mcp-server/dist/index.js"
-      ],
-      "env": {
-        "ZENDESK_SUBDOMAIN": "your-subdomain",
-        "ZENDESK_EMAIL": "you@example.com",
-        "ZENDESK_API_KEY": "your_zendesk_api_token"
-      }
-    }
-  }
-}
-```
-
-## Prompts
+Prompts:
 
 - `analyze-ticket`
 - `draft-ticket-response`
 
-## Tools
+Tools:
 
 - `get_ticket`
 - `get_tickets`
@@ -156,21 +232,14 @@ MCP_URL=https://dev-server.tail22145b.ts.net/mcp npm run smoke:http
 - `create_ticket`
 - `update_ticket`
 
-`get_ticket_comments` returns an `attachments` array on each comment. Each attachment includes its ID, filename, content type, size, download URL, inline/deleted flags, and malware scan result. File bytes are not embedded in MCP responses; consumers download relevant `content_url` values with a normal GET and inspect them locally.
-
-## Resources
+Resources:
 
 - `zendesk://knowledge-base`
 
-## Contributing
-
-Issues and pull requests are welcome at [github.com/eramba/zendesk-mcp-server](https://github.com/eramba/zendesk-mcp-server).
-
-When submitting changes:
-- Keep changes focused and small
-- Include clear reproduction/validation steps
-- Update documentation for any tool or behavior changes
+`get_ticket_comments` includes normalized attachment metadata. File bytes are
+not embedded in MCP responses.
 
 ## Support
 
-For bug reports and feature requests, please use [GitHub Issues](https://github.com/eramba/zendesk-mcp-server/issues).
+Use [GitHub Issues](https://github.com/eramba/zendesk-mcp-server/issues) for
+bugs and feature requests.
