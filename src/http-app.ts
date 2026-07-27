@@ -10,9 +10,12 @@ export type HttpAppOptions = {
   allowedHosts: string[];
   authenticateBearer(token: string): { userId: string } | undefined;
   resolver: UserClientResolverLike;
+  selfServiceEnrollmentEnabled: boolean;
   linkHandlers: {
     link: RequestHandler;
     callback: RequestHandler;
+    createAccount: RequestHandler;
+    startEnrollment: RequestHandler;
   };
   serverFactory?: typeof buildZendeskServer;
 };
@@ -28,6 +31,7 @@ export function createHttpApp({
   allowedHosts,
   authenticateBearer,
   resolver,
+  selfServiceEnrollmentEnabled,
   linkHandlers,
   serverFactory = buildZendeskServer,
 }: HttpAppOptions) {
@@ -39,6 +43,10 @@ export function createHttpApp({
 
   app.get("/oauth/link", linkHandlers.link);
   app.get("/oauth/callback", linkHandlers.callback);
+  if (selfServiceEnrollmentEnabled) {
+    app.get("/create-account", linkHandlers.createAccount);
+    app.post("/create-account", linkHandlers.startEnrollment);
+  }
 
   app.use("/mcp", (req, res, next) => {
     const bearer = bearerFromHeader(req.headers.authorization);

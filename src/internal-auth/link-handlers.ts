@@ -93,8 +93,8 @@ async function revokeBestEffort(
 export function createLinkHandlers(options: {
   store: InternalAuthStore;
   oauth: ZendeskOAuthGateway;
-  publicBaseUrl?: URL;
-  selfServiceEnabled?: boolean;
+  publicBaseUrl: URL;
+  selfServiceEnabled: boolean;
   now?: () => number;
 }): {
   link: RequestHandler;
@@ -102,10 +102,8 @@ export function createLinkHandlers(options: {
   startEnrollment: RequestHandler;
   callback: RequestHandler;
 } {
-  const publicBaseUrl = new URL(
-    options.publicBaseUrl?.href ?? "http://127.0.0.1/",
-  );
-  const selfServiceEnabled = options.selfServiceEnabled ?? false;
+  const publicBaseUrl = new URL(options.publicBaseUrl.href);
+  const selfServiceEnabled = options.selfServiceEnabled;
 
   const createAccount: RequestHandler = (_request, response) => {
     if (!selfServiceEnabled) {

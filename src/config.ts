@@ -20,6 +20,7 @@ export type HttpOAuthConfig = {
   oauthEncryptionKey: Buffer;
   oauthDbPath: string;
   zendeskCallbackUrl: URL;
+  selfServiceEnrollmentEnabled: boolean;
 };
 
 const ZENDESK_KEYS = [
@@ -39,6 +40,16 @@ const HTTP_OAUTH_KEYS = [
 
 function isBlank(value: string | undefined): boolean {
   return value === undefined || value.trim() === "";
+}
+
+function readOptionalBoolean(
+  env: Environment,
+  key: string,
+): boolean {
+  const value = env[key];
+  if (value === undefined || value === "false") return false;
+  if (value === "true") return true;
+  throw new Error(`${key} must be true or false`);
 }
 
 function readNetworkConfig(env: Environment): {
@@ -175,5 +186,9 @@ export function readHttpOAuthConfig(
     oauthEncryptionKey: readEncryptionKey(env.OAUTH_ENCRYPTION_KEY as string),
     oauthDbPath,
     zendeskCallbackUrl: new URL("/oauth/callback", publicBaseUrl),
+    selfServiceEnrollmentEnabled: readOptionalBoolean(
+      env,
+      "SELF_SERVICE_ENROLLMENT_ENABLED",
+    ),
   };
 }

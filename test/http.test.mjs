@@ -32,9 +32,12 @@ function makeApp(overrides = {}) {
     authenticateBearer: (token) =>
       token === BEARER_TOKEN ? { userId: USER_ID } : undefined,
     resolver: { resolve: async () => apiClient() },
+    selfServiceEnrollmentEnabled: false,
     linkHandlers: {
       link: (_req, res) => res.status(204).end(),
       callback: (_req, res) => res.status(204).end(),
+      createAccount: (_req, res) => res.status(210).end(),
+      startEnrollment: (_req, res) => res.status(211).end(),
     },
     ...overrides,
   })
@@ -87,6 +90,27 @@ test('healthz is public and does not require Zendesk access', async (t) => {
 
   assert.equal(response.status, 200)
   assert.deepEqual(await response.json(), { ok: true })
+})
+
+test('create-account routes mount only when self-service enrollment is enabled', async (t) => {
+  const disabled = await listen(t, makeApp())
+  assert.equal((await fetch(`${disabled}/create-account`)).status, 404)
+  assert.equal(
+    (await fetch(`${disabled}/create-account`, { method: 'POST' })).status,
+    404,
+  )
+
+  const enabled = await listen(
+    t,
+    makeApp({ selfServiceEnrollmentEnabled: true }),
+  )
+  assert.equal((await fetch(`${enabled}/create-account`)).status, 210)
+  assert.equal(
+    (await fetch(`${enabled}/create-account`, { method: 'POST' })).status,
+    211,
+  )
+  assert.equal((await fetch(`${enabled}/oauth/link`)).status, 204)
+  assert.equal((await fetch(`${enabled}/oauth/callback`)).status, 204)
 })
 
 test('mcp rejects every invalid or inactive bearer shape before credential use or server creation', async (t) => {

@@ -47,6 +47,7 @@ test('readHttpOAuthConfig applies safe local defaults and a fixed callback', () 
     oauthEncryptionKey: Buffer.alloc(32, 7),
     oauthDbPath: '/var/lib/zendesk-mcp/oauth.sqlite',
     zendeskCallbackUrl: new URL('https://mcp.example.test/oauth/callback'),
+    selfServiceEnrollmentEnabled: false,
   })
 })
 
@@ -69,6 +70,7 @@ test('readHttpOAuthConfig parses explicit deployment values', () => {
       oauthEncryptionKey: Buffer.alloc(32, 7),
       oauthDbPath: '/var/lib/zendesk-mcp/oauth.sqlite',
       zendeskCallbackUrl: new URL('https://mcp.example.test/oauth/callback'),
+      selfServiceEnrollmentEnabled: false,
     },
   )
 })
@@ -80,6 +82,38 @@ test('readHttpOAuthConfig reports every missing key without values', () => {
     assert.equal(error.message.includes('client-secret-sentinel'), false)
     return true
   })
+})
+
+test('readHttpOAuthConfig strictly parses optional self-service enrollment', () => {
+  assert.equal(
+    readHttpOAuthConfig({
+      ...HTTP_ENV,
+      SELF_SERVICE_ENROLLMENT_ENABLED: 'true',
+    }).selfServiceEnrollmentEnabled,
+    true,
+  )
+  assert.equal(
+    readHttpOAuthConfig({
+      ...HTTP_ENV,
+      SELF_SERVICE_ENROLLMENT_ENABLED: 'false',
+    }).selfServiceEnrollmentEnabled,
+    false,
+  )
+
+  for (const value of ['', '1', 'yes', 'TRUE', ' false ', 'flag-secret-sentinel']) {
+    assert.throws(
+      () =>
+        readHttpOAuthConfig({
+          ...HTTP_ENV,
+          SELF_SERVICE_ENROLLMENT_ENABLED: value,
+        }),
+      (error) => {
+        assert.match(error.message, /SELF_SERVICE_ENROLLMENT_ENABLED/)
+        if (value.length > 0) assert.equal(error.message.includes(value), false)
+        return true
+      },
+    )
+  }
 })
 
 test('readHttpOAuthConfig rejects invalid TCP ports', () => {

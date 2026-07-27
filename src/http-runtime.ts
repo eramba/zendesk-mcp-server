@@ -75,12 +75,15 @@ export function createHttpRuntime(
     const linkHandlers = (dependencies.createHandlers ?? createLinkHandlers)({
       store,
       oauth,
+      publicBaseUrl: config.publicBaseUrl,
+      selfServiceEnabled: config.selfServiceEnrollmentEnabled,
     });
     const app = (dependencies.createApp ?? createHttpApp)({
       host: config.host,
       allowedHosts: config.allowedHosts,
       authenticateBearer: (token) => store.authenticateBearer(token),
       resolver,
+      selfServiceEnrollmentEnabled: config.selfServiceEnrollmentEnabled,
       linkHandlers,
     });
     let closed = false;

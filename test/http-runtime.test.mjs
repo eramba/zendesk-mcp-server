@@ -17,6 +17,7 @@ const config = {
   oauthEncryptionKey: Buffer.alloc(32, 3),
   oauthDbPath: '/tmp/not-used.sqlite',
   zendeskCallbackUrl: new URL('http://127.0.0.1:3000/oauth/callback'),
+  selfServiceEnrollmentEnabled: true,
 }
 
 test('runtime wires one fixed store, OAuth gateway, resolver, handlers, and app', () => {
@@ -27,7 +28,12 @@ test('runtime wires one fixed store, OAuth gateway, resolver, handlers, and app'
   }
   const oauth = { fixed: 'oauth' }
   const resolver = { resolve: async () => ({}) }
-  const handlers = { link() {}, callback() {} }
+  const handlers = {
+    link() {},
+    callback() {},
+    createAccount() {},
+    startEnrollment() {},
+  }
   const app = { fixed: 'app' }
 
   const runtime = createHttpRuntime(config, {
@@ -58,6 +64,8 @@ test('runtime wires one fixed store, OAuth gateway, resolver, handlers, and app'
       calls.push('handlers.create')
       assert.equal(options.store, store)
       assert.equal(options.oauth, oauth)
+      assert.equal(options.publicBaseUrl.href, config.publicBaseUrl.href)
+      assert.equal(options.selfServiceEnabled, true)
       return handlers
     },
     createApp: (options) => {
@@ -67,6 +75,7 @@ test('runtime wires one fixed store, OAuth gateway, resolver, handlers, and app'
       })
       assert.equal(options.resolver, resolver)
       assert.equal(options.linkHandlers, handlers)
+      assert.equal(options.selfServiceEnrollmentEnabled, true)
       return app
     },
   })
