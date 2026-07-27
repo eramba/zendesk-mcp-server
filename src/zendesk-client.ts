@@ -11,6 +11,7 @@ import type {
   ZendeskGroupMembership,
   ZendeskGroupMembersPage,
   ZendeskCustomStatus,
+  ZendeskInlineAttachmentInput,
   ZendeskKnowledgeBase,
   ZendeskOrganization,
   ZendeskSearchResult,
@@ -270,6 +271,63 @@ export type ZendeskClientOptions = {
 };
 
 const MAX_ERROR_BODY_BYTES = 16 * 1024;
+const MAX_INLINE_ATTACHMENTS = 3;
+const MAX_INLINE_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+const SAFE_MIME_TYPE =
+  /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}$/;
+const CANONICAL_BASE64 =
+  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+type DecodedInlineAttachment = {
+  filename: string;
+  contentType: string;
+  content: Uint8Array<ArrayBuffer>;
+};
+
+function decodeInlineAttachments(
+  attachments: ZendeskInlineAttachmentInput[] | undefined,
+): DecodedInlineAttachment[] {
+  if (!attachments) return [];
+  if (attachments.length > MAX_INLINE_ATTACHMENTS) {
+    throw new Error("Invalid attachment input");
+  }
+
+  let totalBytes = 0;
+  return attachments.map((attachment) => {
+    const filename = attachment.filename;
+    const contentType = attachment.content_type;
+    const contentBase64 = attachment.content_base64;
+
+    if (
+      typeof filename !== "string" ||
+      filename.length < 1 ||
+      filename.length > 255 ||
+      filename === "." ||
+      filename === ".." ||
+      /[\\/\u0000-\u001f\u007f]/.test(filename) ||
+      typeof contentType !== "string" ||
+      !SAFE_MIME_TYPE.test(contentType) ||
+      typeof contentBase64 !== "string" ||
+      contentBase64.length % 4 !== 0 ||
+      !CANONICAL_BASE64.test(contentBase64)
+    ) {
+      throw new Error("Invalid attachment input");
+    }
+
+    const decoded = Buffer.from(contentBase64, "base64");
+    if (decoded.toString("base64") !== contentBase64) {
+      throw new Error("Invalid attachment input");
+    }
+    const content = Uint8Array.from(decoded);
+
+    totalBytes += content.byteLength;
+    if (totalBytes > MAX_INLINE_ATTACHMENT_BYTES) {
+      throw new Error("Attachment payload exceeds 5 MiB");
+    }
+
+    return { filename, contentType, content };
+  });
+}
 
 async function readErrorCode(
   response: Response,
@@ -628,7 +686,11 @@ export class ZendeskClient {
     return `Bearer ${accessToken ?? this.auth.accessToken}`;
   }
 
-  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+  private async performRequest<T>(
+    path: string,
+    init: RequestInit | undefined,
+    consume: (response: Response) => Promise<T>,
+  ): Promise<T> {
     const controller = new AbortController();
     const abort = () => controller.abort();
     if (this.outerSignal?.aborted) abort();
@@ -685,11 +747,7 @@ export class ZendeskClient {
         });
       }
 
-      try {
-        return (await response.json()) as T;
-      } catch {
-        throw new SafeAuthError("invalid_response");
-      }
+      return await consume(response);
     } catch (error) {
       if (error instanceof SafeAuthError) throw error;
       if (controller.signal.aborted) {
@@ -700,6 +758,20 @@ export class ZendeskClient {
       clearTimeout(timer);
       this.outerSignal?.removeEventListener("abort", abort);
     }
+  }
+
+  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    return this.performRequest(path, init, async (response) => {
+      try {
+        return (await response.json()) as T;
+      } catch {
+        throw new SafeAuthError("invalid_response");
+      }
+    });
+  }
+
+  private async requestVoid(path: string, init?: RequestInit): Promise<void> {
+    await this.performRequest(path, init, async () => undefined);
   }
 
   private async fetchOnce(
@@ -1187,22 +1259,64 @@ export class ZendeskClient {
     comment: string;
     public: boolean;
     expectedUpdatedAt: string;
+    attachments?: ZendeskInlineAttachmentInput[];
   }): Promise<ZendeskTicket> {
-    const data = await this.request<{ ticket: TicketPayload }>(`/tickets/${input.ticketId}.json`, {
-      method: "PUT",
-      body: JSON.stringify({
-        ticket: {
-          comment: {
-            body: input.comment,
-            public: input.public,
-          },
-          safe_update: true,
-          updated_stamp: input.expectedUpdatedAt,
-        },
-      }),
-    });
+    const attachments = decodeInlineAttachments(input.attachments);
+    let uploadToken: string | undefined;
 
-    return normalizeTicket(data.ticket);
+    try {
+      for (const attachment of attachments) {
+        const query = new URLSearchParams({ filename: attachment.filename });
+        if (uploadToken) query.set("token", uploadToken);
+
+        const upload = await this.request<{
+          upload?: { token?: unknown };
+        }>(`/uploads.json?${query.toString()}`, {
+          method: "POST",
+          headers: { "Content-Type": attachment.contentType },
+          body: attachment.content,
+        });
+        if (
+          typeof upload.upload?.token !== "string" ||
+          upload.upload.token.length === 0
+        ) {
+          throw new SafeAuthError("invalid_response");
+        }
+        uploadToken = upload.upload.token;
+      }
+
+      const data = await this.request<{ ticket: TicketPayload }>(
+        `/tickets/${input.ticketId}.json`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            ticket: {
+              comment: {
+                body: input.comment,
+                public: input.public,
+                ...(uploadToken ? { uploads: [uploadToken] } : {}),
+              },
+              safe_update: true,
+              updated_stamp: input.expectedUpdatedAt,
+            },
+          }),
+        },
+      );
+
+      return normalizeTicket(data.ticket);
+    } catch (error) {
+      if (uploadToken) {
+        try {
+          await this.requestVoid(
+            `/uploads/${encodeURIComponent(uploadToken)}.json`,
+            { method: "DELETE" },
+          );
+        } catch {
+          // Cleanup is best-effort; preserve the original safe failure.
+        }
+      }
+      throw error;
+    }
   }
 
   async getAllArticles(): Promise<ZendeskKnowledgeBase> {

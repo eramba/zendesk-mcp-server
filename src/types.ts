@@ -84,6 +84,12 @@ export type ZendeskTicketWriteFields = {
   email_ccs?: ZendeskEmailCcChange[];
 };
 
+export type ZendeskInlineAttachmentInput = {
+  filename: string;
+  content_type: string;
+  content_base64: string;
+};
+
 export type ZendeskAttachment = {
   id: number;
   file_name: string | null;

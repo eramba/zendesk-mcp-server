@@ -17,6 +17,12 @@ const customFieldsSchema = z.array(
   z.object({ id: z.number().int(), value: z.unknown() }),
 );
 
+const inlineAttachmentSchema = z.object({
+  filename: z.string().min(1).max(255),
+  content_type: z.string().min(3).max(255),
+  content_base64: z.string(),
+});
+
 const ticketWriteSchema = {
   subject: z.string().min(1).optional(),
   status: ticketStatusEnum.optional(),
@@ -152,15 +158,23 @@ export function registerTicketTools(
         comment: z.string().min(1),
         public: z.boolean().default(true),
         expected_updated_at: z.string().datetime(),
+        attachments: z.array(inlineAttachmentSchema).max(3).optional(),
       },
     },
-    async ({ ticket_id, comment, public: isPublic, expected_updated_at }) => {
+    async ({
+      ticket_id,
+      comment,
+      public: isPublic,
+      expected_updated_at,
+      attachments,
+    }) => {
       try {
         const ticket = await client.createTicketComment({
           ticketId: ticket_id,
           comment,
           public: isPublic,
           expectedUpdatedAt: expected_updated_at,
+          attachments,
         });
         return jsonText({ message: "Comment created successfully", ticket });
       } catch (error) {
