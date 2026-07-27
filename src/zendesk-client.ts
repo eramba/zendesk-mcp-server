@@ -26,8 +26,25 @@ type TicketPayload = {
   created_at?: string;
   updated_at?: string;
   requester_id?: number;
+  submitter_id?: number;
   assignee_id?: number;
   organization_id?: number;
+  group_id?: number;
+  brand_id?: number;
+  ticket_form_id?: number;
+  custom_status_id?: number;
+  custom_fields?: Array<{ id?: number; value?: unknown }>;
+  collaborator_ids?: number[];
+  email_cc_ids?: number[];
+  follower_ids?: number[];
+  problem_id?: number;
+  due_at?: string;
+  external_id?: string;
+  recipient?: string;
+  has_incidents?: boolean;
+  allow_attachments?: boolean;
+  satisfaction_rating?: { id?: number; score?: string; comment?: string };
+  via?: { channel?: string };
   tags?: string[];
   result_type?: string;
 };
@@ -57,7 +74,20 @@ type UserPayload = {
   id?: number;
   name?: string;
   email?: string;
+  alias?: string;
+  phone?: string;
+  verified?: boolean;
   role?: string;
+  role_type?: number;
+  custom_role_id?: number;
+  default_group_id?: number;
+  locale?: string;
+  locale_id?: number;
+  time_zone?: string;
+  external_id?: string;
+  tags?: string[];
+  user_fields?: Record<string, unknown>;
+  last_login_at?: string;
   created_at?: string;
   updated_at?: string;
   organization_id?: number;
@@ -71,9 +101,15 @@ type OrganizationPayload = {
   name?: string;
   details?: string;
   notes?: string;
+  domain_names?: string[];
+  external_id?: string;
+  group_id?: number;
+  organization_fields?: Record<string, unknown>;
+  shared_comments?: boolean;
   created_at?: string;
   updated_at?: string;
   shared_tickets?: boolean;
+  tags?: string[];
   result_type?: string;
 };
 
@@ -208,8 +244,42 @@ function normalizeTicket(ticket: TicketPayload): ZendeskTicket {
     created_at: ticket.created_at ?? null,
     updated_at: ticket.updated_at ?? null,
     requester_id: ticket.requester_id ?? null,
+    submitter_id: ticket.submitter_id ?? null,
     assignee_id: ticket.assignee_id ?? null,
     organization_id: ticket.organization_id ?? null,
+    group_id: ticket.group_id ?? null,
+    brand_id: ticket.brand_id ?? null,
+    ticket_form_id: ticket.ticket_form_id ?? null,
+    custom_status_id: ticket.custom_status_id ?? null,
+    custom_fields: Array.isArray(ticket.custom_fields)
+      ? ticket.custom_fields.map((field) => ({
+          id: Number(field.id),
+          value: field.value ?? null,
+        }))
+      : [],
+    collaborator_ids: Array.isArray(ticket.collaborator_ids)
+      ? ticket.collaborator_ids.map(Number)
+      : [],
+    email_cc_ids: Array.isArray(ticket.email_cc_ids)
+      ? ticket.email_cc_ids.map(Number)
+      : [],
+    follower_ids: Array.isArray(ticket.follower_ids)
+      ? ticket.follower_ids.map(Number)
+      : [],
+    problem_id: ticket.problem_id ?? null,
+    due_at: ticket.due_at ?? null,
+    external_id: ticket.external_id ?? null,
+    recipient: ticket.recipient ?? null,
+    has_incidents: Boolean(ticket.has_incidents),
+    allow_attachments: Boolean(ticket.allow_attachments),
+    satisfaction_rating: ticket.satisfaction_rating
+      ? {
+          id: ticket.satisfaction_rating.id ?? null,
+          score: ticket.satisfaction_rating.score ?? null,
+          comment: ticket.satisfaction_rating.comment ?? null,
+        }
+      : null,
+    via: ticket.via ? { channel: ticket.via.channel ?? null } : null,
     tags: Array.isArray(ticket.tags) ? ticket.tags : [],
   };
 }
@@ -246,7 +316,20 @@ function normalizeUser(user: UserPayload): ZendeskUser {
     id: Number(user.id),
     name: user.name ?? null,
     email: user.email ?? null,
+    alias: user.alias ?? null,
+    phone: user.phone ?? null,
+    verified: Boolean(user.verified),
     role: user.role ?? null,
+    role_type: user.role_type ?? null,
+    custom_role_id: user.custom_role_id ?? null,
+    default_group_id: user.default_group_id ?? null,
+    locale: user.locale ?? null,
+    locale_id: user.locale_id ?? null,
+    time_zone: user.time_zone ?? null,
+    external_id: user.external_id ?? null,
+    tags: Array.isArray(user.tags) ? user.tags : [],
+    user_fields: user.user_fields ?? {},
+    last_login_at: user.last_login_at ?? null,
     created_at: user.created_at ?? null,
     updated_at: user.updated_at ?? null,
     organization_id: user.organization_id ?? null,
@@ -261,9 +344,17 @@ function normalizeOrganization(organization: OrganizationPayload): ZendeskOrgani
     name: organization.name ?? null,
     details: organization.details ?? null,
     notes: organization.notes ?? null,
+    domain_names: Array.isArray(organization.domain_names)
+      ? organization.domain_names
+      : [],
+    external_id: organization.external_id ?? null,
+    group_id: organization.group_id ?? null,
+    organization_fields: organization.organization_fields ?? {},
+    shared_comments: Boolean(organization.shared_comments),
     created_at: organization.created_at ?? null,
     updated_at: organization.updated_at ?? null,
     shared_tickets: Boolean(organization.shared_tickets),
+    tags: Array.isArray(organization.tags) ? organization.tags : [],
   };
 }
 

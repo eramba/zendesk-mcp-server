@@ -21,6 +21,19 @@ const currentUserPayload = {
 
 const normalizedCurrentUser = {
   ...currentUserPayload,
+  alias: null,
+  phone: null,
+  verified: false,
+  role_type: null,
+  custom_role_id: null,
+  default_group_id: null,
+  locale: null,
+  locale_id: null,
+  time_zone: null,
+  external_id: null,
+  tags: [],
+  user_fields: {},
+  last_login_at: null,
 }
 
 function currentUserClient(requests) {
