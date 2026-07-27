@@ -984,6 +984,34 @@ export class InternalAuthStore {
     return result;
   }
 
+  resetUser(userId: string):
+    | { kind: "reset"; capturedGrant?: OAuthGrant }
+    | { kind: "not_found" } {
+    const reset = this.#database.transaction(() => {
+      const user = this.#database
+        .prepare("SELECT 1 FROM internal_users WHERE id = ?")
+        .get(userId);
+      if (!user) return { kind: "not_found" as const };
+
+      let capturedGrant: OAuthGrant | undefined;
+      try {
+        capturedGrant = this.loadCredential(userId)?.grant;
+      } catch {
+        capturedGrant = undefined;
+      }
+      const deleted = this.#database
+        .prepare("DELETE FROM internal_users WHERE id = ?")
+        .run(userId);
+      if (deleted.changes !== 1) throw new Error("unable to reset user");
+      return capturedGrant
+        ? { kind: "reset" as const, capturedGrant }
+        : { kind: "reset" as const };
+    });
+    const result = reset();
+    this.#restrictDatabaseFiles();
+    return result;
+  }
+
   async backup(destination: string): Promise<void> {
     if (!isAbsolute(destination) || destination === this.#path) {
       throw new Error("Backup destination must be a different absolute path");

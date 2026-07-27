@@ -146,6 +146,18 @@ npm run admin -- revoke --user <uuid> --upstream
 The command reports `succeeded`, `failed`, or `unavailable`; there is no
 background retry or outbox.
 
+Reset one mapping when that person must repeat the complete self-service flow:
+
+```bash
+npm run admin -- reset --user <uuid> --upstream
+```
+
+The command atomically removes only the selected internal user, bearer, OAuth
+grant, and invitation records, releasing that Zendesk identity for a new
+`/create-account` enrollment. Other users are unchanged. The mandatory
+`--upstream` flag makes one bounded attempt to revoke the captured Zendesk
+grant after the local reset and reports `succeeded`, `failed`, or `unavailable`.
+
 ### Codex MCP configuration
 
 ```toml
@@ -216,6 +228,7 @@ docker compose exec -T zendesk-mcp npm run admin -- create --label "Martin"
 docker compose exec -T zendesk-mcp npm run admin -- list
 docker compose exec -T zendesk-mcp npm run admin -- reauthorize --user <uuid>
 docker compose exec -T zendesk-mcp npm run admin -- revoke --user <uuid>
+docker compose exec -T zendesk-mcp npm run admin -- reset --user <uuid> --upstream
 ```
 
 ### Backup

@@ -687,6 +687,46 @@ test('revocation blocks access atomically and returns a bounded in-memory grant'
   )
 })
 
+test('reset deletes only the selected mapping and releases its Zendesk identity', async (t) => {
+  const { store } = await fixture(t)
+  const first = store.createPendingUser('First')
+  const second = store.createPendingUser('Second')
+  const firstSnapshot = activate(store, first, '801', 'first-reset')
+  activate(store, second, '802', 'second-reset')
+
+  assert.deepEqual(store.resetUser(first.userId), {
+    kind: 'reset',
+    capturedGrant: firstSnapshot.grant,
+  })
+  assert.equal(store.authenticateBearer(first.bearer), undefined)
+  assert.deepEqual(store.authenticateBearer(second.bearer), {
+    userId: second.userId,
+  })
+  assert.deepEqual(
+    store.inspectUsers().map(({ id }) => id),
+    [second.userId],
+  )
+  assert.deepEqual(store.resetUser(first.userId), { kind: 'not_found' })
+
+  const enrollment = store.createSelfEnrollment()
+  const claimed = store.claimAuthorization(enrollment.state)
+  const recreated = store.completeSelfEnrollment({
+    enrollmentId: claimed.enrollmentId,
+    identity: {
+      id: '801',
+      name: 'First Again',
+      email: 'first-again@example.test',
+      role: 'agent',
+    },
+    grant: grant('first-again'),
+  })
+  assert.equal(recreated.kind, 'created')
+  assert.notEqual(recreated.userId, first.userId)
+  assert.deepEqual(store.authenticateBearer(second.bearer), {
+    userId: second.userId,
+  })
+})
+
 test('reauthorization replaces expired invitations without a worker', async (t) => {
   const { clock, path, store } = await fixture(t)
   const created = store.createPendingUser('Martin')

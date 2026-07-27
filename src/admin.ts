@@ -20,6 +20,7 @@ const USAGE = [
   "  npm run admin -- reauthorize --user <uuid>",
   "  npm run admin -- list",
   "  npm run admin -- revoke --user <uuid> [--upstream]",
+  "  npm run admin -- reset --user <uuid> --upstream",
   "  npm run admin -- backup --output <absolute-path>",
 ].join("\n");
 
@@ -36,6 +37,7 @@ type ParsedCommand =
   | { kind: "reauthorize"; userId: string }
   | { kind: "list" }
   | { kind: "revoke"; userId: string; upstream: boolean }
+  | { kind: "reset"; userId: string }
   | { kind: "backup"; output: string };
 
 function isUuid(value: string): boolean {
@@ -75,6 +77,15 @@ function parseCommand(argv: string[]): ParsedCommand | undefined {
       userId: args[1],
       upstream: args.length === 3,
     };
+  }
+  if (
+    command === "reset" &&
+    args.length === 3 &&
+    args[0] === "--user" &&
+    isUuid(args[1]) &&
+    args[2] === "--upstream"
+  ) {
+    return { kind: "reset", userId: args[1] };
   }
   if (
     command === "backup" &&
@@ -152,23 +163,28 @@ export async function runAdmin(
       return 0;
     }
 
-    const revoked = store.revokeUser(command.userId);
-    if (revoked.kind === "not_found") {
+    const localResult =
+      command.kind === "reset"
+        ? store.resetUser(command.userId)
+        : store.revokeUser(command.userId);
+    if (localResult.kind === "not_found") {
       stderr("Administration command failed");
       return 1;
     }
-    stdout(`local: ${revoked.kind}`);
-    if (!command.upstream) {
+    stdout(`local: ${localResult.kind}`);
+    const attemptUpstream =
+      command.kind === "reset" || command.upstream;
+    if (!attemptUpstream) {
       stdout("upstream: not_attempted");
       return 0;
     }
-    if (revoked.kind !== "revoked" || !revoked.capturedGrant) {
+    if (!("capturedGrant" in localResult) || !localResult.capturedGrant) {
       stdout("upstream: unavailable");
       return 0;
     }
     try {
       const oauth = (dependencies.createOAuth ?? defaultOAuth)(config);
-      await oauth.revokeCurrent(revoked.capturedGrant.accessToken);
+      await oauth.revokeCurrent(localResult.capturedGrant.accessToken);
       stdout("upstream: succeeded");
     } catch {
       stdout("upstream: failed");

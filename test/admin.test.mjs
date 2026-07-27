@@ -172,6 +172,48 @@ test('revoke commits locally before optional bounded upstream revocation', async
   assert.equal(result.stdout.join('\n').includes('access-revoke-sentinel'), false)
 })
 
+test('reset removes one local mapping before bounded upstream revocation', async () => {
+  const { env } = await fixture()
+  const events = []
+  const fakeStore = {
+    resetUser: () => {
+      events.push('local-reset')
+      return {
+        kind: 'reset',
+        capturedGrant: {
+          accessToken: 'access-reset-sentinel',
+          refreshToken: 'refresh-reset-sentinel',
+        },
+      }
+    },
+    close: () => events.push('store-closed'),
+  }
+  const result = await command(
+    env,
+    ['reset', '--user', '00000000-0000-4000-8000-000000000098', '--upstream'],
+    {
+      openStore: () => fakeStore,
+      createOAuth: () => ({
+        revokeCurrent: async (accessToken) => {
+          events.push('upstream-revoked')
+          assert.equal(accessToken, 'access-reset-sentinel')
+        },
+      }),
+    },
+  )
+
+  assert.equal(result.code, 0)
+  assert.equal(field(result.stdout, 'local'), 'reset')
+  assert.equal(field(result.stdout, 'upstream'), 'succeeded')
+  assert.deepEqual(events, [
+    'local-reset',
+    'upstream-revoked',
+    'store-closed',
+  ])
+  assert.equal(result.stdout.join('\n').includes('access-reset-sentinel'), false)
+  assert.equal(result.stdout.join('\n').includes('refresh-reset-sentinel'), false)
+})
+
 test('revoke without upstream and backup report bounded outcomes and mode 0600', async () => {
   const { directory, env } = await fixture()
   const created = await command(env, ['create', '--label', 'Backup'])
@@ -194,6 +236,7 @@ test('invalid commands and identifiers fail with sanitized usage', async () => {
     [],
     ['retrieve', '--user', 'anything'],
     ['revoke', '--user', 'not-a-uuid'],
+    ['reset', '--user', '00000000-0000-4000-8000-000000000098'],
     ['backup', '--output', 'relative.sqlite'],
   ]) {
     const result = await command(env, argv)
