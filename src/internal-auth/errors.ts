@@ -7,6 +7,7 @@ export type SafeAuthErrorCategory =
   | "rate_limited"
   | "temporarily_unavailable"
   | "invalid_response"
+  | "conflict"
   | "aborted"
   | "reauthorization_required";
 
@@ -25,7 +26,11 @@ export class SafeAuthError extends Error {
     } = {},
   ) {
     const correlationId = options.correlationId ?? randomUUID();
-    super(`Zendesk authentication failed (${correlationId})`);
+    super(
+      category === "conflict"
+        ? `Ticket changed since it was last read. Fetch it again and retry. (reference: ${correlationId})`
+        : `Zendesk authentication failed (${correlationId})`,
+    );
     this.name = "SafeAuthError";
     this.category = category;
     this.correlationId = correlationId;

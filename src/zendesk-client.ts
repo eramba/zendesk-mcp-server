@@ -1,10 +1,17 @@
 import type {
+  CursorInput,
+  CursorPage,
   TicketAuditListResult,
   TicketFieldListResult,
   TicketListResult,
   TicketSearchResult,
   ZendeskAttachment,
   ZendeskComment,
+  ZendeskGroup,
+  ZendeskGroupMembership,
+  ZendeskGroupMembersPage,
+  ZendeskCustomStatus,
+  ZendeskInlineAttachmentInput,
   ZendeskKnowledgeBase,
   ZendeskOrganization,
   ZendeskSearchResult,
@@ -12,7 +19,12 @@ import type {
   ZendeskTicketAudit,
   ZendeskTicketAuditEvent,
   ZendeskTicketField,
+  ZendeskTicketForm,
+  ZendeskTicketMetrics,
+  ZendeskTicketWriteFields,
   ZendeskUser,
+  ZendeskUserTicketRelationship,
+  ZendeskView,
 } from "./types.js";
 import { SafeAuthError } from "./internal-auth/errors.js";
 
@@ -26,8 +38,25 @@ type TicketPayload = {
   created_at?: string;
   updated_at?: string;
   requester_id?: number;
+  submitter_id?: number;
   assignee_id?: number;
   organization_id?: number;
+  group_id?: number;
+  brand_id?: number;
+  ticket_form_id?: number;
+  custom_status_id?: number;
+  custom_fields?: Array<{ id?: number; value?: unknown }>;
+  collaborator_ids?: number[];
+  email_cc_ids?: number[];
+  follower_ids?: number[];
+  problem_id?: number;
+  due_at?: string;
+  external_id?: string;
+  recipient?: string;
+  has_incidents?: boolean;
+  allow_attachments?: boolean;
+  satisfaction_rating?: { id?: number; score?: string; comment?: string };
+  via?: { channel?: string };
   tags?: string[];
   result_type?: string;
 };
@@ -57,7 +86,20 @@ type UserPayload = {
   id?: number;
   name?: string;
   email?: string;
+  alias?: string;
+  phone?: string;
+  verified?: boolean;
   role?: string;
+  role_type?: number;
+  custom_role_id?: number;
+  default_group_id?: number;
+  locale?: string;
+  locale_id?: number;
+  time_zone?: string;
+  external_id?: string;
+  tags?: string[];
+  user_fields?: Record<string, unknown>;
+  last_login_at?: string;
   created_at?: string;
   updated_at?: string;
   organization_id?: number;
@@ -71,13 +113,98 @@ type OrganizationPayload = {
   name?: string;
   details?: string;
   notes?: string;
+  domain_names?: string[];
+  external_id?: string;
+  group_id?: number;
+  organization_fields?: Record<string, unknown>;
+  shared_comments?: boolean;
   created_at?: string;
   updated_at?: string;
   shared_tickets?: boolean;
+  tags?: string[];
   result_type?: string;
 };
 
 type SearchResultPayload = TicketPayload | UserPayload | OrganizationPayload;
+
+type ViewPayload = {
+  id?: number;
+  title?: string;
+  description?: string;
+  active?: boolean;
+  default?: boolean;
+  position?: number;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type GroupPayload = {
+  id?: number;
+  name?: string;
+  description?: string;
+  default?: boolean;
+  deleted?: boolean;
+  is_public?: boolean;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type GroupMembershipPayload = {
+  id?: number;
+  user_id?: number;
+  group_id?: number;
+  default?: boolean;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type MetricDurationPayload = { calendar?: number; business?: number };
+type TicketMetricsPayload = {
+  id?: number;
+  ticket_id?: number;
+  assigned_at?: string;
+  initially_assigned_at?: string;
+  solved_at?: string;
+  status_updated_at?: string;
+  requester_updated_at?: string;
+  assignee_updated_at?: string;
+  latest_comment_added_at?: string;
+  replies?: number;
+  reopens?: number;
+  assignee_stations?: number;
+  group_stations?: number;
+  reply_time_in_minutes?: MetricDurationPayload;
+  requester_wait_time_in_minutes?: MetricDurationPayload;
+  agent_wait_time_in_minutes?: MetricDurationPayload;
+  on_hold_time_in_minutes?: MetricDurationPayload;
+  first_resolution_time_in_minutes?: MetricDurationPayload;
+  full_resolution_time_in_minutes?: MetricDurationPayload;
+};
+
+type TicketFormPayload = {
+  id?: number;
+  name?: string;
+  display_name?: string;
+  active?: boolean;
+  default?: boolean;
+  position?: number;
+  ticket_field_ids?: number[];
+  created_at?: string;
+  updated_at?: string;
+};
+
+type CustomStatusPayload = {
+  id?: number;
+  active?: boolean;
+  default?: boolean;
+  agent_label?: string;
+  end_user_label?: string;
+  description?: string;
+  end_user_description?: string;
+  status_category?: string;
+  created_at?: string;
+  updated_at?: string;
+};
 
 type TicketFieldPayload = {
   id?: number;
@@ -144,6 +271,63 @@ export type ZendeskClientOptions = {
 };
 
 const MAX_ERROR_BODY_BYTES = 16 * 1024;
+const MAX_INLINE_ATTACHMENTS = 3;
+const MAX_INLINE_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+const SAFE_MIME_TYPE =
+  /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}$/;
+const CANONICAL_BASE64 =
+  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+type DecodedInlineAttachment = {
+  filename: string;
+  contentType: string;
+  content: Uint8Array<ArrayBuffer>;
+};
+
+function decodeInlineAttachments(
+  attachments: ZendeskInlineAttachmentInput[] | undefined,
+): DecodedInlineAttachment[] {
+  if (!attachments) return [];
+  if (attachments.length > MAX_INLINE_ATTACHMENTS) {
+    throw new Error("Invalid attachment input");
+  }
+
+  let totalBytes = 0;
+  return attachments.map((attachment) => {
+    const filename = attachment.filename;
+    const contentType = attachment.content_type;
+    const contentBase64 = attachment.content_base64;
+
+    if (
+      typeof filename !== "string" ||
+      filename.length < 1 ||
+      filename.length > 255 ||
+      filename === "." ||
+      filename === ".." ||
+      /[\\/\u0000-\u001f\u007f]/.test(filename) ||
+      typeof contentType !== "string" ||
+      !SAFE_MIME_TYPE.test(contentType) ||
+      typeof contentBase64 !== "string" ||
+      contentBase64.length % 4 !== 0 ||
+      !CANONICAL_BASE64.test(contentBase64)
+    ) {
+      throw new Error("Invalid attachment input");
+    }
+
+    const decoded = Buffer.from(contentBase64, "base64");
+    if (decoded.toString("base64") !== contentBase64) {
+      throw new Error("Invalid attachment input");
+    }
+    const content = Uint8Array.from(decoded);
+
+    totalBytes += content.byteLength;
+    if (totalBytes > MAX_INLINE_ATTACHMENT_BYTES) {
+      throw new Error("Attachment payload exceeds 5 MiB");
+    }
+
+    return { filename, contentType, content };
+  });
+}
 
 async function readErrorCode(
   response: Response,
@@ -185,12 +369,14 @@ function categoryForStatus(status: number): {
     | "forbidden"
     | "rate_limited"
     | "temporarily_unavailable"
+    | "conflict"
     | "invalid_response";
   retryable: boolean;
 } {
   if (status === 401) return { category: "unauthorized", retryable: false };
   if (status === 403) return { category: "forbidden", retryable: false };
   if (status === 429) return { category: "rate_limited", retryable: true };
+  if (status === 409) return { category: "conflict", retryable: false };
   if (status >= 500) {
     return { category: "temporarily_unavailable", retryable: true };
   }
@@ -208,8 +394,42 @@ function normalizeTicket(ticket: TicketPayload): ZendeskTicket {
     created_at: ticket.created_at ?? null,
     updated_at: ticket.updated_at ?? null,
     requester_id: ticket.requester_id ?? null,
+    submitter_id: ticket.submitter_id ?? null,
     assignee_id: ticket.assignee_id ?? null,
     organization_id: ticket.organization_id ?? null,
+    group_id: ticket.group_id ?? null,
+    brand_id: ticket.brand_id ?? null,
+    ticket_form_id: ticket.ticket_form_id ?? null,
+    custom_status_id: ticket.custom_status_id ?? null,
+    custom_fields: Array.isArray(ticket.custom_fields)
+      ? ticket.custom_fields.map((field) => ({
+          id: Number(field.id),
+          value: field.value ?? null,
+        }))
+      : [],
+    collaborator_ids: Array.isArray(ticket.collaborator_ids)
+      ? ticket.collaborator_ids.map(Number)
+      : [],
+    email_cc_ids: Array.isArray(ticket.email_cc_ids)
+      ? ticket.email_cc_ids.map(Number)
+      : [],
+    follower_ids: Array.isArray(ticket.follower_ids)
+      ? ticket.follower_ids.map(Number)
+      : [],
+    problem_id: ticket.problem_id ?? null,
+    due_at: ticket.due_at ?? null,
+    external_id: ticket.external_id ?? null,
+    recipient: ticket.recipient ?? null,
+    has_incidents: Boolean(ticket.has_incidents),
+    allow_attachments: Boolean(ticket.allow_attachments),
+    satisfaction_rating: ticket.satisfaction_rating
+      ? {
+          id: ticket.satisfaction_rating.id ?? null,
+          score: ticket.satisfaction_rating.score ?? null,
+          comment: ticket.satisfaction_rating.comment ?? null,
+        }
+      : null,
+    via: ticket.via ? { channel: ticket.via.channel ?? null } : null,
     tags: Array.isArray(ticket.tags) ? ticket.tags : [],
   };
 }
@@ -246,7 +466,20 @@ function normalizeUser(user: UserPayload): ZendeskUser {
     id: Number(user.id),
     name: user.name ?? null,
     email: user.email ?? null,
+    alias: user.alias ?? null,
+    phone: user.phone ?? null,
+    verified: Boolean(user.verified),
     role: user.role ?? null,
+    role_type: user.role_type ?? null,
+    custom_role_id: user.custom_role_id ?? null,
+    default_group_id: user.default_group_id ?? null,
+    locale: user.locale ?? null,
+    locale_id: user.locale_id ?? null,
+    time_zone: user.time_zone ?? null,
+    external_id: user.external_id ?? null,
+    tags: Array.isArray(user.tags) ? user.tags : [],
+    user_fields: user.user_fields ?? {},
+    last_login_at: user.last_login_at ?? null,
     created_at: user.created_at ?? null,
     updated_at: user.updated_at ?? null,
     organization_id: user.organization_id ?? null,
@@ -261,9 +494,126 @@ function normalizeOrganization(organization: OrganizationPayload): ZendeskOrgani
     name: organization.name ?? null,
     details: organization.details ?? null,
     notes: organization.notes ?? null,
+    domain_names: Array.isArray(organization.domain_names)
+      ? organization.domain_names
+      : [],
+    external_id: organization.external_id ?? null,
+    group_id: organization.group_id ?? null,
+    organization_fields: organization.organization_fields ?? {},
+    shared_comments: Boolean(organization.shared_comments),
     created_at: organization.created_at ?? null,
     updated_at: organization.updated_at ?? null,
     shared_tickets: Boolean(organization.shared_tickets),
+    tags: Array.isArray(organization.tags) ? organization.tags : [],
+  };
+}
+
+function normalizeView(view: ViewPayload): ZendeskView {
+  return {
+    id: Number(view.id),
+    title: view.title ?? null,
+    description: view.description ?? null,
+    active: Boolean(view.active),
+    default: Boolean(view.default),
+    position: view.position ?? null,
+    created_at: view.created_at ?? null,
+    updated_at: view.updated_at ?? null,
+  };
+}
+
+function normalizeGroup(group: GroupPayload): ZendeskGroup {
+  return {
+    id: Number(group.id),
+    name: group.name ?? null,
+    description: group.description ?? null,
+    default: Boolean(group.default),
+    deleted: Boolean(group.deleted),
+    is_public: Boolean(group.is_public),
+    created_at: group.created_at ?? null,
+    updated_at: group.updated_at ?? null,
+  };
+}
+
+function normalizeGroupMembership(
+  membership: GroupMembershipPayload,
+): ZendeskGroupMembership {
+  return {
+    id: Number(membership.id),
+    user_id: Number(membership.user_id),
+    group_id: Number(membership.group_id),
+    default: Boolean(membership.default),
+    created_at: membership.created_at ?? null,
+    updated_at: membership.updated_at ?? null,
+  };
+}
+
+function normalizeMetricDuration(value?: MetricDurationPayload) {
+  return {
+    calendar: value?.calendar ?? null,
+    business: value?.business ?? null,
+  };
+}
+
+function normalizeTicketMetrics(metrics: TicketMetricsPayload): ZendeskTicketMetrics {
+  return {
+    id: Number(metrics.id),
+    ticket_id: Number(metrics.ticket_id),
+    assigned_at: metrics.assigned_at ?? null,
+    initially_assigned_at: metrics.initially_assigned_at ?? null,
+    solved_at: metrics.solved_at ?? null,
+    status_updated_at: metrics.status_updated_at ?? null,
+    requester_updated_at: metrics.requester_updated_at ?? null,
+    assignee_updated_at: metrics.assignee_updated_at ?? null,
+    latest_comment_added_at: metrics.latest_comment_added_at ?? null,
+    replies: Number(metrics.replies ?? 0),
+    reopens: Number(metrics.reopens ?? 0),
+    assignee_stations: Number(metrics.assignee_stations ?? 0),
+    group_stations: Number(metrics.group_stations ?? 0),
+    reply_time_in_minutes: normalizeMetricDuration(metrics.reply_time_in_minutes),
+    requester_wait_time_in_minutes: normalizeMetricDuration(
+      metrics.requester_wait_time_in_minutes,
+    ),
+    agent_wait_time_in_minutes: normalizeMetricDuration(
+      metrics.agent_wait_time_in_minutes,
+    ),
+    on_hold_time_in_minutes: normalizeMetricDuration(metrics.on_hold_time_in_minutes),
+    first_resolution_time_in_minutes: normalizeMetricDuration(
+      metrics.first_resolution_time_in_minutes,
+    ),
+    full_resolution_time_in_minutes: normalizeMetricDuration(
+      metrics.full_resolution_time_in_minutes,
+    ),
+  };
+}
+
+function normalizeTicketForm(form: TicketFormPayload): ZendeskTicketForm {
+  return {
+    id: Number(form.id),
+    name: form.name ?? null,
+    display_name: form.display_name ?? null,
+    active: Boolean(form.active),
+    default: Boolean(form.default),
+    position: form.position ?? null,
+    ticket_field_ids: Array.isArray(form.ticket_field_ids)
+      ? form.ticket_field_ids.map(Number)
+      : [],
+    created_at: form.created_at ?? null,
+    updated_at: form.updated_at ?? null,
+  };
+}
+
+function normalizeCustomStatus(status: CustomStatusPayload): ZendeskCustomStatus {
+  return {
+    id: Number(status.id),
+    active: Boolean(status.active),
+    default: Boolean(status.default),
+    agent_label: status.agent_label ?? null,
+    end_user_label: status.end_user_label ?? null,
+    description: status.description ?? null,
+    end_user_description: status.end_user_description ?? null,
+    status_category: status.status_category ?? null,
+    created_at: status.created_at ?? null,
+    updated_at: status.updated_at ?? null,
   };
 }
 
@@ -336,7 +686,11 @@ export class ZendeskClient {
     return `Bearer ${accessToken ?? this.auth.accessToken}`;
   }
 
-  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+  private async performRequest<T>(
+    path: string,
+    init: RequestInit | undefined,
+    consume: (response: Response) => Promise<T>,
+  ): Promise<T> {
     const controller = new AbortController();
     const abort = () => controller.abort();
     if (this.outerSignal?.aborted) abort();
@@ -393,11 +747,7 @@ export class ZendeskClient {
         });
       }
 
-      try {
-        return (await response.json()) as T;
-      } catch {
-        throw new SafeAuthError("invalid_response");
-      }
+      return await consume(response);
     } catch (error) {
       if (error instanceof SafeAuthError) throw error;
       if (controller.signal.aborted) {
@@ -408,6 +758,20 @@ export class ZendeskClient {
       clearTimeout(timer);
       this.outerSignal?.removeEventListener("abort", abort);
     }
+  }
+
+  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    return this.performRequest(path, init, async (response) => {
+      try {
+        return (await response.json()) as T;
+      } catch {
+        throw new SafeAuthError("invalid_response");
+      }
+    });
+  }
+
+  private async requestVoid(path: string, init?: RequestInit): Promise<void> {
+    await this.performRequest(path, init, async () => undefined);
   }
 
   private async fetchOnce(
@@ -618,6 +982,127 @@ export class ZendeskClient {
     return normalizeUser(data.user);
   }
 
+  async getUser(userId: number): Promise<ZendeskUser> {
+    const data = await this.request<{ user: UserPayload }>(`/users/${userId}.json`);
+    return normalizeUser(data.user);
+  }
+
+  async getOrganization(organizationId: number): Promise<ZendeskOrganization> {
+    const data = await this.request<{ organization: OrganizationPayload }>(
+      `/organizations/${organizationId}.json`,
+    );
+    return normalizeOrganization(data.organization);
+  }
+
+  async listUserTickets(
+    userId: number,
+    relationship: ZendeskUserTicketRelationship,
+    options: CursorInput,
+  ): Promise<CursorPage<ZendeskTicket>> {
+    const query = this.cursorQuery(options);
+    const data = await this.request<{
+      tickets: TicketPayload[];
+      links?: { next?: string | null };
+      meta?: { has_more?: boolean };
+    }>(`/users/${userId}/tickets/${relationship}.json?${query.toString()}`);
+    return this.cursorPage(
+      data.tickets.map(normalizeTicket),
+      options,
+      data.meta?.has_more,
+      data.links?.next,
+    );
+  }
+
+  async listOrganizationTickets(
+    organizationId: number,
+    options: CursorInput,
+  ): Promise<CursorPage<ZendeskTicket>> {
+    const query = this.cursorQuery(options);
+    const data = await this.request<{
+      tickets: TicketPayload[];
+      links?: { next?: string | null };
+      meta?: { has_more?: boolean };
+    }>(`/organizations/${organizationId}/tickets.json?${query.toString()}`);
+    return this.cursorPage(
+      data.tickets.map(normalizeTicket),
+      options,
+      data.meta?.has_more,
+      data.links?.next,
+    );
+  }
+
+  async listViews(options: CursorInput): Promise<CursorPage<ZendeskView>> {
+    const query = this.cursorQuery(options, { active: "true" });
+    const data = await this.request<{
+      views: ViewPayload[];
+      links?: { next?: string | null };
+      meta?: { has_more?: boolean };
+    }>(`/views.json?${query.toString()}`);
+    return this.cursorPage(
+      data.views.map(normalizeView),
+      options,
+      data.meta?.has_more,
+      data.links?.next,
+    );
+  }
+
+  async listViewTickets(
+    viewId: number,
+    options: CursorInput,
+  ): Promise<CursorPage<ZendeskTicket>> {
+    const query = this.cursorQuery(options);
+    const data = await this.request<{
+      tickets: TicketPayload[];
+      links?: { next?: string | null };
+      meta?: { has_more?: boolean };
+    }>(`/views/${viewId}/tickets.json?${query.toString()}`);
+    return this.cursorPage(
+      data.tickets.map(normalizeTicket),
+      options,
+      data.meta?.has_more,
+      data.links?.next,
+    );
+  }
+
+  async listAssignableGroups(
+    options: CursorInput,
+  ): Promise<CursorPage<ZendeskGroup>> {
+    const query = this.cursorQuery(options);
+    const data = await this.request<{
+      groups: GroupPayload[];
+      links?: { next?: string | null };
+      meta?: { has_more?: boolean };
+    }>(`/groups/assignable.json?${query.toString()}`);
+    return this.cursorPage(
+      data.groups.map(normalizeGroup),
+      options,
+      data.meta?.has_more,
+      data.links?.next,
+    );
+  }
+
+  async listGroupMembers(
+    groupId: number,
+    options: CursorInput,
+  ): Promise<ZendeskGroupMembersPage> {
+    const query = this.cursorQuery(options, { include: "users" });
+    const data = await this.request<{
+      group_memberships: GroupMembershipPayload[];
+      users?: UserPayload[];
+      links?: { next?: string | null };
+      meta?: { has_more?: boolean };
+    }>(`/groups/${groupId}/memberships.json?${query.toString()}`);
+    return {
+      ...this.cursorPage(
+        data.group_memberships.map(normalizeGroupMembership),
+        options,
+        data.meta?.has_more,
+        data.links?.next,
+      ),
+      users: (data.users ?? []).map(normalizeUser),
+    };
+  }
+
   async searchUsers(options: {
     query: string;
     page: number;
@@ -664,6 +1149,41 @@ export class ZendeskClient {
     };
   }
 
+  async getTicketMetrics(ticketId: number): Promise<ZendeskTicketMetrics> {
+    const data = await this.request<{ ticket_metric: TicketMetricsPayload }>(
+      `/tickets/${ticketId}/metrics.json`,
+    );
+    return normalizeTicketMetrics(data.ticket_metric);
+  }
+
+  async listTicketForms(
+    options: CursorInput,
+  ): Promise<CursorPage<ZendeskTicketForm>> {
+    const query = this.cursorQuery(options, { active: "true" });
+    const data = await this.request<{
+      ticket_forms: TicketFormPayload[];
+      links?: { next?: string | null };
+      meta?: { has_more?: boolean };
+    }>(`/ticket_forms.json?${query.toString()}`);
+    return this.cursorPage(
+      data.ticket_forms.map(normalizeTicketForm),
+      options,
+      data.meta?.has_more,
+      data.links?.next,
+    );
+  }
+
+  async listCustomStatuses(): Promise<{
+    statuses: ZendeskCustomStatus[];
+    count: number;
+  }> {
+    const data = await this.request<{ custom_statuses: CustomStatusPayload[] }>(
+      "/custom_statuses.json?active=true",
+    );
+    const statuses = data.custom_statuses.map(normalizeCustomStatus);
+    return { statuses, count: statuses.length };
+  }
+
   async getTicketAudits(options: {
     ticketId: number;
     page: number;
@@ -694,29 +1214,20 @@ export class ZendeskClient {
     };
   }
 
-  async createTicket(input: {
-    subject: string;
-    description: string;
-    requester_id?: number;
-    assignee_id?: number;
-    priority?: string;
-    type?: string;
-    tags?: string[];
-    custom_fields?: Array<{ id: number; value: unknown }>;
-  }): Promise<ZendeskTicket> {
+  async createTicket(
+    input: ZendeskTicketWriteFields & {
+      subject: string;
+      description: string;
+    },
+  ): Promise<ZendeskTicket> {
+    const { description, ...fields } = input;
     const data = await this.request<{ ticket: TicketPayload }>("/tickets.json", {
       method: "POST",
       body: JSON.stringify({
         ticket: {
-          subject: input.subject,
-          comment: { body: input.description, public: true },
-          description: input.description,
-          requester_id: input.requester_id,
-          assignee_id: input.assignee_id,
-          priority: input.priority,
-          type: input.type,
-          tags: input.tags,
-          custom_fields: input.custom_fields,
+          ...fields,
+          comment: { body: description, public: true },
+          description,
         },
       }),
     });
@@ -726,42 +1237,86 @@ export class ZendeskClient {
 
   async updateTicket(
     ticketId: number,
-    fields: {
-      subject?: string;
-      status?: string;
-      priority?: string;
-      type?: string;
-      assignee_id?: number;
-      requester_id?: number;
-      tags?: string[];
-      custom_fields?: Array<{ id: number; value: unknown }>;
-      due_at?: string;
-    },
+    fields: ZendeskTicketWriteFields,
+    expectedUpdatedAt: string,
   ): Promise<ZendeskTicket> {
     const data = await this.request<{ ticket: TicketPayload }>(`/tickets/${ticketId}.json`, {
       method: "PUT",
       body: JSON.stringify({
-        ticket: fields,
+        ticket: {
+          ...fields,
+          safe_update: true,
+          updated_stamp: expectedUpdatedAt,
+        },
       }),
     });
 
     return normalizeTicket(data.ticket);
   }
 
-  async createTicketComment(ticketId: number, comment: string, isPublic = true): Promise<string> {
-    await this.request<{ ticket: TicketPayload }>(`/tickets/${ticketId}.json`, {
-      method: "PUT",
-      body: JSON.stringify({
-        ticket: {
-          comment: {
-            body: comment,
-            public: isPublic,
-          },
-        },
-      }),
-    });
+  async createTicketComment(input: {
+    ticketId: number;
+    comment: string;
+    public: boolean;
+    expectedUpdatedAt: string;
+    attachments?: ZendeskInlineAttachmentInput[];
+  }): Promise<ZendeskTicket> {
+    const attachments = decodeInlineAttachments(input.attachments);
+    let uploadToken: string | undefined;
 
-    return comment;
+    try {
+      for (const attachment of attachments) {
+        const query = new URLSearchParams({ filename: attachment.filename });
+        if (uploadToken) query.set("token", uploadToken);
+
+        const upload = await this.request<{
+          upload?: { token?: unknown };
+        }>(`/uploads.json?${query.toString()}`, {
+          method: "POST",
+          headers: { "Content-Type": attachment.contentType },
+          body: attachment.content,
+        });
+        if (
+          typeof upload.upload?.token !== "string" ||
+          upload.upload.token.length === 0
+        ) {
+          throw new SafeAuthError("invalid_response");
+        }
+        uploadToken = upload.upload.token;
+      }
+
+      const data = await this.request<{ ticket: TicketPayload }>(
+        `/tickets/${input.ticketId}.json`,
+        {
+          method: "PUT",
+          body: JSON.stringify({
+            ticket: {
+              comment: {
+                body: input.comment,
+                public: input.public,
+                ...(uploadToken ? { uploads: [uploadToken] } : {}),
+              },
+              safe_update: true,
+              updated_stamp: input.expectedUpdatedAt,
+            },
+          }),
+        },
+      );
+
+      return normalizeTicket(data.ticket);
+    } catch (error) {
+      if (uploadToken) {
+        try {
+          await this.requestVoid(
+            `/uploads/${encodeURIComponent(uploadToken)}.json`,
+            { method: "DELETE" },
+          );
+        } catch {
+          // Cleanup is best-effort; preserve the original safe failure.
+        }
+      }
+      throw error;
+    }
   }
 
   async getAllArticles(): Promise<ZendeskKnowledgeBase> {
@@ -845,5 +1400,34 @@ export class ZendeskClient {
     }
 
     return nextUrl;
+  }
+
+  private cursorQuery(
+    options: CursorInput,
+    leading: Record<string, string> = {},
+  ): URLSearchParams {
+    const query = new URLSearchParams(leading);
+    query.set("page[size]", String(Math.min(options.pageSize, 100)));
+    if (options.after) query.set("page[after]", options.after);
+    return query;
+  }
+
+  private cursorPage<T>(
+    items: T[],
+    options: CursorInput,
+    hasMore = false,
+    nextUrl: string | null = null,
+  ): CursorPage<T> {
+    const nextPath = this.nextPath(nextUrl);
+    const nextCursor = nextPath
+      ? new URL(`${this.baseUrl}${nextPath}`).searchParams.get("page[after]")
+      : null;
+    if (hasMore && !nextCursor) throw new SafeAuthError("invalid_response");
+    return {
+      items,
+      page_size: Math.min(options.pageSize, 100),
+      has_more: Boolean(hasMore),
+      next_cursor: hasMore ? nextCursor : null,
+    };
   }
 }

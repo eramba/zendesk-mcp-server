@@ -1,8 +1,3 @@
-> **Important note:** All credits go to [reminia](https://github.com/reminia).
-> This project is a TypeScript port of
-> [`reminia/zendesk-mcp-server`](https://github.com/reminia/zendesk-mcp-server),
-> with additional tools and internal Streamable HTTP deployment support.
-
 # Zendesk MCP Server (TypeScript)
 
 A Model Context Protocol server for Zendesk with stdio and stateless
@@ -293,6 +288,23 @@ retirement schedule.
 
 ## MCP surface
 
+Ticket reads and writes expose the support-relevant assignment, requester,
+organization, form, custom-status, custom-field, collaborator, follower,
+email-CC, problem/incident, due-date, tags, satisfaction, and channel fields.
+`update_ticket` and `create_ticket_comment` require the ticket's current
+`updated_at` value as `expected_updated_at`. Zendesk rejects a stale write as a
+safe conflict instead of silently overwriting a colleague's newer change.
+
+`create_ticket_comment` optionally accepts up to three inline attachments as
+`filename`, `content_type`, and canonical `content_base64`. The combined decoded
+payload is limited to 5 MiB. Upload tokens are internal implementation details,
+are never returned by the MCP tool, and are cleaned up on a failed comment on a
+best-effort basis.
+
+Cursor-paginated tools accept `page_size` and optional `after`. When more data
+exists, pass the returned `next_cursor` as the next call's `after`; cursors are
+opaque and should not be modified.
+
 Prompts:
 
 - `analyze-ticket`
@@ -303,16 +315,27 @@ Tools:
 - `get_ticket`
 - `get_tickets`
 - `search_tickets`
-- `search`
-- `get_current_user`
-- `search_users`
-- `search_organizations`
-- `list_ticket_fields`
 - `get_ticket_audits`
 - `get_ticket_comments`
 - `create_ticket_comment`
 - `create_ticket`
 - `update_ticket`
+- `search`
+- `get_current_user`
+- `get_user`
+- `get_organization`
+- `list_user_tickets`
+- `list_organization_tickets`
+- `search_users`
+- `search_organizations`
+- `list_ticket_fields`
+- `get_ticket_metrics`
+- `list_ticket_forms`
+- `list_custom_statuses`
+- `list_views`
+- `list_view_tickets`
+- `list_assignable_groups`
+- `list_group_members`
 
 Resources:
 
