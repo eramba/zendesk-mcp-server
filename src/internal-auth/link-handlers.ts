@@ -3,22 +3,45 @@ import type { RequestHandler, Response } from "express";
 import { randomOpaque } from "./crypto.js";
 import { SafeAuthError } from "./errors.js";
 import type { InternalAuthStore, OAuthGrant } from "./store.js";
-import type { ZendeskOAuthGateway } from "./zendesk-oauth.js";
+import {
+  isEligibleZendeskIdentity,
+  type ZendeskOAuthGateway,
+} from "./zendesk-oauth.js";
 
 const INVALID_LINK_PAGE =
   "<!doctype html><title>Link unavailable</title><p>This linking URL is invalid, expired, or already used.</p>";
 const INVALID_CALLBACK_PAGE =
   "<!doctype html><title>Link failed</title><p>This authorization callback is invalid or expired. Ask the administrator for a new linking URL.</p>";
 const FAILED_CALLBACK_PAGE =
-  "<!doctype html><title>Link failed</title><p>Zendesk linking could not be completed. Ask the administrator for a new linking URL.</p>";
+  "<!doctype html><title>Link failed</title><p>Zendesk linking could not be completed. Ask the administrator for help.</p>";
+const INELIGIBLE_PAGE =
+  "<!doctype html><title>Enrollment unavailable</title><p>Only Zendesk agents and administrators can create an MCP account.</p>";
+const ALREADY_REGISTERED_PAGE =
+  "<!doctype html><title>Already registered</title><p>This Zendesk identity is already registered. Contact the administrator if you need help with your bearer.</p>";
 const SUCCESS_PAGE =
   "<!doctype html><title>Zendesk linked</title><p>Your Zendesk identity is linked. You can close this window.</p>";
+const CREATE_ACCOUNT_PAGE = `<!doctype html>
+<title>Create Zendesk MCP account</title>
+<h1>Create Zendesk MCP account</h1>
+<p>Connect your Zendesk agent or administrator identity to receive one personal MCP bearer.</p>
+<form method="post" action="/create-account">
+  <button type="submit">Connect Zendesk</button>
+</form>`;
 
 function browserHeaders(response: Response): void {
   response.setHeader("Cache-Control", "no-store");
   response.setHeader("Pragma", "no-cache");
   response.setHeader("Referrer-Policy", "no-referrer");
   response.setHeader("X-Content-Type-Options", "nosniff");
+  response.setHeader("X-Frame-Options", "DENY");
+  response.setHeader(
+    "Content-Security-Policy",
+    "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+  );
+  response.setHeader(
+    "Permissions-Policy",
+    "camera=(), microphone=(), geolocation=()",
+  );
 }
 
 function html(response: Response, status: number, body: string): void {
@@ -30,14 +53,93 @@ function singleQuery(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function enrollmentSuccessPage(input: {
+  userId: string;
+  bearer: string;
+  mcpUrl: string;
+}): string {
+  const config = [
+    "[mcp_servers.zendesk]",
+    `url = "${input.mcpUrl}"`,
+    "",
+    "[mcp_servers.zendesk.http_headers]",
+    `Authorization = "Bearer ${input.bearer}"`,
+  ].join("\n");
+  return `<!doctype html>
+<title>Zendesk MCP account created</title>
+<h1>Zendesk MCP account created</h1>
+<p><strong>The MCP bearer is displayed once and cannot be recovered. Copy it now.</strong></p>
+<p>user_id:</p><pre>${escapeHtml(input.userId)}</pre>
+<p>mcp_bearer:</p><pre>${escapeHtml(input.bearer)}</pre>
+<p>Codex configuration:</p><pre>${escapeHtml(config)}</pre>`;
+}
+
+async function revokeBestEffort(
+  oauth: ZendeskOAuthGateway,
+  grant: OAuthGrant,
+): Promise<void> {
+  await oauth.revokeCurrent(grant.accessToken).catch(() => undefined);
+}
+
 export function createLinkHandlers(options: {
   store: InternalAuthStore;
   oauth: ZendeskOAuthGateway;
+  publicBaseUrl?: URL;
+  selfServiceEnabled?: boolean;
   now?: () => number;
 }): {
   link: RequestHandler;
+  createAccount: RequestHandler;
+  startEnrollment: RequestHandler;
   callback: RequestHandler;
 } {
+  const publicBaseUrl = new URL(
+    options.publicBaseUrl?.href ?? "http://127.0.0.1/",
+  );
+  const selfServiceEnabled = options.selfServiceEnabled ?? false;
+
+  const createAccount: RequestHandler = (_request, response) => {
+    if (!selfServiceEnabled) {
+      html(response, 404, "<!doctype html><title>Not found</title>");
+      return;
+    }
+    html(response, 200, CREATE_ACCOUNT_PAGE);
+  };
+
+  const startEnrollment: RequestHandler = (request, response) => {
+    if (!selfServiceEnabled) {
+      html(response, 404, "<!doctype html><title>Not found</title>");
+      return;
+    }
+    if (request.get("origin") !== publicBaseUrl.origin) {
+      html(
+        response,
+        403,
+        "<!doctype html><title>Enrollment denied</title><p>This enrollment request is not allowed.</p>",
+      );
+      return;
+    }
+
+    try {
+      const enrollment = options.store.createSelfEnrollment();
+      const upstream = options.oauth.authorizationUrl(enrollment.state);
+      browserHeaders(response);
+      response.redirect(302, upstream.href);
+    } catch {
+      console.error("OAuth self-service enrollment start failed");
+      html(response, 503, FAILED_CALLBACK_PAGE);
+    }
+  };
+
   const link: RequestHandler = (request, response) => {
     browserHeaders(response);
     const invitation = singleQuery(request.query.invitation);
@@ -78,7 +180,7 @@ export function createLinkHandlers(options: {
     }
 
     const claimed = options.store.claimAuthorization(state);
-    if (!claimed || claimed.kind !== "invitation") {
+    if (!claimed) {
       html(response, 400, INVALID_CALLBACK_PAGE);
       return;
     }
@@ -97,18 +199,43 @@ export function createLinkHandlers(options: {
         grant.accessToken,
         controller.signal,
       );
-      options.store.completeLink({
-        ...claimed,
+
+      if (claimed.kind === "invitation") {
+        options.store.completeLink({
+          ...claimed,
+          identity,
+          grant,
+        });
+        html(response, 200, SUCCESS_PAGE);
+        return;
+      }
+
+      if (!isEligibleZendeskIdentity(identity)) {
+        await revokeBestEffort(options.oauth, grant);
+        html(response, 403, INELIGIBLE_PAGE);
+        return;
+      }
+      const created = options.store.completeSelfEnrollment({
+        enrollmentId: claimed.enrollmentId,
         identity,
         grant,
       });
-      html(response, 200, SUCCESS_PAGE);
-    } catch (error) {
-      if (grant) {
-        await options.oauth
-          .revokeCurrent(grant.accessToken)
-          .catch(() => undefined);
+      if (created.kind === "already_registered") {
+        await revokeBestEffort(options.oauth, grant);
+        html(response, 409, ALREADY_REGISTERED_PAGE);
+        return;
       }
+      html(
+        response,
+        200,
+        enrollmentSuccessPage({
+          userId: created.userId,
+          bearer: created.bearer,
+          mcpUrl: new URL("/mcp", publicBaseUrl).href,
+        }),
+      );
+    } catch (error) {
+      if (grant) await revokeBestEffort(options.oauth, grant);
       if (error instanceof SafeAuthError) {
         console.error(
           `OAuth linking failed (${error.category}, ${error.correlationId})`,
@@ -124,5 +251,5 @@ export function createLinkHandlers(options: {
     }
   };
 
-  return { link, callback };
+  return { link, createAccount, startEnrollment, callback };
 }
