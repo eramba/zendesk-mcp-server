@@ -10,6 +10,7 @@ import type {
   ZendeskGroup,
   ZendeskGroupMembership,
   ZendeskGroupMembersPage,
+  ZendeskCustomStatus,
   ZendeskKnowledgeBase,
   ZendeskOrganization,
   ZendeskSearchResult,
@@ -17,6 +18,8 @@ import type {
   ZendeskTicketAudit,
   ZendeskTicketAuditEvent,
   ZendeskTicketField,
+  ZendeskTicketForm,
+  ZendeskTicketMetrics,
   ZendeskTicketWriteFields,
   ZendeskUser,
   ZendeskUserTicketRelationship,
@@ -150,6 +153,54 @@ type GroupMembershipPayload = {
   user_id?: number;
   group_id?: number;
   default?: boolean;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type MetricDurationPayload = { calendar?: number; business?: number };
+type TicketMetricsPayload = {
+  id?: number;
+  ticket_id?: number;
+  assigned_at?: string;
+  initially_assigned_at?: string;
+  solved_at?: string;
+  status_updated_at?: string;
+  requester_updated_at?: string;
+  assignee_updated_at?: string;
+  latest_comment_added_at?: string;
+  replies?: number;
+  reopens?: number;
+  assignee_stations?: number;
+  group_stations?: number;
+  reply_time_in_minutes?: MetricDurationPayload;
+  requester_wait_time_in_minutes?: MetricDurationPayload;
+  agent_wait_time_in_minutes?: MetricDurationPayload;
+  on_hold_time_in_minutes?: MetricDurationPayload;
+  first_resolution_time_in_minutes?: MetricDurationPayload;
+  full_resolution_time_in_minutes?: MetricDurationPayload;
+};
+
+type TicketFormPayload = {
+  id?: number;
+  name?: string;
+  display_name?: string;
+  active?: boolean;
+  default?: boolean;
+  position?: number;
+  ticket_field_ids?: number[];
+  created_at?: string;
+  updated_at?: string;
+};
+
+type CustomStatusPayload = {
+  id?: number;
+  active?: boolean;
+  default?: boolean;
+  agent_label?: string;
+  end_user_label?: string;
+  description?: string;
+  end_user_description?: string;
+  status_category?: string;
   created_at?: string;
   updated_at?: string;
 };
@@ -435,6 +486,76 @@ function normalizeGroupMembership(
     default: Boolean(membership.default),
     created_at: membership.created_at ?? null,
     updated_at: membership.updated_at ?? null,
+  };
+}
+
+function normalizeMetricDuration(value?: MetricDurationPayload) {
+  return {
+    calendar: value?.calendar ?? null,
+    business: value?.business ?? null,
+  };
+}
+
+function normalizeTicketMetrics(metrics: TicketMetricsPayload): ZendeskTicketMetrics {
+  return {
+    id: Number(metrics.id),
+    ticket_id: Number(metrics.ticket_id),
+    assigned_at: metrics.assigned_at ?? null,
+    initially_assigned_at: metrics.initially_assigned_at ?? null,
+    solved_at: metrics.solved_at ?? null,
+    status_updated_at: metrics.status_updated_at ?? null,
+    requester_updated_at: metrics.requester_updated_at ?? null,
+    assignee_updated_at: metrics.assignee_updated_at ?? null,
+    latest_comment_added_at: metrics.latest_comment_added_at ?? null,
+    replies: Number(metrics.replies ?? 0),
+    reopens: Number(metrics.reopens ?? 0),
+    assignee_stations: Number(metrics.assignee_stations ?? 0),
+    group_stations: Number(metrics.group_stations ?? 0),
+    reply_time_in_minutes: normalizeMetricDuration(metrics.reply_time_in_minutes),
+    requester_wait_time_in_minutes: normalizeMetricDuration(
+      metrics.requester_wait_time_in_minutes,
+    ),
+    agent_wait_time_in_minutes: normalizeMetricDuration(
+      metrics.agent_wait_time_in_minutes,
+    ),
+    on_hold_time_in_minutes: normalizeMetricDuration(metrics.on_hold_time_in_minutes),
+    first_resolution_time_in_minutes: normalizeMetricDuration(
+      metrics.first_resolution_time_in_minutes,
+    ),
+    full_resolution_time_in_minutes: normalizeMetricDuration(
+      metrics.full_resolution_time_in_minutes,
+    ),
+  };
+}
+
+function normalizeTicketForm(form: TicketFormPayload): ZendeskTicketForm {
+  return {
+    id: Number(form.id),
+    name: form.name ?? null,
+    display_name: form.display_name ?? null,
+    active: Boolean(form.active),
+    default: Boolean(form.default),
+    position: form.position ?? null,
+    ticket_field_ids: Array.isArray(form.ticket_field_ids)
+      ? form.ticket_field_ids.map(Number)
+      : [],
+    created_at: form.created_at ?? null,
+    updated_at: form.updated_at ?? null,
+  };
+}
+
+function normalizeCustomStatus(status: CustomStatusPayload): ZendeskCustomStatus {
+  return {
+    id: Number(status.id),
+    active: Boolean(status.active),
+    default: Boolean(status.default),
+    agent_label: status.agent_label ?? null,
+    end_user_label: status.end_user_label ?? null,
+    description: status.description ?? null,
+    end_user_description: status.end_user_description ?? null,
+    status_category: status.status_category ?? null,
+    created_at: status.created_at ?? null,
+    updated_at: status.updated_at ?? null,
   };
 }
 
@@ -954,6 +1075,41 @@ export class ZendeskClient {
       fields,
       count: fields.length,
     };
+  }
+
+  async getTicketMetrics(ticketId: number): Promise<ZendeskTicketMetrics> {
+    const data = await this.request<{ ticket_metric: TicketMetricsPayload }>(
+      `/tickets/${ticketId}/metrics.json`,
+    );
+    return normalizeTicketMetrics(data.ticket_metric);
+  }
+
+  async listTicketForms(
+    options: CursorInput,
+  ): Promise<CursorPage<ZendeskTicketForm>> {
+    const query = this.cursorQuery(options, { active: "true" });
+    const data = await this.request<{
+      ticket_forms: TicketFormPayload[];
+      links?: { next?: string | null };
+      meta?: { has_more?: boolean };
+    }>(`/ticket_forms.json?${query.toString()}`);
+    return this.cursorPage(
+      data.ticket_forms.map(normalizeTicketForm),
+      options,
+      data.meta?.has_more,
+      data.links?.next,
+    );
+  }
+
+  async listCustomStatuses(): Promise<{
+    statuses: ZendeskCustomStatus[];
+    count: number;
+  }> {
+    const data = await this.request<{ custom_statuses: CustomStatusPayload[] }>(
+      "/custom_statuses.json?active=true",
+    );
+    const statuses = data.custom_statuses.map(normalizeCustomStatus);
+    return { statuses, count: statuses.length };
   }
 
   async getTicketAudits(options: {

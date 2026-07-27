@@ -199,6 +199,58 @@ export type ZendeskGroupMembersPage = CursorPage<ZendeskGroupMembership> & {
   users: ZendeskUser[];
 };
 
+export type ZendeskMetricDuration = {
+  calendar: number | null;
+  business: number | null;
+};
+
+export type ZendeskTicketMetrics = {
+  id: number;
+  ticket_id: number;
+  assigned_at: string | null;
+  initially_assigned_at: string | null;
+  solved_at: string | null;
+  status_updated_at: string | null;
+  requester_updated_at: string | null;
+  assignee_updated_at: string | null;
+  latest_comment_added_at: string | null;
+  replies: number;
+  reopens: number;
+  assignee_stations: number;
+  group_stations: number;
+  reply_time_in_minutes: ZendeskMetricDuration;
+  requester_wait_time_in_minutes: ZendeskMetricDuration;
+  agent_wait_time_in_minutes: ZendeskMetricDuration;
+  on_hold_time_in_minutes: ZendeskMetricDuration;
+  first_resolution_time_in_minutes: ZendeskMetricDuration;
+  full_resolution_time_in_minutes: ZendeskMetricDuration;
+};
+
+export type ZendeskTicketForm = {
+  id: number;
+  name: string | null;
+  display_name: string | null;
+  active: boolean;
+  default: boolean;
+  position: number | null;
+  ticket_field_ids: number[];
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type ZendeskCustomStatus = {
+  id: number;
+  active: boolean;
+  default: boolean;
+  agent_label: string | null;
+  end_user_label: string | null;
+  description: string | null;
+  end_user_description: string | null;
+  status_category: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
 export type TicketListResult = {
   tickets: ZendeskTicket[];
   page: number;
