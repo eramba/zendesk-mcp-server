@@ -1,35 +1,21 @@
 #!/usr/bin/env node
 import "dotenv/config";
-import { readHttpConfig, readZendeskConfig } from "./config.js";
-import { createHttpApp } from "./http-app.js";
-import { ZendeskClient } from "./zendesk-client.js";
+import { readHttpOAuthConfig } from "./config.js";
+import { createHttpRuntime } from "./http-runtime.js";
 
 function main() {
-  const zendeskConfig = readZendeskConfig();
-  const httpConfig = readHttpConfig();
-  const client = new ZendeskClient({
-    subdomain: zendeskConfig.subdomain,
-    auth: {
-      kind: "api-token",
-      email: zendeskConfig.email,
-      token: zendeskConfig.apiKey,
-    },
-  });
-  const app = createHttpApp({
-    host: httpConfig.host,
-    allowedHosts: httpConfig.allowedHosts,
-    bearerToken: httpConfig.bearerToken,
-    client,
-  });
+  const config = readHttpOAuthConfig();
+  const runtime = createHttpRuntime(config);
 
-  const listener = app.listen(httpConfig.port, httpConfig.host, () => {
+  const listener = runtime.app.listen(config.port, config.host, () => {
     console.error(
-      `Zendesk MCP Streamable HTTP server listening on ${httpConfig.host}:${httpConfig.port}`,
+      `Zendesk MCP Streamable HTTP server listening on ${config.host}:${config.port}`,
     );
   });
 
   listener.on("error", (error) => {
     console.error("HTTP listener error:", error.message);
+    runtime.close();
     process.exitCode = 1;
   });
 
@@ -38,10 +24,12 @@ function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     console.error(`Received ${signal}; stopping HTTP listener`);
+    runtime.beginShutdown();
 
     const timer = setTimeout(() => {
       console.error("HTTP shutdown grace period expired");
       listener.closeAllConnections();
+      runtime.close();
       process.exitCode = 1;
     }, 10_000);
     timer.unref();
@@ -52,6 +40,7 @@ function main() {
         console.error("HTTP shutdown error:", error.message);
         process.exitCode = 1;
       }
+      runtime.close();
     });
   };
 

@@ -1,35 +1,34 @@
-import { timingSafeEqual } from "node:crypto";
+import type { RequestHandler } from "express";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SafeAuthError } from "./internal-auth/errors.js";
+import type { UserClientResolverLike } from "./internal-auth/client-resolver.js";
 import { buildZendeskServer } from "./server.js";
-import { ZendeskClient } from "./zendesk-client.js";
 
 export type HttpAppOptions = {
   host: string;
   allowedHosts: string[];
-  bearerToken: string;
-  client: ZendeskClient;
+  authenticateBearer(token: string): { userId: string } | undefined;
+  resolver: UserClientResolverLike;
+  linkHandlers: {
+    link: RequestHandler;
+    callback: RequestHandler;
+  };
   serverFactory?: typeof buildZendeskServer;
 };
 
-function bearerMatches(header: string | undefined, expected: string): boolean {
-  if (!header) return false;
+function bearerFromHeader(header: string | undefined): string | undefined {
+  if (header === undefined) return undefined;
   const match = /^Bearer ([^\s]+)$/i.exec(header);
-  if (!match) return false;
-
-  const actualBuffer = Buffer.from(match[1], "utf8");
-  const expectedBuffer = Buffer.from(expected, "utf8");
-  return (
-    actualBuffer.length === expectedBuffer.length &&
-    timingSafeEqual(actualBuffer, expectedBuffer)
-  );
+  return match?.[1];
 }
 
 export function createHttpApp({
   host,
   allowedHosts,
-  bearerToken,
-  client,
+  authenticateBearer,
+  resolver,
+  linkHandlers,
   serverFactory = buildZendeskServer,
 }: HttpAppOptions) {
   const app = createMcpExpressApp({ host, allowedHosts });
@@ -38,8 +37,27 @@ export function createHttpApp({
     res.status(200).json({ ok: true });
   });
 
+  app.get("/oauth/link", linkHandlers.link);
+  app.get("/oauth/callback", linkHandlers.callback);
+
   app.use("/mcp", (req, res, next) => {
-    if (!bearerMatches(req.headers.authorization, bearerToken)) {
+    const bearer = bearerFromHeader(req.headers.authorization);
+    let authenticated: { userId: string } | undefined;
+    try {
+      authenticated = bearer ? authenticateBearer(bearer) : undefined;
+    } catch {
+      console.error("MCP bearer lookup unavailable");
+      res.status(503).json({
+        jsonrpc: "2.0",
+        error: {
+          code: -32002,
+          message: "Authentication temporarily unavailable",
+        },
+        id: null,
+      });
+      return;
+    }
+    if (!authenticated) {
       res.setHeader("WWW-Authenticate", "Bearer");
       res.status(401).json({
         jsonrpc: "2.0",
@@ -48,6 +66,7 @@ export function createHttpApp({
       });
       return;
     }
+    res.locals.userId = authenticated.userId;
     next();
   });
 
@@ -73,6 +92,7 @@ export function createHttpApp({
     let server: ReturnType<typeof buildZendeskServer> | undefined;
     let transport: StreamableHTTPServerTransport | undefined;
     let closed = false;
+    const controller = new AbortController();
 
     const closeResources = async () => {
       if (closed) return;
@@ -81,11 +101,18 @@ export function createHttpApp({
       if (server) await server.close().catch(() => undefined);
     };
 
+    const abort = () => controller.abort();
+    req.once("aborted", abort);
     res.once("close", () => {
+      abort();
       void closeResources();
     });
 
     try {
+      const client = await resolver.resolve(
+        res.locals.userId as string,
+        controller.signal,
+      );
       server = serverFactory(client);
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
@@ -94,15 +121,38 @@ export function createHttpApp({
       await transport.handleRequest(req, res, req.body);
     } catch (error) {
       await closeResources();
-      const message = error instanceof Error ? error.message : "Unknown error";
-      console.error("Error handling MCP request:", message);
       if (!res.headersSent) {
-        res.status(500).json({
+        let status = 500;
+        let code = -32603;
+        let message = "Internal server error";
+        if (error instanceof SafeAuthError) {
+          console.error(
+            `MCP credential resolution failed (${error.category}, ${error.correlationId})`,
+          );
+          if (
+            error.category === "reauthorization_required" ||
+            error.category === "unauthorized"
+          ) {
+            status = 401;
+            code = -32001;
+            message = "Unauthorized";
+            res.setHeader("WWW-Authenticate", "Bearer");
+          } else {
+            status = 503;
+            code = -32002;
+            message = "Authentication temporarily unavailable";
+          }
+        } else {
+          console.error("Error handling MCP request");
+        }
+        res.status(status).json({
           jsonrpc: "2.0",
-          error: { code: -32603, message: "Internal server error" },
+          error: { code, message },
           id: null,
         });
       }
+    } finally {
+      req.removeListener("aborted", abort);
     }
   });
 
