@@ -7,6 +7,7 @@ export type SafeAuthErrorCategory =
   | "rate_limited"
   | "temporarily_unavailable"
   | "invalid_response"
+  | "conflict"
   | "aborted"
   | "reauthorization_required";
 

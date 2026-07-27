@@ -40,6 +40,33 @@ const SERVER_INSTRUCTIONS = [
 const ticketStatusEnum = z.enum(["new", "open", "pending", "hold", "solved", "closed"]);
 const ticketPriorityEnum = z.enum(["low", "normal", "high", "urgent"]);
 const ticketTypeEnum = z.enum(["problem", "incident", "question", "task"]);
+const ticketWriteActionEnum = z.enum(["put", "delete"]);
+const collaboratorSchema = z.union([
+  z.number().int().positive(),
+  z.string().email(),
+  z.object({ name: z.string().min(1), email: z.string().email() }),
+]);
+const followerChangeSchema = z.union([
+  z.object({
+    user_id: z.number().int().positive(),
+    action: ticketWriteActionEnum.default("put"),
+  }),
+  z.object({
+    user_email: z.string().email(),
+    action: ticketWriteActionEnum.default("put"),
+  }),
+]);
+const emailCcChangeSchema = z.union([
+  z.object({
+    user_id: z.number().int().positive(),
+    action: ticketWriteActionEnum.default("put"),
+  }),
+  z.object({
+    user_email: z.string().email(),
+    user_name: z.string().min(1).optional(),
+    action: ticketWriteActionEnum.default("put"),
+  }),
+]);
 
 function jsonText(value: unknown): { content: Array<{ type: "text"; text: string }> } {
   return {
@@ -382,14 +409,18 @@ export function buildZendeskServer(client: ZendeskClient): McpServer {
         ticket_id: z.number().int().positive(),
         comment: z.string().min(1),
         public: z.boolean().default(true),
+        expected_updated_at: z.string().datetime(),
       },
     },
-    async ({ ticket_id, comment, public: isPublic }) => {
+    async ({ ticket_id, comment, public: isPublic, expected_updated_at }) => {
       try {
-        const text = await client.createTicketComment(ticket_id, comment, isPublic);
-        return {
-          content: [{ type: "text", text: `Comment created successfully: ${text}` }],
-        };
+        const ticket = await client.createTicketComment({
+          ticketId: ticket_id,
+          comment,
+          public: isPublic,
+          expectedUpdatedAt: expected_updated_at,
+        });
+        return jsonText({ message: "Comment created successfully", ticket });
       } catch (error) {
         return toolError(error);
       }
@@ -405,9 +436,20 @@ export function buildZendeskServer(client: ZendeskClient): McpServer {
         description: z.string().min(1),
         requester_id: z.number().int().positive().optional(),
         assignee_id: z.number().int().positive().optional(),
+        organization_id: z.number().int().positive().optional(),
+        group_id: z.number().int().positive().optional(),
+        brand_id: z.number().int().positive().optional(),
+        ticket_form_id: z.number().int().positive().optional(),
+        custom_status_id: z.number().int().positive().optional(),
+        problem_id: z.number().int().positive().optional(),
         priority: ticketPriorityEnum.optional(),
         type: ticketTypeEnum.optional(),
+        due_at: z.string().datetime().optional(),
         tags: z.array(z.string().min(1)).optional(),
+        collaborator_ids: z.array(z.number().int().positive()).optional(),
+        additional_collaborators: z.array(collaboratorSchema).optional(),
+        followers: z.array(followerChangeSchema).optional(),
+        email_ccs: z.array(emailCcChangeSchema).max(48).optional(),
         custom_fields: z
           .array(
             z.object({
@@ -440,7 +482,17 @@ export function buildZendeskServer(client: ZendeskClient): McpServer {
         type: z.string().min(1).optional(),
         assignee_id: z.number().int().positive().optional(),
         requester_id: z.number().int().positive().optional(),
+        organization_id: z.number().int().positive().optional(),
+        group_id: z.number().int().positive().optional(),
+        brand_id: z.number().int().positive().optional(),
+        ticket_form_id: z.number().int().positive().optional(),
+        custom_status_id: z.number().int().positive().optional(),
+        problem_id: z.number().int().positive().optional(),
         tags: z.array(z.string().min(1)).optional(),
+        collaborator_ids: z.array(z.number().int().positive()).optional(),
+        additional_collaborators: z.array(collaboratorSchema).optional(),
+        followers: z.array(followerChangeSchema).optional(),
+        email_ccs: z.array(emailCcChangeSchema).max(48).optional(),
         custom_fields: z
           .array(
             z.object({
@@ -450,11 +502,12 @@ export function buildZendeskServer(client: ZendeskClient): McpServer {
           )
           .optional(),
         due_at: z.string().datetime().optional(),
+        expected_updated_at: z.string().datetime(),
       },
     },
-    async ({ ticket_id, ...fields }) => {
+    async ({ ticket_id, expected_updated_at, ...fields }) => {
       try {
-        const ticket = await client.updateTicket(ticket_id, fields);
+        const ticket = await client.updateTicket(ticket_id, fields, expected_updated_at);
         return jsonText({ message: "Ticket updated successfully", ticket });
       } catch (error) {
         return toolError(error);

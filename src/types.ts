@@ -45,6 +45,45 @@ export type ZendeskSatisfactionRating = {
   comment: string | null;
 };
 
+export type ZendeskCollaborator =
+  | number
+  | string
+  | { name: string; email: string };
+
+export type ZendeskFollowerChange =
+  | { user_id: number; action?: "put" | "delete" }
+  | { user_email: string; action?: "put" | "delete" };
+
+export type ZendeskEmailCcChange =
+  | { user_id: number; action?: "put" | "delete" }
+  | {
+      user_email: string;
+      user_name?: string;
+      action?: "put" | "delete";
+    };
+
+export type ZendeskTicketWriteFields = {
+  subject?: string;
+  status?: string;
+  priority?: string;
+  type?: string;
+  assignee_id?: number;
+  requester_id?: number;
+  organization_id?: number;
+  group_id?: number;
+  brand_id?: number;
+  ticket_form_id?: number;
+  custom_status_id?: number;
+  problem_id?: number;
+  tags?: string[];
+  custom_fields?: ZendeskCustomFieldValue[];
+  due_at?: string;
+  collaborator_ids?: number[];
+  additional_collaborators?: ZendeskCollaborator[];
+  followers?: ZendeskFollowerChange[];
+  email_ccs?: ZendeskEmailCcChange[];
+};
+
 export type ZendeskAttachment = {
   id: number;
   file_name: string | null;

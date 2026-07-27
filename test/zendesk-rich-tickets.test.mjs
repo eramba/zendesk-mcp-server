@@ -163,3 +163,125 @@ test('user and organization normalization retains curated support context only',
   assert.equal(organization.shared_comments, true)
   assert.equal('upstream_secret' in organization, false)
 })
+
+test('ticket updates send the complete writable contract with optimistic concurrency', async () => {
+  const { client, requests } = queuedClient([{
+    ticket: { id: 36870, updated_at: '2026-07-27T10:01:00Z' },
+  }])
+
+  await client.updateTicket(36870, {
+    subject: 'Updated subject',
+    group_id: 73,
+    organization_id: 202,
+    brand_id: 74,
+    ticket_form_id: 75,
+    custom_status_id: 76,
+    problem_id: 36700,
+    due_at: '2026-07-28T10:00:00Z',
+    collaborator_ids: [104, 105],
+    additional_collaborators: ['extra@example.test'],
+    followers: [{ user_id: 107, action: 'put' }],
+    email_ccs: [{ user_email: 'cc@example.test', action: 'put' }],
+  }, '2026-07-27T10:00:00Z')
+
+  assert.equal(requests[0].method, 'PUT')
+  assert.deepEqual(JSON.parse(requests[0].body).ticket, {
+    subject: 'Updated subject',
+    group_id: 73,
+    organization_id: 202,
+    brand_id: 74,
+    ticket_form_id: 75,
+    custom_status_id: 76,
+    problem_id: 36700,
+    due_at: '2026-07-28T10:00:00Z',
+    collaborator_ids: [104, 105],
+    additional_collaborators: ['extra@example.test'],
+    followers: [{ user_id: 107, action: 'put' }],
+    email_ccs: [{ user_email: 'cc@example.test', action: 'put' }],
+    safe_update: true,
+    updated_stamp: '2026-07-27T10:00:00Z',
+  })
+})
+
+test('ticket creation forwards the approved support workflow fields', async () => {
+  const { client, requests } = queuedClient([{ ticket: { id: 36871 } }])
+
+  await client.createTicket({
+    subject: 'New incident',
+    description: 'Something broke',
+    requester_id: 101,
+    organization_id: 202,
+    group_id: 73,
+    brand_id: 74,
+    ticket_form_id: 75,
+    custom_status_id: 76,
+    collaborator_ids: [104],
+    followers: [{ user_email: 'agent@example.test', action: 'put' }],
+  })
+
+  assert.deepEqual(JSON.parse(requests[0].body).ticket, {
+    subject: 'New incident',
+    comment: { body: 'Something broke', public: true },
+    description: 'Something broke',
+    requester_id: 101,
+    organization_id: 202,
+    group_id: 73,
+    brand_id: 74,
+    ticket_form_id: 75,
+    custom_status_id: 76,
+    collaborator_ids: [104],
+    followers: [{ user_email: 'agent@example.test', action: 'put' }],
+  })
+})
+
+test('ticket comments use optimistic concurrency and return the updated ticket', async () => {
+  const { client, requests } = queuedClient([{
+    ticket: { id: 36870, updated_at: '2026-07-27T10:02:00Z' },
+  }])
+
+  const ticket = await client.createTicketComment({
+    ticketId: 36870,
+    comment: 'Investigating now',
+    public: false,
+    expectedUpdatedAt: '2026-07-27T10:00:00Z',
+  })
+
+  assert.equal(ticket.id, 36870)
+  assert.deepEqual(JSON.parse(requests[0].body), {
+    ticket: {
+      comment: { body: 'Investigating now', public: false },
+      safe_update: true,
+      updated_stamp: '2026-07-27T10:00:00Z',
+    },
+  })
+})
+
+test('a Zendesk 409 is a secret-free conflict and is never retried', async () => {
+  const requests = []
+  const client = new ZendeskClient({
+    subdomain: 'acme',
+    auth: {
+      kind: 'oauth',
+      accessToken: 'access-token-sentinel',
+      onUnauthorized: async () => assert.fail('conflict must not refresh'),
+    },
+    fetch: async (input) => {
+      requests.push(String(input))
+      return response({
+        error: 'UpdateConflict',
+        description: 'upstream-body-secret-sentinel',
+      }, 409)
+    },
+  })
+
+  const error = await client.updateTicket(
+    36870,
+    { status: 'pending' },
+    '2026-07-27T10:00:00Z',
+  ).catch((caught) => caught)
+
+  assert.equal(error.category, 'conflict')
+  assert.equal(error.status, 409)
+  assert.equal(requests.length, 1)
+  assert.equal(String(error).includes('upstream-body-secret-sentinel'), false)
+})

@@ -12,6 +12,7 @@ import type {
   ZendeskTicketAudit,
   ZendeskTicketAuditEvent,
   ZendeskTicketField,
+  ZendeskTicketWriteFields,
   ZendeskUser,
 } from "./types.js";
 import { SafeAuthError } from "./internal-auth/errors.js";
@@ -221,12 +222,14 @@ function categoryForStatus(status: number): {
     | "forbidden"
     | "rate_limited"
     | "temporarily_unavailable"
+    | "conflict"
     | "invalid_response";
   retryable: boolean;
 } {
   if (status === 401) return { category: "unauthorized", retryable: false };
   if (status === 403) return { category: "forbidden", retryable: false };
   if (status === 429) return { category: "rate_limited", retryable: true };
+  if (status === 409) return { category: "conflict", retryable: false };
   if (status >= 500) {
     return { category: "temporarily_unavailable", retryable: true };
   }
@@ -785,29 +788,20 @@ export class ZendeskClient {
     };
   }
 
-  async createTicket(input: {
-    subject: string;
-    description: string;
-    requester_id?: number;
-    assignee_id?: number;
-    priority?: string;
-    type?: string;
-    tags?: string[];
-    custom_fields?: Array<{ id: number; value: unknown }>;
-  }): Promise<ZendeskTicket> {
+  async createTicket(
+    input: ZendeskTicketWriteFields & {
+      subject: string;
+      description: string;
+    },
+  ): Promise<ZendeskTicket> {
+    const { description, ...fields } = input;
     const data = await this.request<{ ticket: TicketPayload }>("/tickets.json", {
       method: "POST",
       body: JSON.stringify({
         ticket: {
-          subject: input.subject,
-          comment: { body: input.description, public: true },
-          description: input.description,
-          requester_id: input.requester_id,
-          assignee_id: input.assignee_id,
-          priority: input.priority,
-          type: input.type,
-          tags: input.tags,
-          custom_fields: input.custom_fields,
+          ...fields,
+          comment: { body: description, public: true },
+          description,
         },
       }),
     });
@@ -817,42 +811,44 @@ export class ZendeskClient {
 
   async updateTicket(
     ticketId: number,
-    fields: {
-      subject?: string;
-      status?: string;
-      priority?: string;
-      type?: string;
-      assignee_id?: number;
-      requester_id?: number;
-      tags?: string[];
-      custom_fields?: Array<{ id: number; value: unknown }>;
-      due_at?: string;
-    },
+    fields: ZendeskTicketWriteFields,
+    expectedUpdatedAt: string,
   ): Promise<ZendeskTicket> {
     const data = await this.request<{ ticket: TicketPayload }>(`/tickets/${ticketId}.json`, {
       method: "PUT",
       body: JSON.stringify({
-        ticket: fields,
+        ticket: {
+          ...fields,
+          safe_update: true,
+          updated_stamp: expectedUpdatedAt,
+        },
       }),
     });
 
     return normalizeTicket(data.ticket);
   }
 
-  async createTicketComment(ticketId: number, comment: string, isPublic = true): Promise<string> {
-    await this.request<{ ticket: TicketPayload }>(`/tickets/${ticketId}.json`, {
+  async createTicketComment(input: {
+    ticketId: number;
+    comment: string;
+    public: boolean;
+    expectedUpdatedAt: string;
+  }): Promise<ZendeskTicket> {
+    const data = await this.request<{ ticket: TicketPayload }>(`/tickets/${input.ticketId}.json`, {
       method: "PUT",
       body: JSON.stringify({
         ticket: {
           comment: {
-            body: comment,
-            public: isPublic,
+            body: input.comment,
+            public: input.public,
           },
+          safe_update: true,
+          updated_stamp: input.expectedUpdatedAt,
         },
       }),
     });
 
-    return comment;
+    return normalizeTicket(data.ticket);
   }
 
   async getAllArticles(): Promise<ZendeskKnowledgeBase> {
